@@ -463,10 +463,14 @@ test('one exit status is only credited to the segments it provably covers', () =
       .map((item) => [item.key.replace('bash:', ''), item.counts]));
 
   // A single command owns its outcome in both directions.
-  assert.partialDeepStrictEqual(counts('git status', 'success'),
-    { 'git status': { success: 1, failed: 0, unknown: 0 } });
-  assert.partialDeepStrictEqual(counts('git status', 'failed'),
-    { 'git status': { success: 0, failed: 1, unknown: 0 } });
+  const okCounts = counts('git status', 'success')['git status'];
+  assert.equal(okCounts.success, 1);
+  assert.equal(okCounts.failed, 0);
+  assert.equal(okCounts.unknown, 0);
+  const failCounts = counts('git status', 'failed')['git status'];
+  assert.equal(failCounts.success, 0);
+  assert.equal(failCounts.failed, 1);
+  assert.equal(failCounts.unknown, 0);
 
   // An all-`&&` chain proves every link ran and exited 0, but a failure could
   // have come from any link, so it is credited to none of them.
