@@ -1804,6 +1804,7 @@ class WildcardingViewProvider {
          box-shadow: 0 0 6px var(--vscode-charts-green, #3fb950); flex: 0 0 auto; }
   .dot.idle { background: var(--vscode-charts-yellow, #d29922); box-shadow: 0 0 6px var(--vscode-charts-yellow, #d29922); }
   .dot.on { background: var(--vscode-charts-red, #f85149); box-shadow: 0 0 6px var(--vscode-charts-red, #f85149); }
+  .dot.blocked { background: var(--vscode-charts-red, #f85149); box-shadow: 0 0 6px var(--vscode-charts-red, #f85149); }
   #codexMaxCard.on, #maxCard.on { border-color: var(--vscode-charts-red, #f85149); }
   button.bypass { width: 100%; padding: 7px; border-radius: 5px; cursor: pointer; margin-top: 8px;
           font-size: 12px; font-weight: 600;
@@ -1813,6 +1814,8 @@ class WildcardingViewProvider {
   button.bypass.on { background: var(--vscode-charts-red, #f85149); color: #fff; border-color: transparent; }
   button.bypass:hover { background: var(--vscode-button-secondaryHoverBackground, var(--vscode-list-hoverBackground)); }
   button.bypass.on:hover { filter: brightness(1.1); }
+  button.bypass:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.bypass:disabled:hover { background: var(--vscode-button-secondaryBackground, transparent); filter: none; }
   .muted { color: var(--vscode-descriptionForeground); font-size: 11px; }
   .sub { margin-top: 4px; }
   .stats { display: flex; gap: 10px; }
@@ -1878,6 +1881,15 @@ class WildcardingViewProvider {
     </div>
   </div>
 
+  <div class="card stats">
+    <div class="stat"><div class="n" id="total">–</div><div class="l">Approved</div></div>
+    <div class="stat"><div class="n" id="wildcards">–</div><div class="l">Wildcards</div></div>
+    <div class="stat"><div class="n" id="specific">–</div><div class="l">Specific</div></div>
+  </div>
+
+  <button class="run" id="runNow">⟳  Wildcard Now</button>
+  <button class="restore" id="restore" title="Merge your saved backup back into the allow list">⤺  Restore prunes from backup</button>
+
   <div class="card" id="maxCard">
     <div class="status"><span id="mdot" class="dot idle"></span><span id="mtext">Claude MAX: OFF</span></div>
     <div class="muted sub" id="msub">Claude · skip every prompt — allow-wildcards + approve hook</div>
@@ -1889,15 +1901,6 @@ class WildcardingViewProvider {
     <div class="muted sub" id="cxsub">Codex · approval_policy=never — sandbox stays as the floor</div>
     <button class="bypass" id="codexMaxBtn">⚡ Turn Codex MAX ON</button>
   </div>
-
-  <div class="card stats">
-    <div class="stat"><div class="n" id="total">–</div><div class="l">Approved</div></div>
-    <div class="stat"><div class="n" id="wildcards">–</div><div class="l">Wildcards</div></div>
-    <div class="stat"><div class="n" id="specific">–</div><div class="l">Specific</div></div>
-  </div>
-
-  <button class="run" id="runNow">⟳  Wildcard Now</button>
-  <button class="restore" id="restore" title="Merge your saved backup back into the allow list">⤺  Restore prunes from backup</button>
 
   <div class="card" id="memCard" style="display:none">
     <div class="status"><span id="llmDot" class="dot idle"></span><span id="llmText">CPU LLM</span></div>
@@ -1958,7 +1961,7 @@ class WildcardingViewProvider {
     // than off — and the button is disabled, because clicking it can only write
     // the org default (which the card would otherwise misread as "MAX on").
     const restricted = !on && !absent && !!(c && c.restricted);
-    $('cxdot').className = 'dot' + (on ? ' on' : ' idle');
+    $('cxdot').className = 'dot' + (on ? ' on' : restricted ? ' blocked' : ' idle');
     $('cxtext').textContent = absent
       ? 'Codex MAX: no config.toml'
       : on ? 'Codex MAX: ON — all Codex prompts skipped'
@@ -1985,7 +1988,10 @@ class WildcardingViewProvider {
     const counts = a.counts || {};
     const active = !!a.enabled;
     $('aldot').className = 'dot' + (active && !a.error ? '' : ' idle');
-    $('altext').textContent = 'Auto Learn: ' + String(a.mode || 'recommend').toUpperCase();
+    const alMode = String(a.mode || 'recommend').toLowerCase();
+    // 'recommend' is the default and the usual state — show it unlabeled; only name
+    // the mode when it's the less-common observe / auto-safe.
+    $('altext').textContent = 'Auto Learn' + (alMode === 'recommend' ? '' : ': ' + alMode.toUpperCase());
     const notes = [active ? 'Claude + Codex history' : 'disabled', 'threshold ' + (a.threshold || 3), 'Codex ' + (a.codexScope || 'user')];
     if (counts.covered) notes.push(counts.covered + ' already covered');
     if (a.busy) notes.unshift('scanning…');
