@@ -1,0 +1,13 @@
+{
+  "name": "permission-wildcarding",
+  "version": "1.0.0",
+  "description": "Reduces Claude Code and Codex approval friction: generalizes approved permissions into command-family wildcards, learns from cross-agent history, makes deterministic safe recommendations, and writes separately validated policy for each agent.",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test",
+    "package": "node scripts/package.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -1,0 +1,2118 @@
+'use strict';
+
+const vscode = require('vscode');
+const fs     = require('fs');
+const path   = require('path');
+const os     = require('os');
+const crypto = require('crypto');
+const https  = require('https');
+const { execFile } = require('child_process');
+const { createAutoLearnWorkerRunner } = require('./autoLearnWorkerRunner');
+
+// Share core logic with the hook variant — permissions.js is copied into
+// src/ by scripts/package.mjs so both modes stay in sync from a single source.
+const {
+  processAllowList, writeFileAtomicSync, isBypassOn, currentMode,
+  applyMax, isMaxOn, maxLayers, buildMaxAllowSet, MAX_MARKERS,
+} = require('./src/permissions');
+const { createAutoLearnManager } = require('./src/auto-learn-manager');
+const {
+  createPolicyLock, POLICY_LOCK_CODE, POLICY_LOCK_PATH, POLICY_LOCK_BUSY_MESSAGE,
+} = require('./src/policy-lock');
+const {
+  CODEX_CONFIG, applyCodexMax, isCodexMaxOn, readApproval, sandboxMode,
+  readEnterpriseBundle, targetApproval, enterpriseDecisionFor,
+} = require('./src/codex-max');
+const {
+  managedSettingsPaths, policySignalPaths, policyLimitsPath, policyRestrictions, assessPolicy,
+} = require('./src/policy-guard');
+const { extractInvocations, candidateKey } = require('./src/auto-learn');
+const {
+  applicationSummary, candidatePendingTargets, claudeDecisionExplanation,
+  claudePermissionDecision, codexCheckVariants, codexExecpolicyArgs, codexRestartSuffix,
+  isCandidateComplete, policyTargetLabel, reviewableCandidates, selectionsNeedingConfirmation,
+  uniqueTargets,
+} = require('./autoLearnUi');
+
+// Ambient memory-index hygiene lint (self-contained; pure Node, no Python/model/hook).
+// memoryReport() also backs the dashboard Memory card (stats only, still pure Node).
+const { MemoryLint, memoryReport, discoverDirs } = require('./memoryLint');
+
+const SETTINGS      = path.join(os.homedir(), '.claude', 'settings.json');
+const BACKUP_DIR    = path.join(os.homedir(), '.claude', 'backups');
+const LATEST_BACKUP = path.join(BACKUP_DIR, 'allow-list.latest.json');
+const PROJECTS_DIR  = path.join(os.homedir(), '.claude', 'projects');
+const CODEX_SESSIONS_DIR = path.join(os.homedir(), '.codex', 'sessions');
+// Auto Learn, this wildcarding pass, and the MAX/bypass toggles are all writers
+// of one settings.json. They take the same lock (POLICY_LOCK_PATH, defined once
+// in src/policy-lock.js) so none can land between another's writes.
+
+let debounceTimer = null;
+let policyLock = null;      // shared with Auto Learn; created on first write
+let lockedRetries = 0;      // consecutive deferrals while Auto Learn holds it
+let dashboard = null;        // WildcardingViewProvider instance
+let lastRun = null;          // timestamp of the last write we made
+let statusBar = null;        // persistent status-bar indicator while MAX/bypass is on
+let memBounce = null;        // debounce for MEMORY.md-driven dashboard refreshes
+let recallRebuildAt = 0;     // timestamp of the last auto-rebuild (cooldown gate)
+let autoLearnBounce = null;  // debounce for Claude/Codex transcript writes
+let autoLearnTimer = null;   // periodic reconciliation timer
+let autoLearnBusy = false;
+let autoLearnLastError = null;
+let autoLearnFailureCount = 0;
+let autoLearnNextRetryAt = 0;
+let autoLearnManager = null;
+let autoLearnManagerKey = '';
+let autoLearnCardCache = null;  // { key, data }; key includes the state file stamp
+let autoLearnWorkerRunner = null;
+
+// ── settings.json helpers ─────────────────────────────────────────────────────
+function readSettings() {
+  try {
+    return JSON.parse(fs.readFileSync(SETTINGS, 'utf8'));
+  } catch {
+    return null; // missing or mid-write
+  }
+}
+
+function readAllow() {
+  const s = readSettings();
+  return Array.isArray(s?.permissions?.allow) ? s.permissions.allow : [];
+}
+
+function writeAllow(settings, allow, denyAdditions) {
+  // Rebase the intended allow-list delta onto the newest parseable settings so
+  // a concurrent Claude/Codex settings write does not lose unrelated fields or
+  // approvals that arrived after this operation began.
+  const latest = readSettings() ?? settings;
+  const originalAllow = Array.isArray(settings?.permissions?.allow) ? settings.permissions.allow : [];
+  const latestAllow = Array.isArray(latest?.permissions?.allow) ? latest.permissions.allow : [];
+  const removed = new Set(originalAllow.filter((entry) => !allow.includes(entry)));
+  const added = allow.filter((entry) => !originalAllow.includes(entry));
+  const rebasedAllow = [...new Set([...latestAllow.filter((entry) => !removed.has(entry)), ...added])];
+  // deny is only ever added to, never rebased away: it is the safety boundary
+  // every other feature defers to, so a concurrent writer's rule must survive.
+  const latestDeny = Array.isArray(latest?.permissions?.deny) ? latest.permissions.deny : [];
+  const additions = Array.isArray(denyAdditions) ? denyAdditions : [];
+  const rebasedDeny = additions.length ? [...new Set([...latestDeny, ...additions])] : latestDeny;
+  const permissions = { ...latest.permissions, allow: rebasedAllow };
+  // Don't introduce an empty deny key where the user never had one.
+  if (rebasedDeny.length || Array.isArray(latest?.permissions?.deny)) permissions.deny = rebasedDeny;
+  const updated = { ...latest, permissions };
+  // Atomic write with Windows-safe rename retry + in-place fallback. The naive
+  // renameSync raced Claude Code's own settings.json writes → intermittent EPERM.
+  writeFileAtomicSync(SETTINGS, JSON.stringify(updated, null, 2) + '\n');
+  backupPolicy(rebasedAllow, rebasedDeny);
+}
+
+// ── policy backup / restore ─────────────────────────────────────────────────────
+// A managed-settings refresh (e.g. an org policy with allowManagedHooksOnly) can
+// reset settings.json and wipe accumulated wildcards. This keeps a copy of the
+// allow list *and* the deny list in ~/.claude/backups so a reset is recoverable.
+//
+// Both halves matter. deny is the safety boundary every other feature defers to
+// — MAX mode, bypass mode and auto-safe all end their safety argument at "deny
+// still wins" — so restoring allow alone would hand back every permission with
+// the killswitch still off, which is strictly worse than not restoring at all.
+//
+// It's a high-water mark: the backup only grows. A reset that *shrinks* the live
+// lists never clobbers a fuller backup, so restore always has the complete set.
+// For deny that direction is also the fail-closed one: a rule deliberately
+// deleted can reappear on an explicit restore, which is noisy but never unsafe.
+//
+// On-disk shape is { allow, deny }. A bare array is the pre-1.12 allow-only
+// backup and is still read, so an existing file upgrades in place on first write.
+function readBackup() {
+  let raw;
+  try { raw = JSON.parse(fs.readFileSync(LATEST_BACKUP, 'utf8')); }
+  catch { return null; }
+  if (Array.isArray(raw)) return { allow: raw, deny: [] };
+  if (!raw || typeof raw !== 'object') return null;
+  return {
+    allow: Array.isArray(raw.allow) ? raw.allow : [],
+    deny: Array.isArray(raw.deny) ? raw.deny : [],
+  };
+}
+
+function backupPolicy(allow, deny) {
+  try {
+    const nextAllow = Array.isArray(allow) ? allow : [];
+    const nextDeny = Array.isArray(deny) ? deny : [];
+    if (!nextAllow.length && !nextDeny.length) return;
+    fs.mkdirSync(BACKUP_DIR, { recursive: true });
+    const previous = readBackup() ?? { allow: [], deny: [] };
+    // Union rather than comparing only lengths: a same-sized settings refresh
+    // can replace one wildcard with another and must not silently drop either.
+    const merged = {
+      allow: [...new Set([...previous.allow, ...nextAllow])],
+      deny: [...new Set([...previous.deny, ...nextDeny])],
+    };
+    if (JSON.stringify(previous) === JSON.stringify(merged)) return;
+    const tmp = LATEST_BACKUP + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(merged, null, 2) + '\n', 'utf8');
+    fs.renameSync(tmp, LATEST_BACKUP);
+  } catch { /* best-effort — never block the main write */ }
+}
+
+function backupCount() {
+  const backup = readBackup();
+  return backup ? backup.allow.length + backup.deny.length : 0;
+}
+
+// The one way an entry leaves the high-water mark: the user said to remove it.
+// Without this the backup would resurrect every deliberate prune, and the policy
+// guard would read the user's own edit as damage.
+function forgetFromBackup(permissions) {
+  const drop = new Set(Array.isArray(permissions) ? permissions : [permissions]);
+  const backup = readBackup();
+  if (!backup) return;
+  const next = {
+    allow: backup.allow.filter((entry) => !drop.has(entry)),
+    deny: backup.deny.filter((entry) => !drop.has(entry)),
+  };
+  if (next.allow.length === backup.allow.length && next.deny.length === backup.deny.length) return;
+  try {
+    const tmp = LATEST_BACKUP + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n', 'utf8');
+    fs.renameSync(tmp, LATEST_BACKUP);
+  } catch { /* best-effort — never block the removal itself */ }
+}
+
+// ── policy guard ────────────────────────────────────────────────────────────────
+// The point of the backup is the day managed policy lands. Two different things
+// happen to prior approvals then, and only one is recoverable:
+//
+//   missing  — the refresh reset settings.json. The backup has them; re-assert.
+//   shadowed — managed deny/ask outranks a user allow entry. Nothing user-side
+//              beats that, so it is reported and never re-written. Fighting it
+//              is exactly how this becomes a write loop against the policy.
+//
+// Only `missing` triggers a write, and only when there is something to restore,
+// so a policy change that took nothing away produces no write at all.
+function readManagedSettings() {
+  for (const candidate of managedSettingsPaths()) {
+    try { return { path: candidate, settings: JSON.parse(fs.readFileSync(candidate, 'utf8')) }; }
+    catch { /* absent or mid-write — try the next location */ }
+  }
+  return null;
+}
+
+function readPolicyLimits() {
+  try { return JSON.parse(fs.readFileSync(policyLimitsPath(), 'utf8')); }
+  catch { return null; }
+}
+
+// Triggered by a policy signal *and* by any settings.json change, because the
+// signal that matters is "approvals stopped being there", not "a policy file
+// changed". On a console-managed org there may be no managed-settings.json at
+// all — restrictions are configured server-side and only ever surface locally as
+// ~/.claude/policy-limits.json, or as effects with no local artefact whatsoever.
+// Watching for the admin-dropped file alone is how a guard watches nothing.
+function onManagedPolicyChanged() {
+  const backup = readBackup();
+  if (!backup) return;
+  const managed = readManagedSettings();
+  const live = readSettings() ?? {};
+  const assessment = assessPolicy({
+    live, backup, managed: managed?.settings, limits: readPolicyLimits(),
+  });
+  if (!assessment.restorable && !assessment.shadowed.length) return;
+
+  // Only a bulk loss is repaired without asking. Removing one entry is an
+  // instruction (the ✕ prune already forgets it from the backup); losing most of
+  // the list is damage.
+  if (assessment.bulkLoss) {
+    restoreFromBackup();
+  } else if (assessment.restorable) {
+    // Small loss: an instruction, not damage — so ask rather than auto-restore.
+    // "Forget them" drops the entries from the high-water backup, which is the
+    // fix for a stale backup nagging forever about entries the user pruned by
+    // editing settings.json directly (the ✕ button forgets; a hand edit can't).
+    const stale = [...assessment.missing.allow, ...assessment.missing.deny];
+    vscode.window.showWarningMessage(
+      `permission-wildcarding: ${assessment.restorable} saved ${assessment.restorable === 1 ? 'entry is' : 'entries are'} missing from settings.json.`,
+      'Re-assert them', 'Forget them'
+    ).then((choice) => {
+      if (choice === 'Re-assert them') restoreFromBackup();
+      else if (choice === 'Forget them') {
+        forgetFromBackup(stale);
+        vscode.window.setStatusBarMessage(
+          `$(check) permission-wildcarding: forgot ${stale.length} stale ${stale.length === 1 ? 'entry' : 'entries'} from the backup`, 4000);
+        dashboard?.refresh();
+      }
+    });
+    return;
+  }
+
+  const notes = [];
+  if (assessment.bulkLoss) {
+    notes.push(`re-asserted ${assessment.restorable} entries that went missing`);
+  }
+  if (assessment.shadowed.length) {
+    // These cannot be recovered, only explained — say so rather than implying
+    // the restore covered them.
+    notes.push(
+      `${assessment.shadowed.length} now overridden by managed rules (cannot be restored — managed policy outranks your allow list)`
+    );
+  }
+  if (assessment.capabilities.userHooksDisabled && isMaxOn(live)) {
+    notes.push('managed policy disables user hooks, so MAX layer 2 (approve hook) is inert — the allow-wildcard layer still applies');
+  }
+  if (!notes.length) return;
+
+  vscode.window.showWarningMessage(
+    `permission-wildcarding: policy change detected — ${notes.join('; ')}.`,
+    'Show detail'
+  ).then((choice) => {
+    if (choice !== 'Show detail') return;
+    const channel = vscode.window.createOutputChannel('Permission Wildcarding');
+    // Name the source honestly. On a console-managed org there is often no
+    // managed-settings.json at all, and saying "managed policy: undefined" would
+    // be worse than saying where the signal actually came from.
+    channel.appendLine(`Managed settings file: ${managed ? managed.path : 'none on disk'}`);
+    channel.appendLine(`Server-delivered restrictions (${policyLimitsPath()}):`);
+    channel.appendLine(assessment.restrictions.length
+      ? assessment.restrictions.map((name) => `  ${name}: not allowed`).join('\n')
+      : '  none recorded');
+    channel.appendLine('');
+    channel.appendLine(`Re-asserted: ${assessment.bulkLoss ? assessment.restorable : 0} entries`);
+    if (assessment.shadowed.length) {
+      channel.appendLine('');
+      channel.appendLine('Overridden by managed policy (not recoverable):');
+      for (const entry of assessment.shadowed) {
+        channel.appendLine(`  ${entry.permission} — managed ${entry.decision}: ${entry.rule}`);
+      }
+    }
+    channel.show(true);
+  });
+}
+
+// Merge the backup into the current allow and deny lists, then generalize/prune
+// the allow half. Used to recover after a policy wipe — a superset merge, so it
+// never removes anything.
+function restoreFromBackup() {
+  const backup = readBackup();
+  if (!backup) {
+    vscode.window.showWarningMessage(`permission-wildcarding: no backup found at ${LATEST_BACKUP}`);
+    return;
+  }
+  if (!backup.allow.length && !backup.deny.length) {
+    vscode.window.showWarningMessage('permission-wildcarding: backup is empty — nothing to restore');
+    return;
+  }
+
+  const settings = readSettings() ?? {};
+  const current  = Array.isArray(settings.permissions?.allow) ? settings.permissions.allow : [];
+  const currentDeny = Array.isArray(settings.permissions?.deny) ? settings.permissions.deny : [];
+  // Never restore the MAX blanket markers (Bash(*) / PowerShell(*)) from backup.
+  // MAX is an explicit mode choice — a restore should not silently re-enable it.
+  // The full MAX set (Read(*), Edit, Write, …) is legitimately used outside MAX too,
+  // so only the two markers that uniquely signal MAX-on are excluded.
+  const maxMarkerSet = new Set(MAX_MARKERS);
+  const safeBackupAllow = backup.allow.filter((p) => !maxMarkerSet.has(p));
+  const merged   = processAllowList([...new Set([...current, ...safeBackupAllow])]);
+  const missingDeny = backup.deny.filter((rule) => !currentDeny.includes(rule));
+
+  if (JSON.stringify(current) === JSON.stringify(merged) && !missingDeny.length) {
+    vscode.window.setStatusBarMessage('$(history) permission-wildcarding: policy already matches backup', 4000);
+    dashboard?.refresh();
+    return;
+  }
+
+  try {
+    // One atomic write carries both halves, so there is no window in which the
+    // allow list is restored while its boundary is still missing.
+    writeAllow(settings, merged, missingDeny);
+    lastRun = Date.now();
+    const added = merged.filter(p => !current.includes(p)).length;
+    vscode.window.showInformationMessage(
+      `$(history) Restored from backup — +${added} allow → ${merged.length} entries` +
+      (missingDeny.length
+        ? `, +${missingDeny.length} deny ${missingDeny.length === 1 ? 'rule' : 'rules'} restored`
+        : '')
+    );
+  } catch (err) {
+    vscode.window.showErrorMessage(`permission-wildcarding: restore failed — ${err.message}`);
+  }
+  dashboard?.refresh();
+}
+
+// ── memory card: recall (CPU LLM) status + vector-cache rebuild ─────────────────
+// The dashboard Memory card surfaces what the lint doesn't: the state of recall.py's
+// CPU embedder (bge-small ONNX) and the vector cache. Detection is a passive
+// filesystem probe — no python is spawned until you click "Rebuild recall index".
+
+// The toolbox venv python that carries onnxruntime + numpy (recall.py re-execs into it).
+function toolboxPython() {
+  const base = process.env.CODEX_TOOLBOX
+    || path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'DevToolbox');
+  return path.join(base, 'python', '.venv', 'Scripts', 'python.exe');
+}
+
+// Absolute path to recall.py, resolved in order:
+//   1. the configured override (permissionWildcarding.memory.recallScript)
+//   2. the dev layout — vscode-extension/ sits next to memory/ (works when running from
+//      the repo checkout, e.g. F5; NOT from an installed VSIX, which doesn't bundle the
+//      sibling memory/ dir, so __dirname points into the extensions folder instead)
+//   3. an open workspace folder that IS or CONTAINS the permission-wildcarding repo — the repo
+//      is normally open when you'd click Rebuild, and it can live on any drive, so probe the
+//      usual layouts (folder = repo | a projects/ dir | a .claude/ root) rather than a fixed path
+//   4. the ~/.claude/projects/permission-wildcarding convention
+// Empty string when none resolve — the rebuild button then guides the user to set it, while
+// the passive status probe keeps working regardless.
+function recallScriptPath() {
+  const c = vscode.workspace.getConfiguration('permissionWildcarding').get('memory.recallScript');
+  if (typeof c === 'string' && c.trim() && fs.existsSync(c.trim())) return c.trim();
+
+  const hit = (p) => (p && fs.existsSync(p) ? p : '');
+
+  const dev = hit(path.join(__dirname, '..', 'memory', 'recall.py'));
+  if (dev) return dev;
+
+  for (const f of vscode.workspace.workspaceFolders || []) {
+    const root = f.uri.fsPath;
+    const found = hit(path.join(root, 'memory', 'recall.py'))                           // folder is the repo root
+      || hit(path.join(root, 'permission-wildcarding', 'memory', 'recall.py'))              // folder is a projects/ dir
+      || hit(path.join(root, 'projects', 'permission-wildcarding', 'memory', 'recall.py')); // folder is a .claude/ root
+    if (found) return found;
+  }
+
+  return hit(path.join(PROJECTS_DIR, 'permission-wildcarding', 'memory', 'recall.py'));
+}
+
+// Where bge-small.onnx lives — mirrors recall.py's own search order.
+function recallModelDir() {
+  const rp = recallScriptPath();
+  const cands = [
+    process.env.RECALL_MODEL_DIR,
+    rp ? path.join(path.dirname(rp), 'models') : '',
+    path.join(__dirname, '..', 'memory', 'models'),
+    'D:\\.claude\\projects\\desktopPet\\src\\Models',
+  ];
+  for (const d of cands) { if (d && fs.existsSync(path.join(d, 'bge-small.onnx'))) return d; }
+  return '';
+}
+
+// Passive probe: is the CPU embedder ready to run? Green needs both the model asset
+// and the venv that carries onnxruntime. Never runs python.
+function recallStatus() {
+  const py = toolboxPython();
+  const modelDir = recallModelDir();
+  const venv = fs.existsSync(py);
+  const model = !!modelDir;
+  const state = venv && model ? 'ready' : (!model ? 'model-missing' : 'venv-missing');
+  return { py, modelDir, venv, model, state };
+}
+
+// How many memories are in the vector cache — read straight from recall_index.json
+// (no python). null when the cache hasn't been built yet.
+function recallIndexCount(memDir) {
+  try {
+    const idx = JSON.parse(fs.readFileSync(path.join(memDir, 'recall_index.json'), 'utf8'));
+    return Object.keys(idx.files || {}).length;
+  } catch { return null; }
+}
+
+// Fetch the CPU recall model on demand. Same asset recall.py/desktopPet already ship
+// (bge-small-en-v1.5, int8 ONNX, ~32MB) — the model itself is gitignored (only the
+// vocab is committed) because that's too big to ship in every VSIX/clone, so a fresh
+// install has nothing until a sibling copy is beside it or this runs. Source is
+// Xenova/bge-small-en-v1.5 on Hugging Face (a public repo, no token). Follows
+// redirects itself (Node's https doesn't) since HF's /resolve/ URLs 302 to a CDN host.
+const RECALL_MODEL_URL = 'https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/main/onnx/model_quantized.onnx';
+const RECALL_MODEL_MIN_BYTES = 5 * 1024 * 1024; // sanity floor — a bad URL/auth wall serves a small HTML page, not the binary
+
+function httpsGetFollow(url, onResponse, redirectsLeft = 5) {
+  const req = https.get(url, { headers: { 'User-Agent': 'permission-wildcarding' } }, (res) => {
+    const loc = res.headers.location;
+    if (loc && res.statusCode >= 300 && res.statusCode < 400) {
+      res.resume(); // drain so the socket can be reused
+      if (redirectsLeft <= 0) { onResponse(null, new Error('too many redirects')); return; }
+      httpsGetFollow(new URL(loc, url).toString(), onResponse, redirectsLeft - 1);
+      return;
+    }
+    onResponse(res, null);
+  });
+  req.on('error', (err) => onResponse(null, err));
+  req.setTimeout(30000, () => req.destroy(new Error('timed out')));
+  return req;
+}
+
+// Downloads to `<dest>.tmp` and renames on success so a cancelled/failed run never
+// leaves a half-written bge-small.onnx that would falsely read as "model present".
+function downloadRecallModel(script) {
+  const modelDir = path.join(path.dirname(script), 'models');
+  const dest = path.join(modelDir, 'bge-small.onnx');
+  const tmp = dest + '.tmp';
+
+  return vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: 'permission-wildcarding: downloading recall model (bge-small, ~32MB)…', cancellable: true },
+    (progress, token) => new Promise((resolve) => {
+      fs.mkdirSync(modelDir, { recursive: true });
+      const out = fs.createWriteStream(tmp);
+      let received = 0, total = 0, reported = 0, activeReq = null;
+
+      const fail = (err) => {
+        out.close();
+        try { fs.unlinkSync(tmp); } catch { /* nothing to clean up */ }
+        vscode.window.showErrorMessage(`permission-wildcarding: recall model download failed — ${err.message || err}`);
+        resolve(false);
+      };
+
+      token.onCancellationRequested(() => activeReq?.destroy(new Error('cancelled')));
+
+      activeReq = httpsGetFollow(RECALL_MODEL_URL, (res, err) => {
+        if (err) { fail(err); return; }
+        if (res.statusCode !== 200) { res.resume(); fail(new Error(`HTTP ${res.statusCode}`)); return; }
+        total = Number(res.headers['content-length'] || 0);
+        res.on('data', (chunk) => {
+          received += chunk.length;
+          if (total) {
+            const pct = Math.floor((received / total) * 100);
+            if (pct > reported) { progress.report({ increment: pct - reported }); reported = pct; }
+          }
+        });
+        res.on('error', fail);
+        res.pipe(out);
+        out.on('finish', () => {
+          out.close(() => {
+            if (received < RECALL_MODEL_MIN_BYTES) { fail(new Error(`only received ${received} bytes — expected a ~32MB file`)); return; }
+            fs.renameSync(tmp, dest);
+            resolve(true);
+          });
+        });
+        out.on('error', fail);
+      });
+    })
+  );
+}
+
+// The one action the card owns: force a full re-embed of the memory dir. Spawns the
+// venv python directly (so recall.py doesn't need to re-exec) with the model + corpus
+// pinned via env, so the cache and the card's stats always agree on the same dir.
+async function rebuildRecall() {
+  const { dir } = memoryReport();
+  if (!dir) {
+    vscode.window.showInformationMessage('permission-wildcarding: no MEMORY.md found to index.');
+    return;
+  }
+  const script = recallScriptPath();
+  if (!script) {
+    vscode.window.showWarningMessage(
+      'permission-wildcarding: recall.py not found. Set its path so the card can rebuild the index.',
+      'Set recall.py path…'
+    ).then((c) => { if (c === 'Set recall.py path…') setRecallPath(); });
+    return;
+  }
+  let st = recallStatus();
+  if (!st.venv) {
+    vscode.window.showWarningMessage(`permission-wildcarding: DevToolbox venv python not found at ${st.py} — cannot rebuild the recall index.`);
+    return;
+  }
+  if (!st.model) {
+    const choice = await vscode.window.showWarningMessage(
+      'permission-wildcarding: the CPU recall model (bge-small-en-v1.5, ~32MB) isn\'t installed yet. Download it from Hugging Face now?',
+      'Download', 'Cancel'
+    );
+    if (choice !== 'Download') return;
+    const ok = await downloadRecallModel(script);
+    if (!ok) return;
+    st = recallStatus();
+    if (!st.model) {
+      vscode.window.showErrorMessage('permission-wildcarding: model download reported success but bge-small.onnx still was not detected — check the models/ folder next to recall.py.');
+      return;
+    }
+  }
+
+  vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: 'permission-wildcarding: rebuilding recall index…' },
+    () => new Promise((resolve) => {
+      const env = { ...process.env, RECALL_MODEL_DIR: st.modelDir, RECALL_MEMORY_DIR: dir, RECALL_REEXEC: '1' };
+      execFile(st.py, [script, '--rebuild'], { env, timeout: 180000 }, (err, _stdout, stderr) => {
+        if (err) {
+          vscode.window.showErrorMessage(`permission-wildcarding: recall rebuild failed — ${(stderr || err.message || '').trim().slice(0, 300)}`);
+        } else {
+          const n = recallIndexCount(dir);
+          vscode.window.showInformationMessage(`$(book) Recall index rebuilt${n != null ? ` — ${n} memories embedded` : ''}.`);
+        }
+        dashboard?.refresh();
+        resolve();
+      });
+    })
+  );
+}
+
+// Silent background rebuild: no progress modal, no prompts, no downloads.
+// Only fires when the model + venv + script are already present AND the index
+// is behind the file count AND the cooldown (15 min) has expired.
+const RECALL_AUTO_COOLDOWN_MS = 15 * 60 * 1000;
+function autoRebuildRecallIfStale() {
+  try {
+    if (Date.now() - recallRebuildAt < RECALL_AUTO_COOLDOWN_MS) return;
+    const { dir } = memoryReport();
+    if (!dir) return;
+    const embedded = recallIndexCount(dir);
+    const script = recallScriptPath();
+    const st = recallStatus();
+    // Only auto-rebuild when everything is already in place — no downloads, no prompts.
+    if (!script || !st.venv || !st.model) return;
+    // Count actual .md files in the memory dir (same set recall.py embeds).
+    let fileCount = 0;
+    try {
+      fileCount = fs.readdirSync(dir).filter((f) => f.endsWith('.md')).length;
+    } catch { return; }
+    if (embedded != null && embedded >= fileCount) return; // already current
+    recallRebuildAt = Date.now();
+    const env = { ...process.env, RECALL_MODEL_DIR: st.modelDir, RECALL_MEMORY_DIR: dir, RECALL_REEXEC: '1' };
+    execFile(st.py, [script, '--rebuild'], { env, timeout: 180000 }, (err, _stdout, stderr) => {
+      if (!err) {
+        const n = recallIndexCount(dir);
+        vscode.window.setStatusBarMessage(
+          `$(book) Recall index rebuilt${n != null ? ` — ${n} memories embedded` : ''}`, 5000
+        );
+      } else {
+        console.error('permission-wildcarding: auto recall rebuild failed —', (stderr || err.message || '').trim().slice(0, 300));
+      }
+      dashboard?.refresh();
+    });
+  } catch { /* auto-rebuild is best-effort — never break anything else */ }
+}
+
+async function setRecallPath() {
+  const val = await vscode.window.showInputBox({
+    title: 'permission-wildcarding: path to recall.py',
+    prompt: "Absolute path to your permission-wildcarding repo's memory/recall.py",
+    value: recallScriptPath(),
+    ignoreFocusOut: true,
+  });
+  if (val && val.trim()) {
+    await vscode.workspace.getConfiguration('permissionWildcarding')
+      .update('memory.recallScript', val.trim(), vscode.ConfigurationTarget.Global);
+    dashboard?.refresh();
+  }
+}
+
+// The Memory card's data payload (pure Node). null when there's no MEMORY.md at all.
+function memoryCardData() {
+  let out = null;
+  try {
+    const { conf, dir, report } = memoryReport();
+    if (dir && report) {
+      const st = recallStatus();
+      out = {
+        dir: dir.replace(os.homedir(), '~'),
+        tokens: report.tokens,
+        budgetTokens: Math.round(conf.totalBudget / 4),
+        overBudget: report.bytes > conf.totalBudget,
+        files: report.fileCount,
+        embedded: recallIndexCount(dir),
+        over: report.over.length,
+        broken: report.broken.length,
+        unresolved: report.unresolved.length,
+        llm: st.state,
+        modelDir: st.modelDir ? st.modelDir.replace(os.homedir(), '~') : null,
+        canRebuild: !!recallScriptPath() && st.venv && st.model,
+      };
+    }
+  } catch { /* memory card is optional — never break the dashboard */ }
+  return out;
+}
+
+// ── activation ────────────────────────────────────────────────────────────────
+// Cross-agent Auto Learn keeps transcript text in memory only. Persistent state
+// contains normalized prefixes, counters, reason labels, hashes, and cursors.
+function autoLearnConfig() {
+  const cfg = vscode.workspace.getConfiguration('permissionWildcarding');
+  const mode = cfg.get('autoLearn.mode', 'recommend');
+  const codexScope = cfg.get('autoLearn.codexScope', 'user');
+  const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  const trustedWorkspaceRoot = vscode.workspace.isTrusted ? workspaceRoot : null;
+  let codexRulesPath = path.join(os.homedir(), '.codex', 'rules', 'permission-wildcarding.rules');
+  let scopeWarning = '';
+  if (codexScope === 'off') codexRulesPath = null;
+  else if (codexScope === 'workspace') {
+    if (!trustedWorkspaceRoot) {
+      codexRulesPath = null;
+      scopeWarning = 'Workspace Codex rules require an open trusted workspace.';
+    } else {
+      codexRulesPath = path.join(trustedWorkspaceRoot, '.codex', 'rules', 'permission-wildcarding.rules');
+    }
+  }
+  return {
+    enabled: cfg.get('autoLearn.enabled', true),
+    mode: ['observe', 'recommend', 'auto-safe'].includes(mode) ? mode : 'recommend',
+    threshold: Math.max(1, Math.floor(cfg.get('autoLearn.successThreshold', 3))),
+    intervalMinutes: Math.max(1, Number(cfg.get('autoLearn.intervalMinutes', 5)) || 5),
+    debounceSeconds: Math.max(1, Number(cfg.get('autoLearn.debounceSeconds', 20)) || 20),
+    codexScope,
+    codexRulesPath,
+    codexExecutable: cfg.get('autoLearn.codexExecutable', 'codex') || 'codex',
+    scopeWarning,
+    // Evidence/state is partitioned and cwd-filtered by the open workspace
+    // independently of where generated Codex policy is exported. Trust is
+    // required only before writing or evaluating workspace-owned rules.
+    workspaceRoot,
+    codexWorkspaceRoot: trustedWorkspaceRoot,
+  };
+}
+
+function autoLearnManagerOptions(cfg = autoLearnConfig()) {
+  return {
+    home: os.homedir(), homeDir: os.homedir(), mode: cfg.mode,
+    threshold: cfg.threshold, successThreshold: cfg.threshold,
+    codexRulesPath: cfg.codexRulesPath, codexExecutable: cfg.codexExecutable,
+    workspaceRoot: cfg.workspaceRoot,
+    paths: {
+      claudeHistory: PROJECTS_DIR,
+      codexHistory: CODEX_SESSIONS_DIR,
+      claudeSettings: SETTINGS,
+      codexRules: cfg.codexRulesPath,
+    },
+  };
+}
+
+function getAutoLearnManager() {
+  const cfg = autoLearnConfig();
+  const key = JSON.stringify({
+    home: os.homedir(), mode: cfg.mode, threshold: cfg.threshold,
+    codexRulesPath: cfg.codexRulesPath, codexExecutable: cfg.codexExecutable,
+    workspaceRoot: cfg.workspaceRoot,
+  });
+  if (autoLearnManager && key === autoLearnManagerKey) return autoLearnManager;
+  autoLearnManager = createAutoLearnManager(autoLearnManagerOptions(cfg));
+  autoLearnManagerKey = key;
+  return autoLearnManager;
+}
+
+function invalidateAutoLearnManager() {
+  autoLearnManager = null;
+  autoLearnManagerKey = '';
+  autoLearnCardCache = null;
+}
+
+function getAutoLearnWorkerRunner() {
+  if (!autoLearnWorkerRunner) {
+    autoLearnWorkerRunner = createAutoLearnWorkerRunner({
+      workerPath: path.join(__dirname, 'src', 'auto-learn-worker.js'),
+      optionsProvider: () => autoLearnManagerOptions(),
+      onMutation: () => invalidateAutoLearnManager(),
+    });
+  }
+  return autoLearnWorkerRunner;
+}
+
+function runAutoLearnWorker(operation, ...args) {
+  return getAutoLearnWorkerRunner().run(operation, ...args);
+}
+
+function managerStatus(manager) {
+  if (typeof manager?.status === 'function') return manager.status();
+  if (typeof manager?.getStatus === 'function') return manager.getStatus();
+  return {};
+}
+
+function managerCandidates(manager, options) {
+  const value = typeof manager?.listCandidates === 'function'
+    ? manager.listCandidates(options)
+    : (typeof manager?.getCandidates === 'function' ? manager.getCandidates(options) : []);
+  return Array.isArray(value) ? value : (Array.isArray(value?.candidates) ? value.candidates : []);
+}
+
+function countAutoLearnCandidates(candidates, status = {}, requiredTargets = ['claude'], mode = 'recommend', settings = null) {
+  const pending = candidates.filter((candidate) =>
+    !isCandidateComplete(candidate, status, requiredTargets));
+  if (mode === 'observe') {
+    return { total: candidates.length, safe: 0, review: 0, covered: 0, observe: pending.length, applied: candidates.length - pending.length };
+  }
+  const reviewable = reviewableCandidates(candidates, status, requiredTargets, settings);
+  return {
+    total: candidates.length,
+    safe: pending.filter((candidate) => candidate.autoSafe || candidate.disposition === 'auto-safe').length,
+    review: reviewable.candidates.length,
+    covered: reviewable.covered.length,
+    observe: pending.filter((candidate) => candidate.disposition === 'observe').length,
+    applied: candidates.length - pending.length,
+  };
+}
+
+function autoLearnStateStamp(manager) {
+  try {
+    const stat = fs.statSync(manager?.paths?.state);
+    return `${stat.mtimeMs}:${stat.size}`;
+  } catch { return 'absent'; }
+}
+
+function autoLearnEvidence(cfg) {
+  const manager = getAutoLearnManager();
+  const key = `${autoLearnManagerKey}|${autoLearnStateStamp(manager)}`;
+  if (autoLearnCardCache?.key === key) return autoLearnCardCache.data;
+  const data = typeof manager?.overview === 'function'
+    ? (() => {
+      const view = manager.overview();
+      return {
+        status: view?.status || {},
+        candidates: Array.isArray(view?.candidates) ? view.candidates : [],
+      };
+    })()
+    : { status: managerStatus(manager) || {}, candidates: managerCandidates(manager) };
+  autoLearnCardCache = { key, data };
+  return data;
+}
+
+function autoLearnCardData() {
+  const cfg = autoLearnConfig();
+  let status = {};
+  let candidates = [];
+  try {
+    ({ status, candidates } = autoLearnEvidence(cfg));
+  } catch (error) {
+    autoLearnLastError = error.message;
+  }
+  return {
+    enabled: cfg.enabled, mode: cfg.mode, threshold: cfg.threshold,
+    codexScope: cfg.codexScope, scopeWarning: cfg.scopeWarning,
+    busy: autoLearnBusy, error: autoLearnLastError,
+    lastScanAt: status.lastScanAt || status.lastScan || null,
+    lastApplyAt: status.lastApplyAt || status.lastApplicationAt || null,
+    counts: countAutoLearnCandidates(
+      candidates, status, cfg.codexRulesPath ? ['claude', 'codex'] : ['claude'], cfg.mode, readSettings(),
+    ),
+    canUndo: Boolean(status.canUndo || status.lastApplication),
+  };
+}
+
+function autoLearnApplicationMessage(summary, verb = 'applied') {
+  const count = summary?.appliedCount || 0;
+  const targets = uniqueTargets(summary?.changedTargets);
+  if (!targets.length) {
+    return count
+      ? `Auto Learn recorded ${count} already-covered command ${count === 1 ? 'family' : 'families'}; no policy file changed.`
+      : 'Auto Learn did not change a policy file.';
+  }
+  const scope = policyTargetLabel(targets);
+  if (!count) return `Auto Learn reconciled ${scope} policy.` + codexRestartSuffix(targets);
+  return `Auto Learn ${verb} ${count} command ${count === 1 ? 'family' : 'families'} in ${scope}.` +
+    codexRestartSuffix(targets);
+}
+
+async function runAutoLearnScan(manual = false, suppressApplicationNotice = false) {
+  const cfg = autoLearnConfig();
+  if (!cfg.enabled && !manual) return null;
+  if (!manual && Date.now() < autoLearnNextRetryAt) return null;
+  if (autoLearnBusy) {
+    if (manual) vscode.window.setStatusBarMessage('$(sync~spin) Auto Learn scan already running', 3000);
+    return null;
+  }
+  autoLearnBusy = true;
+  autoLearnLastError = null;
+  dashboard?.refresh();
+  if (manual) vscode.window.setStatusBarMessage('$(sync~spin) Auto Learn: scanning Claude + Codex history…', 4000);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  try {
+    const result = await runAutoLearnWorker('scan', { mode: cfg.mode, threshold: cfg.threshold });
+    autoLearnFailureCount = 0;
+    autoLearnNextRetryAt = 0;
+    const manager = getAutoLearnManager();
+    const status = managerStatus(manager);
+    const counts = countAutoLearnCandidates(
+      managerCandidates(manager), status, cfg.codexRulesPath ? ['claude', 'codex'] : ['claude'], cfg.mode,
+      readSettings(),
+    );
+    const summary = applicationSummary(result);
+    const applied = summary.appliedCount;
+    if (manual) {
+      let message = `Auto Learn: ${counts.safe} safe, ${counts.review} review, ${counts.observe} still observing`;
+      if (applied && summary.changedTargets.length) {
+        message += `; auto-applied ${applied} in ${policyTargetLabel(summary.changedTargets)}`;
+      } else if (applied) {
+        message += `; recorded ${applied} already-covered ${applied === 1 ? 'family' : 'families'}`;
+      } else if (summary.changedTargets.length) {
+        message += `; reconciled ${policyTargetLabel(summary.changedTargets)} policy`;
+      }
+      vscode.window.showInformationMessage(
+        message + '.' + codexRestartSuffix(summary.changedTargets)
+      );
+    } else if ((applied || summary.changedTargets.length) && !suppressApplicationNotice) {
+      vscode.window.showInformationMessage(autoLearnApplicationMessage(summary, 'safely applied'));
+    }
+    return result;
+  } catch (error) {
+    autoLearnLastError = error.message;
+    if (!manual) {
+      autoLearnFailureCount += 1;
+      // Retry transient failures, without hammering a deterministic bad history
+      // record on every watcher event. A successful scan resets this backoff.
+      const delayMinutes = Math.min(60, 2 ** Math.min(autoLearnFailureCount - 1, 6));
+      autoLearnNextRetryAt = Date.now() + delayMinutes * 60 * 1000;
+    }
+    if (manual) vscode.window.showErrorMessage(`Auto Learn scan failed: ${error.message}`);
+    else console.error('permission-wildcarding: Auto Learn scan failed —', error);
+    return null;
+  } finally {
+    autoLearnBusy = false;
+    dashboard?.refresh();
+  }
+}
+
+async function applyAutoLearnSafe() {
+  const cfg = autoLearnConfig();
+  if (!cfg.enabled) {
+    vscode.window.showWarningMessage('Auto Learn is disabled in settings. Enable it before applying policy.');
+    return;
+  }
+  if (cfg.mode === 'observe') {
+    vscode.window.showWarningMessage('Auto Learn is in observe mode. Switch to recommend or auto-safe before applying policy.');
+    return;
+  }
+  const scanResult = await runAutoLearnScan(false, true);
+  if (scanResult === null) return;
+  const scanSummary = applicationSummary(scanResult);
+  try {
+    const result = await runAutoLearnWorker('apply', { includeReviewed: false });
+    const summary = applicationSummary(scanResult, result);
+    const count = summary.appliedCount;
+    if (!count && !summary.changedTargets.length) {
+      vscode.window.showInformationMessage('Auto Learn: no unapplied safe candidates meet the threshold.');
+    }
+    else vscode.window.showInformationMessage(autoLearnApplicationMessage(summary, 'applied'));
+  } catch (error) {
+    autoLearnLastError = error.message;
+    if (scanSummary.appliedCount || scanSummary.changedTargets.length) {
+      vscode.window.showInformationMessage(
+        autoLearnApplicationMessage(scanSummary, 'safely applied during the prerequisite scan')
+      );
+    }
+    vscode.window.showErrorMessage(`Auto Learn apply failed after scanning: ${error.message}`);
+  }
+  dashboard?.refresh();
+}
+
+async function reviewAutoLearnCandidates() {
+  const cfg = autoLearnConfig();
+  if (!cfg.enabled) {
+    vscode.window.showWarningMessage('Auto Learn is disabled in settings. Enable it before reviewing candidates.');
+    return;
+  }
+  if (cfg.mode === 'observe') {
+    vscode.window.showWarningMessage('Auto Learn is in observe mode. Switch to recommend to review candidates.');
+    return;
+  }
+  const scanResult = await runAutoLearnScan(false, true);
+  if (scanResult === null) return;
+  const scanSummary = applicationSummary(scanResult);
+  const notifyScanApplication = () => {
+    if (scanSummary.appliedCount || scanSummary.changedTargets.length) {
+      vscode.window.showInformationMessage(
+        autoLearnApplicationMessage(scanSummary, 'safely applied during the review scan')
+      );
+    }
+  };
+  const manager = getAutoLearnManager();
+  const status = managerStatus(manager);
+  const requiredTargets = cfg.codexRulesPath ? ['claude', 'codex'] : ['claude'];
+  const settingsNow = readSettings();
+  const { covered, candidates } = reviewableCandidates(
+    managerCandidates(manager), status, requiredTargets, settingsNow,
+  );
+  const coveredNote = covered.length
+    ? ` (${covered.length} already covered by existing allow rules — hidden)`
+    : '';
+  if (!candidates.length) {
+    if (scanSummary.appliedCount || scanSummary.changedTargets.length) notifyScanApplication();
+    else {
+      vscode.window.showInformationMessage(
+        `Auto Learn: no candidates are ready for review${coveredNote}.`
+      );
+    }
+    return;
+  }
+  // A deny or ask rule beats a user allow entry, and managed policy can supply
+  // either. Say so up front rather than letting a granted family keep prompting.
+  const overrideOf = (candidate) => {
+    if (!candidate.claudePermission) return null;
+    const { decision } = claudePermissionDecision(settingsNow, candidate.claudePermission);
+    return decision === 'deny' || decision === 'ask' ? decision : null;
+  };
+  const picks = await vscode.window.showQuickPick(candidates.map((candidate) => ({
+    label: `${candidate.claudePermission || candidate.prefix?.join(' ') || candidate.key} [pending: ${policyTargetLabel(candidatePendingTargets(candidate, status, requiredTargets))}]`,
+    description: `${candidate.counts?.success ?? candidate.successfulRuns ?? 0} successes · ${candidate.risk}`,
+    detail: [overrideOf(candidate) ? `policy ${overrideOf(candidate)} overrides this grant` : null,
+      candidate.autoSafe ? 'safe' : 'manual review',
+      (candidate.sources || []).join(' + '), (candidate.reasons || []).join(', ')]
+      .filter(Boolean).join(' · '),
+    candidate,
+  })), {
+    canPickMany: true,
+    ignoreFocusOut: true,
+    title: `Auto Learn candidates${coveredNote}`,
+    placeHolder: 'Select command families to add to Claude permissions and validated Codex rules',
+  });
+  if (!picks?.length) { notifyScanApplication(); return; }
+  // Confirm on risk and policy override, not on auto-safe eligibility — see
+  // selectionsNeedingConfirmation in autoLearnUi.js for why.
+  const notable = selectionsNeedingConfirmation(
+    picks.map((pick) => pick.candidate), overrideOf,
+  );
+  if (notable.length) {
+    const named = notable.slice(0, 6).map((entry) => {
+      const label = entry.candidate.claudePermission ||
+        entry.candidate.prefix?.join(' ') || entry.candidate.key;
+      return entry.override
+        ? `  ${label} — ${entry.candidate.risk}, but policy ${entry.override} overrides this grant`
+        : `  ${label} — ${entry.candidate.risk}`;
+    });
+    const more = notable.length - named.length;
+    const answer = await vscode.window.showWarningMessage(
+      `Grant ${picks.length} command ${picks.length === 1 ? 'family' : 'families'}?`,
+      {
+        modal: true,
+        detail: [
+          `${notable.length} of them ${notable.length === 1 ? 'is' : 'are'} not plain read-only:`,
+          '',
+          ...named,
+          ...(more > 0 ? [`  …and ${more} more`] : []),
+          '',
+          'permissions.deny and managed policy still win.',
+        ].join('\n'),
+      },
+      'Grant'
+    );
+    if (answer !== 'Grant') { notifyScanApplication(); return; }
+  }
+  try {
+    const expectedFingerprints = Object.fromEntries(
+      picks.map((pick) => [pick.candidate.key, pick.candidate.fingerprint]),
+    );
+    const result = await runAutoLearnWorker('apply', {
+      keys: picks.map((pick) => pick.candidate.key),
+      includeReviewed: true,
+      expectedFingerprints,
+    });
+    const summary = applicationSummary(scanResult, result);
+    vscode.window.showInformationMessage(summary.appliedCount || summary.changedTargets.length
+      ? autoLearnApplicationMessage(summary, 'applied after review')
+      : 'Auto Learn: the selected candidates were already covered or structurally ineligible.');
+  } catch (error) {
+    autoLearnLastError = error.message;
+    notifyScanApplication();
+    vscode.window.showErrorMessage(`Auto Learn reviewed selection was not applied: ${error.message}`);
+  }
+  dashboard?.refresh();
+}
+
+async function undoAutoLearn() {
+  try {
+    const result = await runAutoLearnWorker('undo');
+    if (result?.changed === false || result?.undone === false) {
+      vscode.window.showInformationMessage(result?.reason || 'Auto Learn: nothing to undo.');
+    } else {
+      const targets = uniqueTargets(result?.restoredTargets);
+      vscode.window.showInformationMessage(
+        `Auto Learn restored ${policyTargetLabel(targets)} from before its last application.` +
+        codexRestartSuffix(targets)
+      );
+    }
+  } catch (error) {
+    autoLearnLastError = error.message;
+    vscode.window.showErrorMessage(`Auto Learn undo stopped: ${error.message}`);
+  }
+  dashboard?.refresh();
+}
+
+async function cycleAutoLearnMode() {
+  const order = ['observe', 'recommend', 'auto-safe'];
+  const cfg = autoLearnConfig();
+  const next = order[(order.indexOf(cfg.mode) + 1) % order.length];
+  if (next === 'auto-safe') {
+    const answer = await vscode.window.showWarningMessage(
+      `Turn on Auto Learn auto-safe mode? Only deterministic read-only families with ${cfg.threshold}+ successful runs are eligible; every other risk class stays review-only.`,
+      { modal: true }, 'Enable auto-safe'
+    );
+    if (answer !== 'Enable auto-safe') return;
+  }
+  await vscode.workspace.getConfiguration('permissionWildcarding')
+    .update('autoLearn.mode', next, (() => {
+      const inspected = vscode.workspace.getConfiguration('permissionWildcarding').inspect('autoLearn.mode');
+      if (inspected?.workspaceFolderValue !== undefined) return vscode.ConfigurationTarget.WorkspaceFolder;
+      if (inspected?.workspaceValue !== undefined) return vscode.ConfigurationTarget.Workspace;
+      return vscode.ConfigurationTarget.Global;
+    })());
+  invalidateAutoLearnManager();
+  vscode.window.showInformationMessage(`Auto Learn mode: ${next}.`);
+  scheduleAutoLearn(50);
+  dashboard?.refresh();
+}
+
+function execFileCaptured(executable, args) {
+  return new Promise((resolve, reject) => {
+    execFile(executable, args, {
+      windowsHide: true, timeout: 30000, maxBuffer: 1024 * 1024,
+    }, (error, stdout, stderr) => {
+      if (error) {
+        error.detail = String(stderr || stdout || error.message).trim();
+        reject(error);
+        return;
+      }
+      resolve({ stdout: String(stdout || ''), stderr: String(stderr || '') });
+    });
+  });
+}
+
+function codexRuleFiles(cfg) {
+  const directories = [path.join(os.homedir(), '.codex', 'rules')];
+  if (cfg.codexWorkspaceRoot) directories.push(path.join(cfg.codexWorkspaceRoot, '.codex', 'rules'));
+  const files = [];
+  for (const directory of directories) {
+    let entries = [];
+    try { entries = fs.readdirSync(directory, { withFileTypes: true }); } catch { continue; }
+    for (const entry of entries) {
+      if (entry.isFile() && entry.name.toLowerCase().endsWith('.rules')) {
+        files.push(path.join(directory, entry.name));
+      }
+    }
+  }
+  if (cfg.codexRulesPath && fs.existsSync(cfg.codexRulesPath)) files.push(cfg.codexRulesPath);
+  return [...new Set(files.map((file) => path.resolve(file)))].sort();
+}
+
+function learnedCandidateExplanation(invocation, learned, target, threshold) {
+  const label = invocation.prefix?.join(' ') || candidateKey(invocation);
+  if (!learned) return `${label}: no correlated history evidence has been learned yet.`;
+  const success = learned.counts?.success ?? learned.successfulRuns ?? 0;
+  const failed = learned.counts?.failed ?? learned.failedRuns ?? 0;
+  const pending = candidatePendingTargets(learned, {}, [target]);
+  const state = learned.autoSafe ? 'auto-safe'
+    : learned.disposition === 'review' ? 'review required' : `observing until ${threshold} successes`;
+  return `${label}: ${success} successful, ${failed} failed; ${state}` +
+    (pending.length ? `; pending for ${pending.join(' + ')}` : '; already applied or ineligible for this target') + '.';
+}
+
+function execpolicyOutputSummary(output) {
+  const text = String(output || '').trim();
+  try {
+    const parsed = JSON.parse(text);
+    const decision = parsed.decision || 'no decision (prompt/default policy)';
+    const matches = Array.isArray(parsed.matchedRules) ? parsed.matchedRules.length : 0;
+    return `decision: ${decision}; matched rules: ${matches}\n${JSON.stringify(parsed, null, 2)}`;
+  } catch {
+    return text || 'No output returned.';
+  }
+}
+
+function windowsPowerShellExecutable() {
+  const root = process.env.SystemRoot || process.env.WINDIR;
+  if (!root) return null;
+  const executable = path.join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  return fs.existsSync(executable) ? executable : null;
+}
+
+async function explainAutoLearnPrompt() {
+  const agentPick = await vscode.window.showQuickPick([
+    { label: 'Claude Code', value: 'claude', description: 'Evaluate deny, ask, and allow precedence' },
+    { label: 'Codex', value: 'codex', description: 'Run codex execpolicy check against visible rules' },
+  ], { title: 'Which agent showed the approval prompt?' });
+  if (!agentPick) return;
+
+  const shell = await vscode.window.showQuickPick(['PowerShell', 'Bash'], {
+    title: 'Which shell syntax should Auto Learn parse?',
+  });
+  if (!shell) return;
+  const command = await vscode.window.showInputBox({
+    title: `Why did ${agentPick.label} prompt?`,
+    prompt: 'Paste the shell command. It is analyzed in memory and is not saved.',
+    ignoreFocusOut: true,
+  });
+  if (!command) return;
+
+  const invocations = extractInvocations(shell, command, { source: 'manual' });
+  if (!invocations.length) {
+    vscode.window.showInformationMessage('Auto Learn could not derive a stable command family from that shell expression.');
+    return;
+  }
+
+  const cfg = autoLearnConfig();
+  let candidates = new Map();
+  try {
+    candidates = new Map(managerCandidates(getAutoLearnManager())
+      .map((candidate) => [candidate.key, candidate]));
+  } catch { /* Policy analysis still works if learner state is temporarily unavailable. */ }
+
+  if (agentPick.value === 'claude') {
+    const settings = readSettings() || {};
+    const details = invocations.map((invocation) => {
+      const exact = `${shell}(${invocation.command || command})`;
+      const learned = candidates.get(candidateKey(invocation));
+      const assessment = claudePermissionDecision(settings, exact);
+      let explanation = claudeDecisionExplanation(assessment);
+      if (assessment.decision === 'allow') {
+        explanation += ' If Claude still prompted, org policy is the remaining explanation — see below.';
+      }
+      return `${exact}\n${explanation}\nLearner: ${learnedCandidateExplanation(
+        invocation, learned, 'claude', cfg.threshold,
+      )}`;
+    });
+    // Name the org policy explicitly. Saying "check managed policy" is useless
+    // advice on a console-managed org, where there is no managed-settings.json to
+    // check: restrictions are configured server-side and only their cached
+    // effects are visible locally. An unqualified "ALLOW" here is exactly the
+    // wrong answer to give someone whose org is prompting them.
+    const restrictions = policyRestrictions(readPolicyLimits());
+    const orgNote = restrictions.length
+      ? `\n\nYour organization applies server-side restrictions (${policyLimitsPath()}):\n` +
+        restrictions.map((name) => `  ${name}: not allowed`).join('\n') +
+        '\nThese are configured in the org console, not in any local settings file, so the ' +
+        'verdict above reflects your user settings only.'
+      : '\n\nNo server-delivered org restrictions were found locally, but a console-managed org ' +
+        'can still apply policy that leaves no local trace.';
+    vscode.window.showInformationMessage('Claude permission analysis', {
+      modal: true,
+      detail: `Precedence: managed/org policy > deny > ask > allow > session default.\n\n${details.join('\n\n')}${orgNote}`,
+    });
+    return;
+  }
+
+  // The enterprise bundle outranks every user rule, so check it first. Reporting
+  // "no local rule allows this" for a command the org forces a prompt on names
+  // the wrong cause, and the fix it implies (write a rule) cannot work.
+  const bundle = readEnterpriseBundle();
+  const enterprise = invocations
+    .map((invocation) => ({ invocation, rule: enterpriseDecisionFor(bundle, invocation.argv) }))
+    .filter((entry) => entry.rule);
+  if (enterprise.length) {
+    const target = targetApproval(bundle);
+    vscode.window.showInformationMessage('Codex enterprise policy', {
+      modal: true,
+      detail: [
+        'Your organization\'s Codex policy governs this command directly, and it outranks any ' +
+        'rule Auto Learn can write:',
+        '',
+        ...enterprise.map((entry) =>
+          `  ${entry.rule.root} — decision "${entry.rule.decision}"\n    ${entry.rule.justification}`),
+        '',
+        target.restricted
+          ? `Approval policy is also capped: the org allows only [${(target.allowed || []).join(', ')}], ` +
+            'so "never" cannot be set. Codex MAX applies the least-friction policy permitted.'
+          : 'No approval-policy cap was found.',
+        '',
+        'A user rule cannot override this. The prompt is the policy working as configured.',
+      ].join('\n'),
+    });
+    return;
+  }
+
+  const rules = codexRuleFiles(cfg);
+  if (!rules.length) {
+    vscode.window.showInformationMessage('Codex execpolicy analysis', {
+      modal: true,
+      detail: 'No enterprise rule governs this command, and no user or trusted-workspace .rules files are currently visible, so Codex has no local prefix rule to allow it. This check cannot see session approval state or sandbox restrictions.',
+    });
+    return;
+  }
+
+  const variants = [];
+  for (let index = 0; index < invocations.length; index += 1) {
+    variants.push(...codexCheckVariants(
+      shell,
+      index === 0 ? command : invocations[index].command,
+      invocations[index],
+      index === 0 ? windowsPowerShellExecutable() : null,
+    ));
+  }
+  const uniqueVariants = [...new Map(variants.map((item) => [JSON.stringify(item.argv), item])).values()];
+  try {
+    const checks = [];
+    for (const variant of uniqueVariants) {
+      const result = await execFileCaptured(
+        cfg.codexExecutable, codexExecpolicyArgs(rules, variant.argv),
+      );
+      checks.push(`${variant.label}: ${JSON.stringify(variant.argv)}\n${execpolicyOutputSummary(result.stdout)}`);
+    }
+    const learned = invocations.map((invocation) => learnedCandidateExplanation(
+      invocation, candidates.get(candidateKey(invocation)), 'codex', cfg.threshold,
+    ));
+    vscode.window.showInformationMessage('Codex execpolicy analysis', {
+      modal: true,
+      detail: `Rules checked:\n${rules.map((file) => `- ${file.replace(os.homedir(), '~')}`).join('\n')}` +
+        `\n\n${checks.join('\n\n')}\n\nLearner:\n${learned.join('\n')}` +
+        '\n\nScope limitation: only visible user and trusted-workspace rule files were checked; managed/system policy, session approval state, and sandbox restrictions may still prompt.',
+    });
+  } catch (error) {
+    vscode.window.showErrorMessage(
+      `Codex execpolicy check failed without changing rules: ${error.detail || error.message}`
+    );
+  }
+}
+
+// A bare call is a watcher-driven reactive scan: coalesce a burst of transcript
+// writes and scan once activity settles, using the configurable debounce (the
+// thing that felt too frequent at its old 1.2s). Explicit-delay callers are
+// deliberate quick refreshes after a specific action and pass their own value.
+function scheduleAutoLearn(delay) {
+  if (delay == null) delay = autoLearnConfig().debounceSeconds * 1000;
+  clearTimeout(autoLearnBounce);
+  autoLearnBounce = setTimeout(() => runAutoLearnScan(false), delay);
+}
+
+function resetAutoLearnTimer() {
+  clearInterval(autoLearnTimer);
+  const cfg = autoLearnConfig();
+  if (!cfg.enabled) return;
+  autoLearnTimer = setInterval(() => runAutoLearnScan(false), cfg.intervalMinutes * 60 * 1000);
+}
+
+function registerAutoLearnWatchers(context) {
+  for (const [base, pattern] of [
+    [path.join(os.homedir(), '.claude'), 'projects/**/*.jsonl'],
+    [path.join(os.homedir(), '.codex'), 'sessions/**/*.jsonl'],
+  ]) {
+    try {
+      const watcher = vscode.workspace.createFileSystemWatcher(
+        new vscode.RelativePattern(vscode.Uri.file(base), pattern)
+      );
+      watcher.onDidChange(() => scheduleAutoLearn());
+      watcher.onDidCreate(() => scheduleAutoLearn());
+      watcher.onDidDelete(() => scheduleAutoLearn());
+      context.subscriptions.push(watcher);
+    } catch (error) {
+      console.error('permission-wildcarding: Auto Learn watcher failed —', error);
+    }
+  }
+  context.subscriptions.push(vscode.workspace.onDidChangeConfiguration((event) => {
+    if (!event.affectsConfiguration('permissionWildcarding.autoLearn')) return;
+    invalidateAutoLearnManager();
+    resetAutoLearnTimer();
+    scheduleAutoLearn(100);
+    dashboard?.refresh();
+  }));
+  resetAutoLearnTimer();
+}
+
+function activate(context) {
+  // Watch settings.json for any change (Claude Code approval, manual edit, etc.).
+  // RelativePattern (not a plain string) — plain strings only watch files inside
+  // opened workspace folders, but ~/.claude/settings.json usually isn't one.
+  const watcher = vscode.workspace.createFileSystemWatcher(
+    new vscode.RelativePattern(vscode.Uri.file(path.dirname(SETTINGS)), path.basename(SETTINGS))
+  );
+  // Loss is checked on every settings change, not only on a policy-file event:
+  // server-delivered org policy can remove approvals with no local file to watch.
+  const onSettingsChanged = () => { schedule(); try { onManagedPolicyChanged(); } catch {} };
+  watcher.onDidChange(onSettingsChanged);
+  watcher.onDidCreate(onSettingsChanged);
+  context.subscriptions.push(watcher);
+
+  // Watch for managed policy arriving or changing. This is the case the backup
+  // exists for, so it is checked once at startup and on every subsequent change
+  // rather than only when the user happens to click Restore.
+  for (const managedPath of policySignalPaths()) {
+    try {
+      const managedWatcher = vscode.workspace.createFileSystemWatcher(
+        new vscode.RelativePattern(vscode.Uri.file(path.dirname(managedPath)), path.basename(managedPath))
+      );
+      managedWatcher.onDidChange(() => onManagedPolicyChanged());
+      managedWatcher.onDidCreate(() => onManagedPolicyChanged());
+      context.subscriptions.push(managedWatcher);
+    } catch { /* an unwatchable system path must never block activation */ }
+  }
+  // Catch a policy that landed while VS Code was closed.
+  try { onManagedPolicyChanged(); } catch { /* never block activation */ }
+
+  // Codex config.toml drives the Codex half of the friction indicator.
+  try {
+    const codexWatcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(vscode.Uri.file(path.dirname(CODEX_CONFIG)), path.basename(CODEX_CONFIG))
+    );
+    codexWatcher.onDidChange(() => { updateStatusBar(); dashboard?.refresh(); });
+    codexWatcher.onDidCreate(() => { updateStatusBar(); dashboard?.refresh(); });
+    context.subscriptions.push(codexWatcher);
+  } catch { /* never block activation */ }
+
+  // Sidebar dashboard (Activity Bar → webview).
+  dashboard = new WildcardingViewProvider(context);
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider(WildcardingViewProvider.viewId, dashboard)
+  );
+
+  // Manual trigger — from the Command Palette or the view's title-bar button.
+  context.subscriptions.push(
+    vscode.commands.registerCommand('permission-wildcarding.runNow', () => runWildcarding(true))
+  );
+
+  // Restore prunes from the backup after a wipe — palette / title-bar / dashboard.
+  context.subscriptions.push(
+    vscode.commands.registerCommand('permission-wildcarding.restoreBackup', () => restoreFromBackup())
+  );
+
+  // Keep the legacy command id as an alias; Auto Learn is the only history scanner.
+  context.subscriptions.push(
+    vscode.commands.registerCommand('permission-wildcarding.scanHistory', () => runAutoLearnScan(true)),
+    vscode.commands.registerCommand('permission-wildcarding.autoLearnScan', () => runAutoLearnScan(true)),
+    vscode.commands.registerCommand('permission-wildcarding.autoLearnReview', () => reviewAutoLearnCandidates()),
+    vscode.commands.registerCommand('permission-wildcarding.autoLearnApplySafe', () => applyAutoLearnSafe()),
+    vscode.commands.registerCommand('permission-wildcarding.autoLearnUndo', () => undoAutoLearn()),
+    vscode.commands.registerCommand('permission-wildcarding.autoLearnCycleMode', () => cycleAutoLearnMode()),
+    vscode.commands.registerCommand('permission-wildcarding.autoLearnWhy', () => explainAutoLearnPrompt())
+  );
+
+  // Rebuild the recall (CPU bge-small) vector cache from the Memory card.
+  context.subscriptions.push(
+    vscode.commands.registerCommand('permission-wildcarding.rebuildRecall', () => rebuildRecall())
+  );
+
+  // MAX mode (primary) + bypass (secondary; palette/CLI) "skip everything" toggles.
+  context.subscriptions.push(
+    vscode.commands.registerCommand('permission-wildcarding.toggleMax', () => toggleMax()),
+    vscode.commands.registerCommand('permission-wildcarding.toggleCodexMax', () => toggleCodexMax())
+  );
+
+  // Persistent status-bar indicator so an active "skip everything" is never invisible.
+  statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+  statusBar.command = 'permission-wildcarding.toggleMax';
+  context.subscriptions.push(statusBar);
+  updateStatusBar();
+
+  // Process once on activation to catch anything missed while VS Code was closed.
+  runWildcarding();
+  startAutoLearn(context);
+  // Rebuild the recall index on startup if the model is present and the index is
+  // behind the file count. Deferred 10 s so the extension host settles first.
+  setTimeout(autoRebuildRecallIfStale, 10000);
+
+  // Memory-index hygiene lint: status-bar bloat gauge + editor squiggles on over-budget
+  // hook lines / broken index links. Isolated so a failure here never breaks wildcarding.
+  try {
+    const memoryLint = new MemoryLint();
+    memoryLint.activate(context);
+  } catch (err) {
+    console.error('permission-wildcarding: memory lint failed to activate —', err);
+  }
+
+  // Keep the dashboard's Memory card live as MEMORY.md changes (an agent editing it
+  // outside the editor still fires this). Best-effort — the card also refreshes on
+  // panel visibility and after a rebuild, so a watcher failure is non-fatal.
+  try {
+    for (const dir of discoverDirs({ enabled: true, dir: '', lineBudget: 300, totalBudget: 12000 })) {
+      const w = vscode.workspace.createFileSystemWatcher(
+        new vscode.RelativePattern(vscode.Uri.file(dir), 'MEMORY.md')
+      );
+      const bump = () => {
+        clearTimeout(memBounce);
+        memBounce = setTimeout(() => { dashboard?.refresh(); autoRebuildRecallIfStale(); }, 350);
+      };
+      w.onDidChange(bump); w.onDidCreate(bump); w.onDidDelete(bump);
+      context.subscriptions.push(w);
+    }
+  } catch (err) {
+    console.error('permission-wildcarding: memory-card watcher failed —', err);
+  }
+}
+
+// Reflect the live "skip everything" state in the status bar (warning-tinted ON).
+// Primary signal is MAX mode; bypassPermissions mode also lights it.
+// Learn on startup, on either agent's JSONL appends, and periodically to
+// reconcile events missed while the extension host was suspended.
+// This sits immediately after activate() so all dashboard state already exists.
+function startAutoLearn(context) {
+  registerAutoLearnWatchers(context);
+  scheduleAutoLearn(750);
+}
+
+// ── one vocabulary for "how much friction is left" ──────────────────────────────
+// There are two agents and three switches, which is exactly the sort of thing
+// that becomes folklore. Everything that reports state derives it from here, so
+// the status bar, the tooltip and the dashboard can never disagree, and every
+// label names the agent it applies to.
+//
+//   Claude  MAX    — blanket allow wildcards + PreToolUse approve hook.
+//                    Floor: permissions.deny + hard circuit breakers.
+//   Claude  BYPASS  — flips permissions.defaultMode. Legacy/advanced; managed
+//                    policy can disable it, which is why MAX exists.
+//   Codex   MAX    — approval_policy = "never" in config.toml.
+//                    Floor: the sandbox (sandbox_mode is never touched).
+//
+// The two MAX switches are siblings, not one setting: they write different
+// files, for different agents, with different floors.
+function codexConfigText() {
+  try { return fs.readFileSync(CODEX_CONFIG, 'utf8'); }
+  catch { return null; }
+}
+
+function frictionState() {
+  const settings = readSettings();
+  const codexText = codexConfigText();
+  // bypass is detected but no longer offered: it is Claude Code's own setting,
+  // and where policy permits it the user can set it there. Reported so an
+  // externally-enabled bypass is never invisible.
+  const claude = isMaxOn(settings) ? 'max' : isBypassOn(settings) ? 'bypass' : 'prompts';
+  return {
+    claude,
+    claudeLayers: maxLayers(settings),
+    codex: codexText === null ? 'absent' : isCodexMaxOn(codexText) ? 'max' : 'prompts',
+    codexApproval: codexText === null ? null : readApproval(codexText),
+    codexSandbox: codexText === null ? null : sandboxMode(codexText),
+  };
+}
+
+const CLAUDE_LABEL = { max: 'Claude MAX', bypass: 'Claude BYPASS', prompts: 'Claude prompts' };
+const CODEX_LABEL = { max: 'Codex MAX', prompts: 'Codex prompts', absent: 'Codex n/a' };
+
+function frictionSummary(state = frictionState()) {
+  return `${CLAUDE_LABEL[state.claude]} · ${CODEX_LABEL[state.codex]}`;
+}
+
+function updateStatusBar() {
+  if (!statusBar) return;
+  const state = frictionState();
+  const anyOn = state.claude !== 'prompts' || state.codex === 'max';
+  statusBar.text = `${anyOn ? '$(zap)' : '$(shield)'} ${frictionSummary(state)}`;
+  statusBar.tooltip = [
+    state.claude === 'max'
+      ? `Claude: MAX — every prompt skipped (allow-wildcards ${state.claudeLayers.allow ? 'on' : 'off'}, approve-hook ${state.claudeLayers.hook ? 'on' : 'off'}). permissions.deny + circuit breakers still apply.`
+      : state.claude === 'bypass'
+        ? 'Claude: BYPASS — defaultMode flipped. Managed policy can disable this; MAX is the durable option.'
+        : 'Claude: prompts active.',
+    state.codex === 'max'
+      ? `Codex: MAX — approval_policy=never. The ${state.codexSandbox || 'configured'} sandbox is still the floor, so out-of-workspace writes and network remain blocked.`
+      : state.codex === 'prompts'
+        ? `Codex: prompts active (approval_policy=${state.codexApproval || 'default'}).`
+        : 'Codex: no config.toml found.',
+    '',
+    'Click to toggle Claude MAX.',
+  ].join('\n');
+  statusBar.backgroundColor = anyOn
+    ? new vscode.ThemeColor('statusBarItem.warningBackground') : undefined;
+  statusBar.show();
+}
+
+// Codex MAX writes Codex's own config.toml, so it takes no policy lock — it
+// shares no file with Auto Learn or the wildcarding pass.
+function toggleCodexMax() {
+  const text = codexConfigText();
+  if (text === null) {
+    vscode.window.showWarningMessage(
+      `permission-wildcarding: no Codex config at ${CODEX_CONFIG} — cannot toggle Codex MAX.`
+    );
+    return;
+  }
+  const turningOn = !isCodexMaxOn(text);
+  let res;
+  try {
+    res = applyCodexMax(text, turningOn);
+    if (res.blockedBy === 'enterprise-policy') {
+      const allowed = (res.allowed || []).join(', ') || 'none';
+      vscode.window.showWarningMessage(
+        res.restricted
+          ? "Codex MAX skips every prompt by setting approval_policy=\"never\", but your organization's " +
+            `Codex policy forbids it (allows only [${allowed}]). Codex will keep prompting; nothing was changed.`
+          : "Codex MAX: your organization's Codex policy permits no approval policy this can set " +
+            `(allowed: ${allowed}). Nothing was changed.`
+      );
+      return;
+    }
+    if (!res.changed) { updateStatusBar(); dashboard?.refresh(); return; }
+    fs.mkdirSync(path.dirname(CODEX_CONFIG), { recursive: true });
+    writeFileAtomicSync(CODEX_CONFIG, res.text);
+  } catch (err) {
+    vscode.window.showErrorMessage(`permission-wildcarding: Codex MAX toggle failed — ${err.message}`);
+    return;
+  }
+  const sandbox = sandboxMode(res.text) || 'configured';
+  if (turningOn) {
+    vscode.window.showWarningMessage(
+      `⚡ Codex MAX ON — approval_policy=${res.target}. ` +
+      (res.restricted
+        ? "Your organization's Codex policy forbids 'never', so this is the least-friction policy it allows. "
+        : 'Codex stops asking. ') +
+      `The ${sandbox} sandbox is untouched and still blocks out-of-workspace writes and network. ` +
+      'Restart Codex to apply.'
+    );
+  } else {
+    vscode.window.showInformationMessage(
+      `$(shield) Codex MAX OFF — approval_policy=${res.restoredTo ?? 'unset (key removed)'}. Restart Codex to apply.`
+    );
+  }
+  updateStatusBar();
+  dashboard?.refresh();
+}
+
+// Flip MAX mode: blanket allow-list wildcards (Layer 1) + a PreToolUse auto-approve
+// hook (Layer 2), independent of Claude Code's bypassPermissions mode. Reversible
+// via the sidecar snapshot. deny rules + circuit breakers still apply.
+function toggleMax() {
+  // Read and write under the lock: MAX-off unions the sidecar snapshot with
+  // whatever was granted since, so an Auto Learn write landing between the read
+  // and the write would be re-pruned back out.
+  let turningOn = false;
+  let layers = null;
+  try {
+    getPolicyLock().locked(() => {
+      const settings = readSettings();
+      if (!settings) {
+        vscode.window.showWarningMessage('permission-wildcarding: settings.json not found — cannot toggle MAX.');
+        return;
+      }
+      turningOn = !isMaxOn(settings);
+      const res = applyMax(settings, turningOn);
+      if (!res.changed) return;
+      writeFileAtomicSync(SETTINGS, JSON.stringify(res.settings, null, 2) + '\n');
+      if (!turningOn) {
+        // Purge MAX blanket entries from the backup so the policy guard does not
+        // treat them as "missing" and re-assert them, re-enabling MAX silently.
+        forgetFromBackup(buildMaxAllowSet(settings.permissions?.allow ?? []));
+      }
+      lastRun = Date.now();
+      layers = maxLayers(res.settings);
+    });
+  } catch (err) {
+    // User-initiated, so report the contention instead of deferring silently the
+    // way runWildcarding's watcher-driven pass does.
+    vscode.window.showErrorMessage(err?.code === POLICY_LOCK_CODE
+      ? `permission-wildcarding: ${POLICY_LOCK_BUSY_MESSAGE}`
+      : `permission-wildcarding: MAX toggle failed — ${err.message}`);
+    updateStatusBar();
+    dashboard?.refresh();
+    return;
+  }
+
+  if (layers && turningOn) {
+    vscode.window.showWarningMessage(
+      `⚡ MAX mode ON — every prompt skipped via allow-wildcards${layers.hook ? ' + approve hook' : ''} ` +
+      '(deny rules + circuit breakers still apply). Reload the window for the approve hook to take effect.',
+      'Reload Window'
+    ).then((choice) => {
+      if (choice === 'Reload Window') vscode.commands.executeCommand('workbench.action.reloadWindow');
+    });
+  } else if (layers) {
+    vscode.window.showInformationMessage(
+      '$(shield) MAX mode OFF — restored your allow list, kept anything approved while MAX was on, ' +
+      'and removed the approve hook. Reload the window to apply.'
+    );
+  }
+  updateStatusBar();
+  dashboard?.refresh();
+}
+
+
+function getPolicyLock() {
+  if (!policyLock) policyLock = createPolicyLock({ lockPath: POLICY_LOCK_PATH });
+  return policyLock;
+}
+
+function schedule(delay = 400) {
+  clearTimeout(debounceTimer);
+  // 400ms debounce — Claude Code may write settings.json in several rapid bursts.
+  debounceTimer = setTimeout(() => runWildcarding(), delay);
+}
+
+// Generalize + prune the allow list. `manual` = invoked via the button/command
+// (surface a status message even when nothing changed).
+function runWildcarding(manual = false) {
+  // Keep the status indicator current on every settings.json change — a flip via
+  // the CLI (`wildcard-perms --max` / `--bypass`) fires the watcher and lands here.
+  updateStatusBar();
+
+  let settings;
+  let before;
+  let after;
+  try {
+    getPolicyLock().locked(() => {
+      settings = readSettings();
+      if (!settings) return;
+      before = settings?.permissions?.allow ?? [];
+      after = processAllowList(before);
+      if (JSON.stringify(before) === JSON.stringify(after)) return;
+      writeAllow(settings, after);
+      lastRun = Date.now();
+    });
+  } catch (err) {
+    if (err?.code === POLICY_LOCK_CODE) {
+      // Auto Learn is mid-scan or mid-apply. Its write fires the watcher again,
+      // so a bounded retry keeps the list converging without spinning.
+      if (lockedRetries < 20) { lockedRetries += 1; schedule(1500); }
+      dashboard?.refresh();
+      return;
+    }
+    vscode.window.showErrorMessage(`permission-wildcarding: write failed — ${err.message}`);
+    dashboard?.refresh();
+    return;
+  }
+  lockedRetries = 0;
+  if (!settings) { dashboard?.refresh(); return; }
+
+  // Nothing changed — also guards the watcher loop (our own write re-fires the
+  // watcher; the idempotent check short-circuits on the second pass).
+  if (JSON.stringify(before) === JSON.stringify(after)) {
+    // Keep the backup fresh even when the list is already optimal, so approvals
+    // that arrive already-wildcarded still get captured. deny rides along: this
+    // is the path that runs on every settings change, so it is where a deny rule
+    // added by hand first reaches the backup.
+    backupPolicy(after, settings?.permissions?.deny);
+    if (manual) vscode.window.setStatusBarMessage('$(shield) permission-wildcarding: already optimal', 4000);
+    dashboard?.refresh();
+    return;
+  }
+
+  {
+    const addedList   = after.filter(p => !before.includes(p));
+    const removedList = before.filter(p => !after.includes(p));
+    if (addedList.length || removedList.length) {
+      vscode.window.showInformationMessage(
+        `$(shield) Wildcarded ${addedList.length} permission${addedList.length !== 1 ? 's' : ''}, pruned ${removedList.length} — ${after.length} total`,
+        { detail: addedList.map(p => `→ ${p}`).join('\n') }
+      );
+      vscode.window.setStatusBarMessage(
+        `$(shield) permission-wildcarding: +${addedList.length} -${removedList.length} → ${after.length} entries`,
+        5000
+      );
+    }
+  }
+
+  dashboard?.refresh();
+}
+
+// ── dashboard (Activity Bar webview) ────────────────────────────────────────────
+class WildcardingViewProvider {
+  static viewId = 'permissionWildcarding.dashboard';
+
+  constructor(context) {
+    this.context = context;
+    this.view = null;
+  }
+
+  resolveWebviewView(view) {
+    this.view = view;
+    view.webview.options = { enableScripts: true };
+    view.webview.html = this._html(view.webview);
+
+    view.webview.onDidReceiveMessage((msg) => {
+      switch (msg?.type) {
+        case 'runNow':       vscode.commands.executeCommand('permission-wildcarding.runNow'); break;
+        case 'restore':      vscode.commands.executeCommand('permission-wildcarding.restoreBackup'); break;
+        case 'autoLearnScan': vscode.commands.executeCommand('permission-wildcarding.autoLearnScan'); break;
+        case 'autoLearnReview': vscode.commands.executeCommand('permission-wildcarding.autoLearnReview'); break;
+        case 'autoLearnApply': vscode.commands.executeCommand('permission-wildcarding.autoLearnApplySafe'); break;
+        case 'autoLearnUndo': vscode.commands.executeCommand('permission-wildcarding.autoLearnUndo'); break;
+        case 'autoLearnMode': vscode.commands.executeCommand('permission-wildcarding.autoLearnCycleMode'); break;
+        case 'autoLearnWhy': vscode.commands.executeCommand('permission-wildcarding.autoLearnWhy'); break;
+        case 'toggleMax':    vscode.commands.executeCommand('permission-wildcarding.toggleMax'); break;
+        case 'toggleCodexMax': vscode.commands.executeCommand('permission-wildcarding.toggleCodexMax'); break;
+        case 'rebuildRecall': vscode.commands.executeCommand('permission-wildcarding.rebuildRecall'); break;
+        case 'lintMemory':   vscode.commands.executeCommand('permission-wildcarding.lintMemory'); break;
+        case 'refresh':      this.refresh(); break;
+        case 'remove':       this._remove(msg.value); break;
+      }
+    });
+
+    view.onDidChangeVisibility(() => { if (view.visible) this.refresh(); });
+    this.refresh();
+  }
+
+  // Push current state to the webview.
+  refresh() {
+    if (!this.view) return;
+    const settings = readSettings();
+    const allow = Array.isArray(settings?.permissions?.allow) ? settings.permissions.allow : [];
+    const wildcards = allow.filter((p) => p.includes('*')).sort();
+    const mode = currentMode(settings);
+    // What Wildcard Now would actually change. The "specific" tally is not that
+    // number: an entry with no `*` is often one the pass can never generalize
+    // (Edit, Write, WebSearch, an exact mcp__server__tool), so badging the button
+    // with it advertises work that resolves to "already optimal".
+    const optimized = processAllowList(allow);
+    const pendingWildcard = optimized.length === allow.length && optimized.every((p, i) => p === allow[i])
+      ? 0
+      : optimized.filter((p) => !allow.includes(p)).length + allow.filter((p) => !optimized.includes(p)).length;
+    // The live wildcarding pass watches Claude's settings.json; Auto Learn also
+    // reads Codex history (regardless of codexScope, which only gates rule writes).
+    // Name Codex in the status card whenever both are true, so the flagship line
+    // isn't Claude-only for a cross-agent tool.
+    const autoLearn = autoLearnCardData();
+    const codexWatching = !!autoLearn.enabled && fs.existsSync(CODEX_SESSIONS_DIR);
+    this.view.webview.postMessage({
+      type: 'data',
+      active: fs.existsSync(SETTINGS),
+      settingsPath: SETTINGS.replace(os.homedir(), '~'),
+      codexWatching,
+      total: allow.length,
+      wildcardCount: wildcards.length,
+      specificCount: allow.length - wildcards.length,
+      pendingWildcard,
+      backupCount: backupCount(),
+      wildcards,
+      lastRun,
+      max: { on: isMaxOn(settings), layers: maxLayers(settings) },
+      codexMax: (() => {
+        const state = frictionState();
+        const target = targetApproval(readEnterpriseBundle());
+        return {
+          on: state.codex === 'max',
+          absent: state.codex === 'absent',
+          approval: state.codexApproval,
+          sandbox: state.codexSandbox,
+          restricted: target.restricted,
+          allowed: target.allowed,
+        };
+      })(),
+      autoLearn,
+      memory: memoryCardData(),
+    });
+  }
+
+  // Remove a single permission entry (the per-row prune button).
+  _remove(perm) {
+    if (!perm) return;
+    const settings = readSettings();
+    if (!settings) return;
+    const allow = (settings.permissions?.allow ?? []).filter((p) => p !== perm);
+    try {
+      // Drop it from the backup first. The backup is a high-water mark, so
+      // without this the entry would come straight back on the next restore and
+      // the policy guard would keep reporting it as missing — a deliberate prune
+      // must be an instruction, not damage to recover from.
+      forgetFromBackup([perm]);
+      writeAllow(settings, allow);
+      lastRun = Date.now();
+      vscode.window.setStatusBarMessage(`$(shield) permission-wildcarding: removed ${perm}`, 4000);
+    } catch (err) {
+      vscode.window.showErrorMessage(`permission-wildcarding: remove failed — ${err.message}`);
+    }
+    this.refresh();
+  }
+
+  _html(webview) {
+    const nonce = crypto.randomBytes(16).toString('hex');
+    const csp = [
+      "default-src 'none'",
+      "style-src 'unsafe-inline'",
+      `script-src 'nonce-${nonce}'`,
+    ].join('; ');
+
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="${csp}">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+  body { font-family: var(--vscode-font-family); color: var(--vscode-foreground);
+         padding: 10px 12px; font-size: 13px; }
+  .card { background: var(--vscode-editorWidget-background, rgba(127,127,127,0.08));
+          border: 1px solid var(--vscode-widget-border, transparent);
+          border-radius: 6px; padding: 10px 12px; margin-bottom: 10px; }
+  .status { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--vscode-charts-green, #3fb950);
+         box-shadow: 0 0 6px var(--vscode-charts-green, #3fb950); flex: 0 0 auto; }
+  .dot.idle { background: var(--vscode-charts-yellow, #d29922); box-shadow: 0 0 6px var(--vscode-charts-yellow, #d29922); }
+  .dot.on { background: var(--vscode-charts-red, #f85149); box-shadow: 0 0 6px var(--vscode-charts-red, #f85149); }
+  #codexMaxCard.on, #maxCard.on { border-color: var(--vscode-charts-red, #f85149); }
+  button.bypass { width: 100%; padding: 7px; border-radius: 5px; cursor: pointer; margin-top: 8px;
+          font-size: 12px; font-weight: 600;
+          border: 1px solid var(--vscode-button-border, var(--vscode-widget-border, transparent));
+          background: var(--vscode-button-secondaryBackground, transparent);
+          color: var(--vscode-button-secondaryForeground, var(--vscode-foreground)); }
+  button.bypass.on { background: var(--vscode-charts-red, #f85149); color: #fff; border-color: transparent; }
+  button.bypass:hover { background: var(--vscode-button-secondaryHoverBackground, var(--vscode-list-hoverBackground)); }
+  button.bypass.on:hover { filter: brightness(1.1); }
+  .muted { color: var(--vscode-descriptionForeground); font-size: 11px; }
+  .sub { margin-top: 4px; }
+  .stats { display: flex; gap: 10px; }
+  .stat { flex: 1; text-align: center; }
+  .stat .n { font-size: 22px; font-weight: 700; line-height: 1.1; }
+  .stat .l { font-size: 10px; text-transform: uppercase; letter-spacing: .04em;
+             color: var(--vscode-descriptionForeground); }
+  button.run { width: 100%; padding: 7px; border: none; border-radius: 5px; cursor: pointer;
+          font-size: 13px; font-weight: 600; margin-bottom: 6px;
+          background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+  button.run:hover { background: var(--vscode-button-hoverBackground); }
+  button.restore { width: 100%; padding: 6px; border-radius: 5px; cursor: pointer;
+          font-size: 12px; margin-bottom: 12px;
+          border: 1px solid var(--vscode-button-border, var(--vscode-widget-border, transparent));
+          background: var(--vscode-button-secondaryBackground, transparent);
+          color: var(--vscode-button-secondaryForeground, var(--vscode-foreground)); }
+  button.restore:hover { background: var(--vscode-button-secondaryHoverBackground, var(--vscode-list-hoverBackground)); }
+  .listhead { display: flex; justify-content: space-between; align-items: baseline;
+              margin: 2px 2px 6px; cursor: pointer; user-select: none; }
+  .listhead:hover .h { color: var(--vscode-textLink-foreground); }
+  .listhead .h { font-weight: 600; }
+  #chev { display: inline-block; width: 1em; font-size: 10px; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li { display: flex; align-items: center; gap: 6px; padding: 4px 6px; border-radius: 4px; }
+  li:hover { background: var(--vscode-list-hoverBackground); }
+  li code { font-family: var(--vscode-editor-font-family, monospace); font-size: 12px;
+            flex: 1 1 auto; word-break: break-all; }
+  li .x { flex: 0 0 auto; cursor: pointer; border: none; background: transparent;
+          color: var(--vscode-descriptionForeground); font-size: 14px; line-height: 1;
+          padding: 2px 5px; border-radius: 4px; visibility: hidden; }
+  li:hover .x { visibility: visible; }
+  li .x:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-errorForeground); }
+  .empty { color: var(--vscode-descriptionForeground); font-style: italic; padding: 6px; }
+  #memDir { word-break: break-all; }
+  .memissues { margin: 8px 2px 6px; font-size: 11px; }
+  .memlink { color: var(--vscode-textLink-foreground); cursor: pointer; text-decoration: none; }
+  .memlink:hover { text-decoration: underline; }
+  .buttonrow { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 8px; }
+  .buttonrow button { margin: 0; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="status"><span id="dot" class="dot"></span><span id="statusText">Active</span></div>
+    <div class="muted sub" id="watching">watching settings.json</div>
+    <div class="muted" id="lastRun"></div>
+    <div class="muted" id="backup"></div>
+  </div>
+
+  <div class="card" id="autoLearnCard">
+    <div class="status"><span id="aldot" class="dot idle"></span><span id="altext">Auto Learn</span></div>
+    <div class="muted sub" id="alsub">loading cross-agent history state…</div>
+    <div class="stats" style="margin-top:8px">
+      <div class="stat"><div class="n" id="alsafe">–</div><div class="l">safe</div></div>
+      <div class="stat"><div class="n" id="alreview">–</div><div class="l">review</div></div>
+      <div class="stat"><div class="n" id="alobserve">–</div><div class="l">observing</div></div>
+    </div>
+    <div class="buttonrow">
+      <button class="restore" id="alScan">Scan now</button>
+      <button class="restore" id="alReview">Review</button>
+      <button class="restore" id="alUndo">Undo</button>
+      <button class="restore" id="alWhy">Why prompt?</button>
+    </div>
+  </div>
+
+  <div class="card" id="maxCard">
+    <div class="status"><span id="mdot" class="dot idle"></span><span id="mtext">Claude MAX: OFF</span></div>
+    <div class="muted sub" id="msub">Claude · skip every prompt — allow-wildcards + approve hook</div>
+    <button class="bypass" id="maxBtn">⚡ Turn Claude MAX ON</button>
+  </div>
+
+  <div class="card" id="codexMaxCard">
+    <div class="status"><span id="cxdot" class="dot idle"></span><span id="cxtext">Codex MAX: OFF</span></div>
+    <div class="muted sub" id="cxsub">Codex · approval_policy=never — sandbox stays as the floor</div>
+    <button class="bypass" id="codexMaxBtn">⚡ Turn Codex MAX ON</button>
+  </div>
+
+  <div class="card stats">
+    <div class="stat"><div class="n" id="total">–</div><div class="l">Approved</div></div>
+    <div class="stat"><div class="n" id="wildcards">–</div><div class="l">Wildcards</div></div>
+    <div class="stat"><div class="n" id="specific">–</div><div class="l">Specific</div></div>
+  </div>
+
+  <button class="run" id="runNow">⟳  Wildcard Now</button>
+  <button class="restore" id="restore" title="Merge your saved backup back into the allow list">⤺  Restore prunes from backup</button>
+
+  <div class="card" id="memCard" style="display:none">
+    <div class="status"><span id="llmDot" class="dot idle"></span><span id="llmText">CPU LLM</span></div>
+    <div class="muted sub" id="memDir"></div>
+    <div class="stats" style="margin-top:8px">
+      <div class="stat"><div class="n" id="memTok">–</div><div class="l">tok/session</div></div>
+      <div class="stat"><div class="n" id="memFiles">–</div><div class="l">files</div></div>
+      <div class="stat"><div class="n" id="memEmb">–</div><div class="l">embedded</div></div>
+    </div>
+    <div class="memissues" id="memIssues"></div>
+    <button class="restore" id="rebuild" title="Force a full CPU re-embed of the memory dir (recall.py --rebuild)">⟳  Rebuild recall index</button>
+  </div>
+
+  <div class="listhead" id="toggle" title="Click to collapse / expand">
+    <span class="h"><span id="chev">▾</span> Wildcards tracked</span>
+    <span class="muted" id="wcount"></span>
+  </div>
+  <ul id="list"></ul>
+
+<script nonce="${nonce}">
+  const vscode = acquireVsCodeApi();
+  const $ = (id) => document.getElementById(id);
+
+  const st = vscode.getState();
+  let collapsed = !!(st && st.collapsed);
+  function applyCollapsed() {
+    $('list').style.display = collapsed ? 'none' : '';
+    $('chev').textContent = collapsed ? '▸' : '▾';
+  }
+
+  function timeAgo(ts) {
+    if (!ts) return '';
+    const s = Math.round((Date.now() - ts) / 1000);
+    if (s < 5)   return 'last wildcarded: just now';
+    if (s < 60)  return 'last wildcarded: ' + s + 's ago';
+    if (s < 3600) return 'last wildcarded: ' + Math.round(s/60) + 'm ago';
+    return 'last wildcarded: ' + Math.round(s/3600) + 'h ago';
+  }
+
+  function renderMax(m) {
+    const on = !!(m && m.on);
+    const L = (m && m.layers) || {};
+    $('mdot').className = 'dot' + (on ? ' on' : ' idle');
+    $('mtext').textContent = on ? 'Claude MAX: ON — all Claude prompts skipped' : 'Claude MAX: OFF';
+    $('msub').textContent = on
+      ? 'Claude · layers: allow-wildcards ' + (L.allow ? '✓' : '✕') + ', approve-hook ' + (L.hook ? '✓' : '✕') + ' · deny still applies'
+      : 'Claude · skip every prompt — allow-wildcards + approve hook';
+    $('maxBtn').textContent = on ? '⚡ Turn Claude MAX OFF' : '⚡ Turn Claude MAX ON';
+    $('maxBtn').className = 'bypass' + (on ? ' on' : '');
+    $('maxCard').className = 'card' + (on ? ' on' : '');
+  }
+
+  function renderCodexMax(c) {
+    const on = !!(c && c.on);
+    const absent = !!(c && c.absent);
+    // "never" is the only approval_policy that skips every prompt. Where the org
+    // forbids it, Codex MAX has no on-state to reach, so it is unavailable rather
+    // than off — and the button is disabled, because clicking it can only write
+    // the org default (which the card would otherwise misread as "MAX on").
+    const restricted = !on && !absent && !!(c && c.restricted);
+    $('cxdot').className = 'dot' + (on ? ' on' : ' idle');
+    $('cxtext').textContent = absent
+      ? 'Codex MAX: no config.toml'
+      : on ? 'Codex MAX: ON — all Codex prompts skipped'
+      : restricted ? 'Codex MAX: unavailable — org policy caps approval'
+      : 'Codex MAX: OFF';
+    // Always name the remaining floor: this switch never touches the sandbox.
+    const allowed = (c && c.allowed && c.allowed.length) ? c.allowed.join(', ') : 'the org-permitted set';
+    $('cxsub').textContent = absent
+      ? 'Codex · no ~/.codex/config.toml found'
+      : on
+        ? 'Codex · approval_policy=' + (c.approval || '?') + (c.restricted ? ' (org policy caps this)' : '') + ' · ' + (c.sandbox || 'sandbox') + ' sandbox still blocks network + out-of-workspace writes'
+      : restricted
+        ? "Codex · org allows only [" + allowed + "], so 'never' (skip all prompts) can't be set. Current approval_policy=" + (c.approval || 'default') + '.'
+        : 'Codex · approval_policy=' + (c.approval || 'default') + ' — sandbox stays as the floor';
+    $('codexMaxBtn').textContent = on ? '⚡ Turn Codex MAX OFF' : '⚡ Turn Codex MAX ON';
+    $('codexMaxBtn').className = 'bypass' + (on ? ' on' : '');
+    $('codexMaxBtn').disabled = absent || restricted;
+    $('codexMaxCard').className = 'card' + (on ? ' on' : '');
+  }
+
+
+  function renderAutoLearn(a) {
+    a = a || {};
+    const counts = a.counts || {};
+    const active = !!a.enabled;
+    $('aldot').className = 'dot' + (active && !a.error ? '' : ' idle');
+    $('altext').textContent = 'Auto Learn: ' + String(a.mode || 'recommend').toUpperCase();
+    const notes = [active ? 'Claude + Codex history' : 'disabled', 'threshold ' + (a.threshold || 3), 'Codex ' + (a.codexScope || 'user')];
+    if (counts.covered) notes.push(counts.covered + ' already covered');
+    if (a.busy) notes.unshift('scanning…');
+    if (a.scopeWarning) notes.push(a.scopeWarning);
+    if (a.error) notes.push('error: ' + a.error);
+    $('alsub').textContent = notes.join(' · ');
+    $('alsafe').textContent = counts.safe || 0;
+    $('alreview').textContent = counts.review || 0;
+    $('alobserve').textContent = counts.observe || 0;
+    $('alUndo').disabled = !a.canUndo || !!a.busy;
+    for (const id of ['alScan', 'alWhy']) $(id).disabled = !!a.busy;
+    $('alReview').disabled = !active || !!a.busy || a.mode === 'observe';
+    $('alReview').textContent = (counts.review > 0) ? 'Review (' + counts.review + ')' : 'Review';
+  }
+
+  function fmtK(n) {
+    return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n);
+  }
+
+  function renderMemory(m) {
+    const card = $('memCard');
+    if (!m) { card.style.display = 'none'; return; }
+    card.style.display = '';
+
+    const ready = m.llm === 'ready';
+    $('llmDot').className = 'dot' + (ready ? '' : ' idle');
+    $('llmText').textContent = ready
+      ? 'CPU LLM: ready (bge-small, 384-dim)'
+      : (m.llm === 'model-missing' ? 'CPU LLM: model not found' : 'CPU LLM: venv not found');
+    $('llmText').style.fontWeight = '600';
+    $('memDir').textContent = m.dir;
+
+    $('memTok').textContent = fmtK(m.tokens);
+    $('memTok').title = 'budget ' + fmtK(m.budgetTokens) + ' tok/session';
+    if (m.overBudget) $('memTok').style.color = 'var(--vscode-charts-red, #f85149)';
+    else $('memTok').style.color = '';
+    $('memFiles').textContent = m.files;
+    $('memEmb').textContent = m.embedded == null ? '–' : m.embedded;
+    $('memEmb').title = m.embedded == null ? 'recall cache not built yet — click Rebuild' : 'memories in the recall vector cache';
+
+    const issues = [];
+    if (m.over)   issues.push(m.over + ' over budget');
+    if (m.broken) issues.push(m.broken + ' broken link' + (m.broken !== 1 ? 's' : ''));
+    const el = $('memIssues');
+    el.innerHTML = '';
+    if (issues.length) {
+      el.className = 'memissues';
+      const a = document.createElement('a');
+      a.className = 'memlink';
+      a.textContent = '⚠ ' + issues.join(' · ') + ' — open report';
+      a.addEventListener('click', (e) => { e.preventDefault(); vscode.postMessage({ type: 'lintMemory' }); });
+      el.appendChild(a);
+    } else {
+      el.className = 'memissues muted';
+      el.textContent = '✓ index clean, all links resolve';
+    }
+  }
+
+  function render(d) {
+    $('dot').className = 'dot' + (d.active ? '' : ' idle');
+    $('statusText').textContent = d.active ? 'Active' : 'Idle — settings.json not found';
+    $('watching').textContent = 'watching ' + d.settingsPath + (d.codexWatching ? ' + Codex history' : '');
+    renderMax(d.max);
+    renderCodexMax(d.codexMax);
+    renderAutoLearn(d.autoLearn);
+    renderMemory(d.memory);
+    $('lastRun').textContent = timeAgo(d.lastRun);
+    $('backup').textContent = d.backupCount
+      ? 'backup: ' + d.backupCount + ' entries saved'
+      : 'backup: none yet';
+    $('total').textContent = d.total;
+    $('wildcards').textContent = d.wildcardCount;
+    $('specific').textContent = d.specificCount;
+    $('wcount').textContent = d.wildcardCount + ' total';
+    $('runNow').textContent = (d.pendingWildcard > 0) ? '⟳  Wildcard Now (' + d.pendingWildcard + ')' : '⟳  Wildcard Now';
+
+    const list = $('list');
+    list.innerHTML = '';
+    if (!d.wildcards.length) {
+      const li = document.createElement('li');
+      li.className = 'empty';
+      li.textContent = 'No wildcards yet — approve some commands, or click Wildcard Now.';
+      list.appendChild(li);
+    } else {
+      for (const w of d.wildcards) {
+        const li = document.createElement('li');
+        const code = document.createElement('code');
+        code.textContent = w;
+        const x = document.createElement('button');
+        x.className = 'x'; x.textContent = '✕'; x.title = 'Remove this entry';
+        x.addEventListener('click', () => vscode.postMessage({ type: 'remove', value: w }));
+        li.appendChild(code); li.appendChild(x);
+        list.appendChild(li);
+      }
+    }
+    applyCollapsed();
+  }
+
+  $('toggle').addEventListener('click', () => {
+    collapsed = !collapsed;
+    vscode.setState({ collapsed });
+    applyCollapsed();
+  });
+  $('runNow').addEventListener('click', () => vscode.postMessage({ type: 'runNow' }));
+  $('alScan').addEventListener('click', () => vscode.postMessage({ type: 'autoLearnScan' }));
+  $('alReview').addEventListener('click', () => vscode.postMessage({ type: 'autoLearnReview' }));
+  $('alUndo').addEventListener('click', () => vscode.postMessage({ type: 'autoLearnUndo' }));
+  $('alWhy').addEventListener('click', () => vscode.postMessage({ type: 'autoLearnWhy' }));
+  $('restore').addEventListener('click', () => vscode.postMessage({ type: 'restore' }));
+  $('rebuild').addEventListener('click', () => vscode.postMessage({ type: 'rebuildRecall' }));
+  $('maxBtn').addEventListener('click', () => vscode.postMessage({ type: 'toggleMax' }));
+  $('codexMaxBtn').addEventListener('click', () => vscode.postMessage({ type: 'toggleCodexMax' }));
+  window.addEventListener('message', (e) => { if (e.data?.type === 'data') render(e.data); });
+  applyCollapsed();
+  vscode.postMessage({ type: 'refresh' });
+</script>
+</body>
+</html>`;
+  }
+}
+
+async function deactivate() {
+  clearTimeout(debounceTimer);
+  clearTimeout(memBounce);
+  clearTimeout(autoLearnBounce);
+  clearInterval(autoLearnTimer);
+  if (autoLearnWorkerRunner) await autoLearnWorkerRunner.deactivate();
+}
+
+module.exports = { activate, deactivate };

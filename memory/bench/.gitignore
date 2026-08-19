@@ -1,0 +1,7 @@
+# generated benchmark artifacts
+bench_report.md
+bench_results.csv
+__pycache__/
+
+# personal: maps the private memory corpus (filenames + topics) — keep local, do not publish
+queries.json

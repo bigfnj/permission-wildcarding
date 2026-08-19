@@ -1,0 +1,221 @@
+{
+  "name": "permission-wildcarding",
+  "displayName": "Permission Wildcarding",
+  "description": "Reduces Claude Code and Codex approval friction. Generalizes approved permissions into command-family wildcards on change, learns from Claude Code and Codex history (Auto Learn), recommends deterministic safe policy, writes separate Claude and validated Codex outputs, and includes memory-index diagnostics and MAX/bypass controls.",
+  "version": "1.0.0",
+  "publisher": "local",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bigfnj/permission-wildcarding.git"
+  },
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "permissionWildcarding",
+          "title": "Permission Wildcarding",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "permissionWildcarding": [
+        {
+          "type": "webview",
+          "id": "permissionWildcarding.dashboard",
+          "name": "Wildcarding"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "permission-wildcarding.runNow",
+        "title": "Permission Wildcarding: Wildcard Now",
+        "icon": "$(sync)"
+      },
+      {
+        "command": "permission-wildcarding.restoreBackup",
+        "title": "Permission Wildcarding: Restore prunes from backup",
+        "icon": "$(history)"
+      },
+      {
+        "command": "permission-wildcarding.scanHistory",
+        "title": "Permission Wildcarding: Auto Learn - Scan now (compatibility command)",
+        "icon": "$(search)"
+      },
+      {
+        "command": "permission-wildcarding.autoLearnScan",
+        "title": "Permission Wildcarding: Auto Learn - Scan now",
+        "icon": "$(sync)"
+      },
+      {
+        "command": "permission-wildcarding.autoLearnReview",
+        "title": "Permission Wildcarding: Auto Learn - Review candidates",
+        "icon": "$(checklist)"
+      },
+      {
+        "command": "permission-wildcarding.autoLearnApplySafe",
+        "title": "Permission Wildcarding: Auto Learn - Apply safe candidates",
+        "icon": "$(shield)"
+      },
+      {
+        "command": "permission-wildcarding.autoLearnUndo",
+        "title": "Permission Wildcarding: Auto Learn - Undo last application",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "permission-wildcarding.autoLearnCycleMode",
+        "title": "Permission Wildcarding: Auto Learn - Cycle mode",
+        "icon": "$(settings-gear)"
+      },
+      {
+        "command": "permission-wildcarding.autoLearnWhy",
+        "title": "Permission Wildcarding: Auto Learn - Why did this prompt?",
+        "icon": "$(question)"
+      },
+      {
+        "command": "permission-wildcarding.toggleMax",
+        "title": "Permission Wildcarding: Toggle Claude MAX (skip all Claude prompts — allow-wildcards + approve hook)",
+        "icon": "$(zap)"
+      },
+      {
+        "command": "permission-wildcarding.toggleCodexMax",
+        "title": "Permission Wildcarding: Toggle Codex MAX (Codex — approval_policy=never, sandbox kept)",
+        "icon": "$(zap)"
+      },
+      {
+        "command": "permission-wildcarding.lintMemory",
+        "title": "Permission Wildcarding: Lint memory index (MEMORY.md bloat + broken links)",
+        "icon": "$(book)"
+      },
+      {
+        "command": "permission-wildcarding.rebuildRecall",
+        "title": "Permission Wildcarding: Rebuild recall index (CPU bge-small re-embed)",
+        "icon": "$(sync)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "permission-wildcarding.toggleMax",
+          "when": "view == permissionWildcarding.dashboard",
+          "group": "navigation@1"
+        },
+        {
+          "command": "permission-wildcarding.runNow",
+          "when": "view == permissionWildcarding.dashboard",
+          "group": "navigation@2"
+        },
+        {
+          "command": "permission-wildcarding.autoLearnScan",
+          "when": "view == permissionWildcarding.dashboard",
+          "group": "navigation@3"
+        },
+        {
+          "command": "permission-wildcarding.restoreBackup",
+          "when": "view == permissionWildcarding.dashboard",
+          "group": "navigation@4"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Permission Wildcarding",
+      "properties": {
+        "permissionWildcarding.autoLearn.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Incrementally correlate Claude Code and Codex shell history on startup, on transcript changes, and during periodic reconciliation. Confirmed successes add evidence, failures are retained as negative evidence, and unanswered calls are ignored. Raw transcript arguments and absolute transcript paths are never saved in Auto Learn state."
+        },
+        "permissionWildcarding.autoLearn.mode": {
+          "type": "string",
+          "enum": [
+            "observe",
+            "recommend",
+            "auto-safe"
+          ],
+          "enumDescriptions": [
+            "Learn counts only; never propose or apply policy.",
+            "Learn continuously and show candidates for review (recommended).",
+            "Automatically apply only deterministic, suffix-closed read-only candidates after the success threshold and with zero confirmed failures."
+          ],
+          "default": "recommend",
+          "markdownDescription": "Auto Learn operating mode. `auto-safe` requires a suffix-closed read-only prefix, judged on the *pattern* rather than the observed command: an applied `Bash(<root> *)` also matches `<root> ... > <path>`, and no allow pattern can exclude a redirection. Auto-safe is therefore limited to roots where no argument can reach stdout — `echo`, `printf`, `Write-*`, `basename`, `dirname`, `Get-Date` and `git cat-file` are excluded, along with destructive, administrative, credential-related, network-capable, package-install, wrapper, and ambiguous candidates. All remain review-only. Accepted residual: an auto-safe root can still truncate a path with fixed content (`whoami > f`), so keep catastrophic paths in `permissions.deny`."
+        },
+        "permissionWildcarding.autoLearn.successThreshold": {
+          "type": "number",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 100,
+          "markdownDescription": "Successful correlated executions required before a normalized command family becomes eligible for automatic safe application."
+        },
+        "permissionWildcarding.autoLearn.intervalMinutes": {
+          "type": "number",
+          "default": 5,
+          "minimum": 1,
+          "maximum": 1440,
+          "markdownDescription": "Periodic reconciliation interval in minutes. File watchers usually learn sooner; reconciliation catches events missed while VS Code was suspended."
+        },
+        "permissionWildcarding.autoLearn.debounceSeconds": {
+          "type": "number",
+          "default": 20,
+          "minimum": 1,
+          "maximum": 600,
+          "markdownDescription": "How long to wait after transcript activity settles before a watcher-driven scan runs, in seconds. Higher = fewer scans during active work (the periodic reconcile is the backstop). Auto Learn reads incrementally, so a later scan just processes a larger batch — nothing is lost."
+        },
+        "permissionWildcarding.autoLearn.codexScope": {
+          "type": "string",
+          "enum": [
+            "user",
+            "workspace",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Write the dedicated user rule file at `~/.codex/rules/permission-wildcarding.rules`.",
+            "Write `.codex/rules/permission-wildcarding.rules` in the first trusted workspace folder.",
+            "Learn from Codex history but do not write Codex rules."
+          ],
+          "default": "user",
+          "markdownDescription": "Where validated generated Codex rules are written. Codex loads rules at startup, so restart Codex after a rule change."
+        },
+        "permissionWildcarding.autoLearn.codexExecutable": {
+          "type": "string",
+          "default": "codex",
+          "markdownDescription": "Command name or absolute path used for `codex execpolicy check`. Auto Learn never writes a Codex rule unless this validation succeeds."
+        },
+        "permissionWildcarding.memory.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Lint the Claude Code file-memory index (`MEMORY.md`) for bloat and broken links: a status-bar gauge plus editor diagnostics on over-budget hook lines and links to missing files."
+        },
+        "permissionWildcarding.memory.dir": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Absolute path to a specific memory dir to lint (the folder containing `MEMORY.md`). Leave empty to auto-discover every `~/.claude/projects/*/memory/MEMORY.md`."
+        },
+        "permissionWildcarding.memory.lineBudget": {
+          "type": "number",
+          "default": 300,
+          "markdownDescription": "Max characters for a single `MEMORY.md` index line before it's flagged. Hooks over this are drifting into changelog territory — move the detail into the memory file or the project repo."
+        },
+        "permissionWildcarding.memory.totalBudget": {
+          "type": "number",
+          "default": 12000,
+          "markdownDescription": "Byte budget for the whole always-loaded `MEMORY.md` index before the gauge warns."
+        },
+        "permissionWildcarding.memory.recallScript": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Absolute path to your permission-wildcarding repo's `memory/recall.py`. Enables the dashboard Memory card's **Rebuild recall index** button (a CPU bge-small re-embed of the memory dir). Leave empty to auto-detect the repo layout; the passive CPU-LLM status probe works either way."
+        }
+      }
+    }
+  }
+}

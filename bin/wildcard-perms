@@ -1,0 +1,360 @@
+#!/usr/bin/env node
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const os  = require('os');
+const {
+  processAllowList, writeFileAtomicSync, applyBypass, isBypassOn, currentMode,
+  applyMax, isMaxOn, maxLayers,
+} = require('../src/permissions');
+const {
+  createPolicyLock, POLICY_LOCK_CODE, POLICY_LOCK_PATH, POLICY_LOCK_BUSY_MESSAGE,
+} = require('../src/policy-lock');
+const {
+  CODEX_CONFIG, applyCodexMax, isCodexMaxOn, readApproval, sandboxMode,
+  readEnterpriseBundle, targetApproval,
+} = require('../src/codex-max');
+
+const SETTINGS  = path.join(os.homedir(), '.claude', 'settings.json');
+const PACK_PATH = path.join(__dirname, '..', 'patterns', 'starter-pack.json');
+const LEARN_USAGE = 'usage: wildcard-perms --learn scan|status|apply|undo ' +
+  '[--mode observe|recommend|auto-safe] [--workspace <path>] ' +
+  '[--codex-scope user|workspace|off] [--threshold <count>] ' +
+  '[--codex-executable <path>]\n';
+
+const argv = process.argv.slice(2);
+if (argv.includes('--learn')) {
+  learn(argv);
+} else if (argv.includes('--seed')) {
+  seed();
+} else if (argv.includes('--codex-max')) {
+  codexMax(argv);
+} else if (argv.includes('--max')) {
+  max(argv);
+} else if (argv.includes('--bypass')) {
+  bypass(argv);
+} else {
+  // Hook mode: drain stdin (Claude Code sends JSON context we don't need)
+  process.stdin.resume();
+  process.stdin.on('end', run);
+}
+
+function learnOption(args, name, fallback) {
+  const index = args.indexOf(name);
+  if (index === -1) return fallback;
+  const value = args[index + 1];
+  if (!value || value.startsWith('--')) throw new Error(`${name} requires a value`);
+  return value;
+}
+
+function learn(args) {
+  // Keep the PostToolUse hot path independent of the optional learner stack.
+  const { createAutoLearnManager } = require('../src/auto-learn-manager');
+  const index = args.indexOf('--learn');
+  const action = String(args[index + 1] || 'status').toLowerCase();
+
+  try {
+    const modeValue = learnOption(args, '--mode', null);
+    const mode = modeValue ? String(modeValue).toLowerCase() : null;
+    if (mode && !['observe', 'recommend', 'auto-safe'].includes(mode)) {
+      process.stderr.write(LEARN_USAGE);
+      process.exitCode = 1;
+      return;
+    }
+    const workspaceRoot = path.resolve(learnOption(args, '--workspace', process.cwd()));
+    const codexScope = String(learnOption(args, '--codex-scope', 'user')).toLowerCase();
+    if (!['user', 'workspace', 'off'].includes(codexScope)) {
+      process.stderr.write(LEARN_USAGE);
+      process.exitCode = 1;
+      return;
+    }
+    const thresholdValue = learnOption(args, '--threshold', null);
+    const threshold = thresholdValue === null ? null : Number(thresholdValue);
+    if (threshold !== null && (!Number.isInteger(threshold) || threshold < 1)) {
+      throw new Error('--threshold must be a positive integer');
+    }
+    const codexRulesPath = codexScope === 'off' ? null
+      : codexScope === 'workspace'
+        ? path.join(workspaceRoot, '.codex', 'rules', 'permission-wildcarding.rules')
+        : path.join(os.homedir(), '.codex', 'rules', 'permission-wildcarding.rules');
+    const manager = createAutoLearnManager({
+      workspaceRoot,
+      codexRulesPath,
+      codexExecutable: learnOption(args, '--codex-executable', 'codex'),
+      mode: mode || 'recommend',
+      threshold: threshold || 3,
+    });
+    if (mode || threshold !== null) {
+      const current = manager.status();
+      manager.setMode(mode || current.mode, threshold === null ? undefined : threshold);
+    }
+
+    let result;
+    if (action === 'scan') result = manager.scan();
+    else if (action === 'status') result = manager.status();
+    else if (action === 'apply') result = manager.apply({ includeReviewed: false });
+    else if (action === 'undo') result = manager.undo();
+    else {
+      process.stderr.write(LEARN_USAGE);
+      process.exitCode = 1;
+      return;
+    }
+    process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+  } catch (error) {
+    process.stderr.write(`wildcard-perms --learn ${action}: ${error.message}\n`);
+    process.exitCode = 1;
+  }
+}
+
+function readSettings() {
+  try {
+    return JSON.parse(fs.readFileSync(SETTINGS, 'utf8'));
+  } catch (err) {
+    if (err.code !== 'ENOENT') {
+      process.stderr.write(`wildcard-perms: read error: ${err.message}\n`);
+    }
+    return null;
+  }
+}
+
+function writeSettings(settings) {
+  // Atomic write with Windows-safe rename retry + in-place fallback.
+  writeFileAtomicSync(SETTINGS, JSON.stringify(settings, null, 2) + '\n');
+}
+
+function run() {
+  const settings = readSettings();
+  if (!settings) process.exit(0);
+
+  const before = settings?.permissions?.allow ?? [];
+  const after  = processAllowList(before);
+
+  if (JSON.stringify(before) === JSON.stringify(after)) process.exit(0);
+
+  try {
+    writeSettings({
+      ...settings,
+      permissions: { ...settings.permissions, allow: after },
+    });
+
+    const added   = after.filter(p => !before.includes(p));
+    const removed = before.filter(p => !after.includes(p));
+    process.stderr.write(
+      `wildcard-perms: +${added.length} -${removed.length} → ${after.length} entries\n`
+    );
+  } catch (err) {
+    process.stderr.write(`wildcard-perms: write error: ${err.message}\n`);
+  }
+
+  process.exit(0);
+}
+
+function seed() {
+  let pack;
+  try {
+    pack = JSON.parse(fs.readFileSync(PACK_PATH, 'utf8'));
+  } catch (err) {
+    process.stderr.write(`wildcard-perms --seed: cannot read starter pack: ${err.message}\n`);
+    process.exit(1);
+  }
+
+  const settings = readSettings() ?? {};
+  const existing = settings?.permissions?.allow ?? [];
+
+  // Merge: existing entries first (preserve ordering), then new pack entries
+  const merged = [...new Set([...existing, ...pack])];
+  const after  = processAllowList(merged);
+
+  if (JSON.stringify(existing) === JSON.stringify(after)) {
+    process.stdout.write('wildcard-perms --seed: allow list already covers starter pack — nothing to do\n');
+    process.exit(0);
+  }
+
+  try {
+    writeSettings({
+      ...settings,
+      permissions: { ...(settings.permissions ?? {}), allow: after },
+    });
+
+    const added   = after.filter(p => !existing.includes(p));
+    const removed = existing.filter(p => !after.includes(p));
+    process.stdout.write(
+      `wildcard-perms --seed: merged ${pack.length} starter entries — ` +
+      `+${added.length} added, ${removed.length} pruned → ${after.length} total\n`
+    );
+    if (added.length) {
+      process.stdout.write(added.map(p => `  + ${p}`).join('\n') + '\n');
+    }
+  } catch (err) {
+    process.stderr.write(`wildcard-perms --seed: write error: ${err.message}\n`);
+    process.exit(1);
+  }
+}
+
+// Every policy writer shares one lock, so a toggle cannot land between Auto
+// Learn's settings write and its claims write. Read and write both go inside:
+// MAX-off unions the sidecar snapshot with what was granted since, so a write
+// landing between the read and the write would be re-pruned back out.
+function withPolicyLock(flag, run) {
+  try {
+    createPolicyLock({ lockPath: POLICY_LOCK_PATH }).locked(run);
+  } catch (err) {
+    process.stderr.write(err?.code === POLICY_LOCK_CODE
+      ? `wildcard-perms ${flag}: ${POLICY_LOCK_BUSY_MESSAGE}\n`
+      : `wildcard-perms ${flag}: write error: ${err.message}\n`);
+    process.exit(1);
+  }
+}
+
+// Flip Claude Code's bypassPermissions mode on/off (our "skip every prompt"
+// switch). `--bypass on|off|status`; bare `--bypass` reports status. Turning on
+// stashes the previous mode so `off` restores it. Deny rules + Claude Code's
+// hard circuit breakers still apply — this suppresses prompts, not safeguards.
+function bypass(args) {
+  const cmd = (args[args.indexOf('--bypass') + 1] || 'status').toLowerCase();
+
+  if (cmd === 'status') {
+    const settings = readSettings() ?? {};
+    process.stdout.write(
+      `wildcard-perms bypass: ${isBypassOn(settings) ? 'ON' : 'OFF'} (defaultMode=${currentMode(settings)})\n`
+    );
+    return;
+  }
+
+  if (cmd !== 'on' && cmd !== 'off') {
+    process.stderr.write('usage: wildcard-perms --bypass on|off|status\n');
+    process.exit(1);
+  }
+
+  withPolicyLock('--bypass', () => {
+    const settings = readSettings() ?? {};
+    const res = applyBypass(settings, cmd === 'on');
+    if (!res.changed) {
+      process.stdout.write(`wildcard-perms bypass: already ${cmd.toUpperCase()} (defaultMode=${res.to})\n`);
+      return;
+    }
+    writeSettings(res.settings);
+    process.stdout.write(
+      `wildcard-perms bypass: ${res.from} → ${res.to} — ` +
+      `${cmd === 'on' ? 'ALL PROMPTS BYPASSED' : 'prompts restored'}. ` +
+      `Reload the Claude Code window (or wait for context rollover) to apply.\n`
+    );
+    if (cmd === 'on') {
+      process.stdout.write('  deny rules and hard circuit breakers still apply.\n');
+    }
+  });
+}
+
+// Codex MAX — the Codex-side counterpart of `--max`. Sets approval_policy in
+// ~/.codex/config.toml and deliberately leaves sandbox_mode alone, so prompts
+// stop but the sandbox stays as the floor (Codex has no deny list to fall back
+// on). It aims for "never" but obeys an enterprise requirements bundle that
+// restricts which policies are legal. `--codex-max on|off|status`.
+//
+// No policy lock here: this writes Codex's config.toml, not Claude's
+// settings.json, so it shares no file with Auto Learn or the wildcarding pass.
+function codexMax(args) {
+  const cmd = (args[args.indexOf('--codex-max') + 1] || 'status').toLowerCase();
+  const text = fs.existsSync(CODEX_CONFIG) ? fs.readFileSync(CODEX_CONFIG, 'utf8') : null;
+  const target = targetApproval(readEnterpriseBundle());
+
+  if (cmd === 'status') {
+    if (text === null) {
+      process.stdout.write(`wildcard-perms Codex MAX: no config at ${CODEX_CONFIG}\n`);
+      return;
+    }
+    process.stdout.write(
+      `wildcard-perms Codex MAX: ${isCodexMaxOn(text) ? 'ON' : 'OFF'} ` +
+      `(approval_policy=${readApproval(text) ?? 'unset'}, sandbox_mode=${sandboxMode(text) ?? 'unset'})\n`
+    );
+    if (target.restricted) {
+      process.stdout.write(
+        `  enterprise policy allows only [${(target.allowed || []).join(', ')}] — ` +
+        `'never' is not permitted, so the best available is ${target.value ?? 'nothing'}.\n`
+      );
+    }
+    return;
+  }
+
+  if (cmd !== 'on' && cmd !== 'off') {
+    process.stderr.write('usage: wildcard-perms --codex-max on|off|status\n');
+    process.exit(1);
+  }
+
+  const res = applyCodexMax(text ?? '', cmd === 'on');
+  if (res.blockedBy === 'enterprise-policy') {
+    process.stderr.write(
+      'wildcard-perms --codex-max: enterprise policy permits no approval policy this can set ' +
+      `(allowed: ${(res.allowed || []).join(', ') || 'none'}).\n`
+    );
+    process.exit(1);
+  }
+  if (!res.changed) {
+    process.stdout.write(`wildcard-perms Codex MAX: already ${cmd.toUpperCase()}\n`);
+    return;
+  }
+
+  try {
+    fs.mkdirSync(path.dirname(CODEX_CONFIG), { recursive: true });
+    writeFileAtomicSync(CODEX_CONFIG, res.text);
+    const sandbox = sandboxMode(res.text) ?? 'unset';
+    process.stdout.write(
+      `wildcard-perms Codex MAX: ${cmd.toUpperCase()} — ` +
+      `${cmd === 'on'
+        ? `approval_policy=${res.target}${res.restricted ? " (enterprise policy forbids 'never')" : ''} (sandbox_mode=${sandbox}, untouched)`
+        : `approval_policy=${res.restoredTo ?? 'unset (key removed)'}`}. ` +
+      'Restart Codex to apply.\n'
+    );
+    if (cmd === 'on') {
+      process.stdout.write(
+        `  the ${sandbox} sandbox is still the floor: out-of-workspace writes and network remain blocked.\n`
+      );
+    }
+  } catch (err) {
+    process.stderr.write(`wildcard-perms --codex-max: write error: ${err.message}\n`);
+    process.exit(1);
+  }
+}
+
+// Flip MAX mode — the two-layer "skip everything" switch (blanket allow-list
+// wildcards + a PreToolUse auto-approve hook), independent of Claude Code's
+// bypassPermissions mode. `--max on|off|status`; bare `--max` reports status.
+function max(args) {
+  const cmd = (args[args.indexOf('--max') + 1] || 'status').toLowerCase();
+
+  if (cmd === 'status') {
+    const settings = readSettings() ?? {};
+    const L = maxLayers(settings);
+    process.stdout.write(
+      `wildcard-perms MAX: ${isMaxOn(settings) ? 'ON' : 'OFF'} ` +
+      `(allow-wildcards=${L.allow ? 'on' : 'off'}, approve-hook=${L.hook ? 'on' : 'off'})\n`
+    );
+    return;
+  }
+
+  if (cmd !== 'on' && cmd !== 'off') {
+    process.stderr.write('usage: wildcard-perms --max on|off|status\n');
+    process.exit(1);
+  }
+
+  withPolicyLock('--max', () => {
+    const settings = readSettings() ?? {};
+    const res = applyMax(settings, cmd === 'on');
+    if (!res.changed) {
+      process.stdout.write(`wildcard-perms MAX: already ${cmd.toUpperCase()}\n`);
+      return;
+    }
+    writeSettings(res.settings);
+    const L = maxLayers(res.settings);
+    process.stdout.write(
+      `wildcard-perms MAX: ${cmd.toUpperCase()} — ` +
+      `${cmd === 'on' ? 'ALL PROMPTS SKIPPED' : 'restored your allow list (keeping anything approved since) + removed approve hook'} ` +
+      `(allow-wildcards=${L.allow ? 'on' : 'off'}, approve-hook=${L.hook ? 'on' : 'off'}). ` +
+      `Reload the Claude Code window to apply.\n`
+    );
+    if (cmd === 'on') {
+      process.stdout.write('  deny rules and hard circuit breakers still apply.\n');
+    }
+  });
+}

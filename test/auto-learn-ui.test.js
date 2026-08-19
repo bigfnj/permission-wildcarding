@@ -1,0 +1,166 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const {
+  applicationSummary, candidatePendingTargets, claudeDecisionExplanation,
+  claudePermissionDecision, codexCheckVariants, codexExecpolicyArgs, codexRestartSuffix,
+  isCandidateComplete, policyTargetLabel, reviewableCandidates,
+} = require('../vscode-extension/autoLearnUi');
+
+// Regression: the Review badge counted every candidate with a 'review'
+// disposition, but the picker hides the ones an existing allow rule already
+// covers. "Review (30)" opening a list of 1 is the button lying about its own
+// scope — both must read from reviewableCandidates.
+test('the review count matches what the picker will actually show', () => {
+  const settings = { permissions: { allow: ['Bash(rg *)', 'Bash(git *)'], deny: [] } };
+  const candidates = [
+    // Already covered by Bash(rg *) — hidden from the picker, so not counted.
+    { key: 'rg\0--files', claudePermission: 'Bash(rg --files *)', disposition: 'review', meetsThreshold: true },
+    // Already covered by Bash(git *).
+    { key: 'git\0status', claudePermission: 'Bash(git status *)', disposition: 'review', meetsThreshold: true },
+    // Genuinely new — the only thing the picker offers.
+    { key: 'tokei\0.',    claudePermission: 'Bash(tokei *)',      disposition: 'review', meetsThreshold: true },
+    // Below threshold and still observing — not ready either way.
+    { key: 'fd\0-e',      claudePermission: 'Bash(fd *)',         disposition: 'observe', meetsThreshold: false },
+  ];
+
+  const result = reviewableCandidates(candidates, {}, ['claude'], settings);
+  assert.equal(result.candidates.length, 1, 'only the uncovered candidate is offered');
+  assert.equal(result.candidates[0].claudePermission, 'Bash(tokei *)');
+  assert.equal(result.covered.length, 2, 'covered candidates are reported, not silently dropped');
+  assert.equal(result.ready.length, 3, 'the observing candidate is not ready');
+});
+
+test('with no settings to compare against, nothing is treated as covered', () => {
+  const candidates = [
+    { key: 'rg\0--files', claudePermission: 'Bash(rg --files *)', disposition: 'review', meetsThreshold: true },
+  ];
+  assert.equal(reviewableCandidates(candidates, {}, ['claude'], null).candidates.length, 1);
+  assert.equal(reviewableCandidates([], {}, ['claude'], null).candidates.length, 0);
+});
+
+test('candidate completion honors manager eligible and pending targets', () => {
+  const candidate = {
+    key: 'git\0status', eligibleTargets: ['claude'], pendingTargets: [],
+  };
+  assert.equal(isCandidateComplete(candidate, {}, ['claude', 'codex']), true);
+  assert.deepEqual(candidatePendingTargets({
+    ...candidate, pendingTargets: ['claude'],
+  }, {}, ['claude', 'codex']), ['claude']);
+});
+
+test('candidate completion falls back to per-target applied state', () => {
+  const candidate = { key: 'rg\0--files' };
+  const status = { applied: { claude: ['rg\0--files'], codex: [] } };
+  assert.deepEqual(candidatePendingTargets(candidate, status, ['claude', 'codex']), ['codex']);
+});
+
+test('application summary includes scan auto-application and later apply', () => {
+  assert.deepEqual(applicationSummary(
+    { application: { appliedKeys: ['git\0status'], changedTargets: ['claude'] } },
+    { appliedKeys: ['rg\0--files'], changedTargets: ['codex'] },
+  ), {
+    appliedCount: 2,
+    appliedKeys: ['git\0status', 'rg\0--files'],
+    changedTargets: ['claude', 'codex'],
+  });
+});
+
+test('Claude permission analysis reports deny then ask then allow precedence', () => {
+  const settings = { permissions: {
+    allow: ['Bash(git *)'], ask: ['Bash(git push *)'], deny: ['Bash(git push --force *)'],
+  } };
+  assert.equal(claudePermissionDecision(settings, 'Bash(git push --force origin)').decision, 'deny');
+  assert.equal(claudePermissionDecision(settings, 'Bash(git push origin)').decision, 'ask');
+  assert.equal(claudePermissionDecision(settings, 'Bash(git status)').decision, 'allow');
+  assert.equal(claudePermissionDecision(settings, 'Bash(rg TODO)').decision, 'default');
+  assert.match(
+    claudeDecisionExplanation(claudePermissionDecision(settings, 'Bash(git push origin)')),
+    /ASK.*Ask wins over allow.*prompt is expected/,
+  );
+});
+
+// The review list drops candidates an existing allow rule already covers. That
+// suppression reuses the same precedence check, so pin the shapes it depends on:
+// a candidate permission is a *wildcard* string, and coverage means an existing
+// rule matches it, not that the two are equal.
+test('an existing root wildcard reports a narrower candidate as already covered', () => {
+  const settings = { permissions: { allow: ['Bash(rg *)', 'Bash(git *)', 'Bash(tokei *)'] } };
+  const covered = (permission) =>
+    claudePermissionDecision(settings, permission).decision === 'allow';
+
+  assert.equal(covered('Bash(rg --files *)'), true, 'covered by Bash(rg *)');
+  assert.equal(covered('Bash(git status *)'), true, 'covered by Bash(git *)');
+  assert.equal(covered('Bash(tokei *)'), true, 'covered exactly');
+  assert.equal(covered('Bash(whoami *)'), false, 'nothing grants this yet');
+
+  // Coverage must not swallow a family a deny or ask rule governs — those still
+  // need to reach review so the user learns why the prompt persists.
+  const guarded = { permissions: {
+    allow: ['Bash(git *)'], ask: ['Bash(git push *)'], deny: ['Bash(git push --force *)'],
+  } };
+  assert.equal(claudePermissionDecision(guarded, 'Bash(git push *)').decision, 'ask');
+  assert.equal(claudePermissionDecision(guarded, 'Bash(git push --force *)').decision, 'deny');
+});
+
+// The confirmation gate used to key off `autoSafe`, which asks whether a machine
+// may apply something unattended — the wrong question for a human who has just
+// ticked rows in a picker. After auto-safe narrowed to suffix-closed roots,
+// nothing in the review list is ever auto-safe, so the prompt fired on every
+// selection and could not be avoided.
+test('confirmation is driven by risk and override, never by auto-safe eligibility', () => {
+  const { selectionsNeedingConfirmation } = require('../vscode-extension/autoLearnUi');
+  const readOnly = { key: 'a', risk: 'read-only', autoSafe: false, claudePermission: 'Bash(rg *)' };
+  const network = { key: 'b', risk: 'network', autoSafe: false, claudePermission: 'Bash(curl *)' };
+
+  // A plain read-only grant is exactly what the review list is for: no prompt,
+  // even though it is not auto-safe.
+  assert.deepEqual(selectionsNeedingConfirmation([readOnly]), []);
+  // Risk is what earns the prompt.
+  assert.deepEqual(
+    selectionsNeedingConfirmation([readOnly, network]).map((e) => e.candidate.key), ['b']);
+  // An auto-safe candidate is not special-cased either way — only its risk counts.
+  assert.deepEqual(
+    selectionsNeedingConfirmation([{ ...readOnly, autoSafe: true }]), []);
+
+  // A policy override earns the prompt on its own, so a grant the current deny
+  // or ask rules would defeat is never applied silently.
+  const overridden = selectionsNeedingConfirmation(
+    [readOnly], (candidate) => (candidate.key === 'a' ? 'deny' : null));
+  assert.deepEqual(overridden, [{ candidate: readOnly, override: 'deny' }]);
+
+  assert.deepEqual(selectionsNeedingConfirmation([]), []);
+  assert.deepEqual(selectionsNeedingConfirmation(undefined), []);
+});
+
+test('Codex Why checks normalized argv and the Windows PowerShell host wrapper', () => {
+  assert.deepEqual(codexCheckVariants(
+    'PowerShell', 'Get-ChildItem -Force', { argv: ['Get-ChildItem', '-Force'] },
+    'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+  ), [
+    { label: 'normalized command argv', argv: ['Get-ChildItem', '-Force'] },
+    {
+      label: 'Windows PowerShell host argv',
+      argv: [
+        'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+        '-Command', 'Get-ChildItem -Force',
+      ],
+    },
+  ]);
+  assert.deepEqual(codexExecpolicyArgs(
+    ['user.rules', 'workspace.rules'], ['rg', '--files'],
+  ), [
+    'execpolicy', 'check', '--pretty',
+    '--rules', 'user.rules', '--rules', 'workspace.rules',
+    '--', 'rg', '--files',
+  ]);
+});
+
+test('policy summaries name only changed targets and restart Codex only when needed', () => {
+  assert.equal(policyTargetLabel(['claude']), 'Claude');
+  assert.equal(policyTargetLabel(['codex']), 'Codex');
+  assert.equal(policyTargetLabel(['codex', 'claude', 'codex']), 'Claude and Codex');
+  assert.equal(codexRestartSuffix(['claude']), '');
+  assert.match(codexRestartSuffix(['codex']), /Restart Codex/);
+});
