@@ -124,7 +124,10 @@ VSIX and works under a managed policy.
 - **Editor diagnostics** squiggle every `MEMORY.md` hook line over the character budget
   and any index link pointing at a file that doesn't exist.
 - It auto-discovers every `~/.claude/projects/*/memory/MEMORY.md`, re-lints on save and on
-  external edits (so it catches an agent editing the file too), and is tunable via the
+  external edits (so it catches an agent editing the file too), and reconciles on a short
+  timer so a store that **moves** — Claude Code derives the project slug from the working
+  directory, so renaming a working root relocates the whole store to a new slug — is picked
+  up rather than freezing the gauge on a now-deleted path. Tunable via the
   `permissionWildcarding.memory.*` settings (`enabled`, `dir`, `lineBudget`, `totalBudget`).
   Command: `Permission Wildcarding: Lint memory index`.
 
