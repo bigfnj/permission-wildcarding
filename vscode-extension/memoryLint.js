@@ -17,6 +17,12 @@ const os = require('os');
 
 const PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
 
+// Backstop cadence for re-discovering the memory store. A file watcher can only
+// report on a directory that exists when the watcher is made, so when the store
+// MOVES every watcher dies at once and no surviving watcher can say so. Same
+// watcher-plus-periodic-reconcile shape Auto Learn uses, for the same reason.
+const RECONCILE_MS = 5 * 60 * 1000;
+
 function cfg() {
   const c = vscode.workspace.getConfiguration('permissionWildcarding');
   return {
@@ -123,8 +129,9 @@ class MemoryLint {
     this.status = null;
     this.diags = null;
     this.channel = null;
-    this.watchers = [];
+    this.watchers = new Map();
     this.debounce = null;
+    this.timer = null;
   }
 
   activate(context) {
@@ -141,23 +148,53 @@ class MemoryLint {
     );
 
     // External writes (an agent editing MEMORY.md outside the editor) + in-editor saves/opens.
-    for (const dir of discoverDirs(cfg())) {
+    // The per-dir watchers are (re)built from discovery inside refresh(), not once here:
+    // Claude Code derives the project slug from the working directory, so renaming a
+    // working root moves the whole store to a new slug. Watchers bound to the old dir then
+    // fire never again, and a gauge that only repaints on those events would sit frozen on
+    // stale numbers indefinitely — reporting a budget for a file that no longer exists.
+    context.subscriptions.push(
+      vscode.workspace.onDidSaveTextDocument((d) => { if (this.isMemory(d)) this.refresh(); }),
+      vscode.workspace.onDidOpenTextDocument((d) => { if (this.isMemory(d)) this.refresh(); }),
+      vscode.window.onDidChangeActiveTextEditor((e) => { if (e && this.isMemory(e.document)) this.refresh(); }),
+      { dispose: () => this.disposeWatchers() }
+    );
+
+    // The backstop: a move leaves no live watcher to report it, so re-discover on a timer.
+    this.timer = setInterval(() => this.refresh(), RECONCILE_MS);
+    if (typeof this.timer?.unref === 'function') this.timer.unref();
+    context.subscriptions.push({ dispose: () => { clearInterval(this.timer); this.timer = null; } });
+
+    this.refresh();
+  }
+
+  // Keep one watcher per discovered dir: add watchers for dirs that appeared, drop the
+  // ones whose dir went away. Called from refresh(), so the watcher set never outlives
+  // the discovery it came from.
+  syncWatchers(dirs) {
+    const wanted = new Set(dirs);
+    for (const [dir, watcher] of this.watchers) {
+      if (wanted.has(dir)) continue;
+      try { watcher.dispose(); } catch { /* already gone with the extension host */ }
+      this.watchers.delete(dir);
+    }
+    for (const dir of wanted) {
+      if (this.watchers.has(dir)) continue;
       const w = vscode.workspace.createFileSystemWatcher(
         new vscode.RelativePattern(vscode.Uri.file(dir), 'MEMORY.md')
       );
       w.onDidChange(() => this.schedule());
       w.onDidCreate(() => this.schedule());
       w.onDidDelete(() => this.schedule());
-      this.watchers.push(w);
-      context.subscriptions.push(w);
+      this.watchers.set(dir, w);
     }
-    context.subscriptions.push(
-      vscode.workspace.onDidSaveTextDocument((d) => { if (this.isMemory(d)) this.refresh(); }),
-      vscode.workspace.onDidOpenTextDocument((d) => { if (this.isMemory(d)) this.refresh(); }),
-      vscode.window.onDidChangeActiveTextEditor((e) => { if (e && this.isMemory(e.document)) this.refresh(); })
-    );
+  }
 
-    this.refresh();
+  disposeWatchers() {
+    for (const [, watcher] of this.watchers) {
+      try { watcher.dispose(); } catch { /* nothing left to release */ }
+    }
+    this.watchers.clear();
   }
 
   isMemory(doc) {
@@ -177,8 +214,9 @@ class MemoryLint {
 
   refresh() {
     const conf = cfg();
-    if (!conf.enabled) { this.status?.hide(); this.diags?.clear(); return; }
+    if (!conf.enabled) { this.status?.hide(); this.diags?.clear(); this.disposeWatchers(); return; }
     const dirs = discoverDirs(conf);
+    this.syncWatchers(dirs);
 
     // Diagnostics for every discovered MEMORY.md (squiggles show when the file is open).
     this.diags.clear();
