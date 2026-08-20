@@ -20,7 +20,8 @@ Usage (from anywhere):
     python recall.py --selftest        # verify the embedder reproduces its reference cosines
 
 Config via env:
-    RECALL_MEMORY_DIR   corpus to index      (default ~/.claude/projects/d---claude/memory)
+    RECALL_MEMORY_DIR   corpus to index      (default: the ~/.claude/projects/*/memory
+                                             holding the most memory files)
     RECALL_MODEL_DIR    bge-small.onnx dir   (default ./models, then desktopPet's copy)
 """
 import os, sys, re, json, argparse, unicodedata
@@ -51,8 +52,30 @@ import numpy as np
 import onnxruntime as ort
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MEMORY_DIR = os.environ.get("RECALL_MEMORY_DIR",
-                            os.path.expanduser(r"~/.claude/projects/d---claude/memory"))
+
+
+# Claude Code derives the project slug from the working directory, so the corpus moves
+# whenever the working root is renamed (D:\.claude -> D:\.ai-work did exactly that on
+# 2026-08-20 and left the old default pointing at a deleted directory). Discover the
+# store instead of hardcoding one slug: pick the ~/.claude/projects/*/memory holding the
+# most memory files, and only fall back to a literal when nothing is found.
+def _discover_memory_dir():
+    root = os.path.expanduser(r"~/.claude/projects")
+    best, best_count = None, 0
+    try:
+        for slug in os.listdir(root):
+            candidate = os.path.join(root, slug, "memory")
+            if not os.path.isdir(candidate):
+                continue
+            count = len([f for f in os.listdir(candidate) if f.endswith(".md")])
+            if count > best_count:
+                best, best_count = candidate, count
+    except OSError:
+        pass
+    return best or os.path.join(root, "d---ai-work", "memory")
+
+
+MEMORY_DIR = os.environ.get("RECALL_MEMORY_DIR") or _discover_memory_dir()
 INDEX_PATH = os.path.join(MEMORY_DIR, "recall_index.json")
 EMBED_CHAR_CAP = 8000          # per-file text handed to the tokenizer
 EXCLUDE = {"MEMORY.md"}        # the index is just hooks; skip it as a search target
