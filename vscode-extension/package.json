@@ -1,8 +1,8 @@
 {
   "name": "permission-wildcarding",
   "displayName": "Permission Wildcarding",
-  "description": "Reduces Claude Code and Codex approval friction. Generalizes approved permissions into command-family wildcards on change, learns from Claude Code and Codex history (Auto Learn), recommends deterministic safe policy, writes separate Claude and validated Codex outputs, and includes memory-index diagnostics and MAX/bypass controls.",
-  "version": "1.0.0",
+  "description": "Reduces Claude Code and Codex approval friction. Generalizes approved permissions into command-family wildcards on change, learns from Claude Code and Codex history (Auto Learn), recommends deterministic safe policy, writes separate Claude and validated Codex outputs, drains project-local approvals into user scope, installs a wildcardable shell style for the agent, and includes memory-index diagnostics and MAX/bypass controls.",
+  "version": "1.1.0",
   "publisher": "local",
   "license": "MIT",
   "repository": {
@@ -90,6 +90,16 @@
         "command": "permission-wildcarding.toggleCodexMax",
         "title": "Permission Wildcarding: Toggle Codex MAX (Codex — approval_policy=never, sandbox kept)",
         "icon": "$(zap)"
+      },
+      {
+        "command": "permission-wildcarding.drainLocal",
+        "title": "Permission Wildcarding: Drain project-local approvals into user scope",
+        "icon": "$(export)"
+      },
+      {
+        "command": "permission-wildcarding.toggleGuidance",
+        "title": "Permission Wildcarding: Toggle shell-style guidance in ~/.claude/CLAUDE.md",
+        "icon": "$(book)"
       },
       {
         "command": "permission-wildcarding.lintMemory",
@@ -189,6 +199,16 @@
           "type": "string",
           "default": "codex",
           "markdownDescription": "Command name or absolute path used for `codex execpolicy check`. Auto Learn never writes a Codex rule unless this validation succeeds."
+        },
+        "permissionWildcarding.localDrain.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Promote portable approvals from each workspace's `.claude/settings.local.json` — the file Claude Code writes an \"always approve\" into — up to user-scope `settings.json`, then drop the local entries user scope now covers. Only clean command families move (`Bash(<root> *)`, `Tool(<root> <sub> *)`); script blobs, absolute-path executables, MCP tools and file/web families stay local. A local entry is removed only after its promotion is verified in `settings.json`, so a pruned entry is always still granted. Refused while Claude MAX is on, because its blanket `Bash(*)` would match everything. Untrusted workspaces are read-only."
+        },
+        "permissionWildcarding.guidance.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Maintain a short managed block in each installed agent’s user-scope instruction file (`~/.claude/CLAUDE.md`, and `~/.codex/AGENTS.md` when Codex is installed) telling the agent to write one command per tool call. An approval is stored as the command *string*: a single command becomes a reusable wildcard, while a compound command (`cd x && build`, multi-statement PowerShell) is stored verbatim and never matches again — the friction no generalizer can fix after the fact. Codex needs it for a different reason: its policy is an argv prefix for the program actually executed, so a `bash -lc` wrapper around `cd x && build` is a `bash` invocation that no rule for the real tool can match. Marker-fenced, so turning it off removes exactly what was added."
         },
         "permissionWildcarding.memory.enabled": {
           "type": "boolean",

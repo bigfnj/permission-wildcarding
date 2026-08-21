@@ -52,6 +52,7 @@ function harness(tempHome) {
         };
       },
       onDidChangeConfiguration() { return disposable(); },
+      onDidChangeWorkspaceFolders() { return disposable(); },
     },
   };
 

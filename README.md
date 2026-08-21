@@ -20,8 +20,9 @@ subcommand. The safety boundary for the legacy hook is still your
 ## What's here
 
 - **`bin/wildcard-perms`** — the hook executable and CLI (Node); also supports
-  `--learn scan|status|apply|undo`, `--seed`, `--max on|off|status` (MAX mode), and
-  `--bypass on|off|status` (see below).
+  `--learn scan|status|apply|undo`, `--seed`, `--drain [--dry-run]` (project-local
+  approvals), `--guidance on|off|status` (agent shell style), `--max on|off|status`
+  (MAX mode), and `--bypass on|off|status` (see below).
 - **`src/permissions.js`** — the live Claude allow-list generalization logic, a
   legacy syntax-only mining helper, and the MAX-mode and bypass toggles.
 - **`src/auto-learn.js`**, **`src/history-adapters.js`**, **`src/auto-learn-manager.js`**,
@@ -32,6 +33,16 @@ subcommand. The safety boundary for the legacy hook is still your
   limits on what each may ever propose.
 - **`src/policy-lock.js`** — the advisory lock every policy writer takes, so Auto Learn and
   the wildcarding pass cannot interleave on `settings.json`.
+- **`src/local-settings.js`** — the project-local drain: which of a project's
+  `.claude/settings.local.json` approvals are portable enough to promote to user scope,
+  and the promote-verify-prune order that makes removing one loss-free (see below).
+- **`src/agent-guidance.js`** — the marker-fenced shell-style block written into each
+  installed agent's user-scope instruction file (`~/.claude/CLAUDE.md`, and
+  `~/.codex/AGENTS.md` when Codex is present), the only way to fix the approvals no
+  generalizer can ever match twice (see below).
+- **`memory/recall.py`** / **`src/recall-index.js`** — the CPU semantic-recall script
+  (bge-small ONNX), which the VSIX bundles, and the shared staleness predicate the
+  extension uses to decide whether re-embedding is needed at all.
 - **`patterns/starter-pack.json`** / **`patterns/starter-pack.md`** — a curated
   seed of common, safe wildcard patterns (documented in the `.md`).
 - **`vscode-extension/`** — optional VS Code extension. Watches `settings.json` live
@@ -109,6 +120,112 @@ To build a `.vsix` locally instead of downloading one:
 node scripts/package.mjs            # -> permission-wildcarding-<version>.vsix
 ```
 
+## Project-local approvals (the file that actually fills up)
+
+Claude Code persists an "always approve" into the **project's**
+`.claude/settings.local.json`, not the user-scope `settings.json` that every pass above
+targets. So the file where approvals actually accumulate was the one nothing generalized.
+Measured on one real repo: 167 entries, **68% already covered** by a user-scope wildcard,
+and most of the rest multi-statement PowerShell that can never match a second command.
+
+The drain moves them in one direction only — upward:
+
+- Each local entry goes through the same generalization pass the hook uses.
+- A **portable** command family (`Bash(<root> *)`, or the dispatcher form
+  `Bash(<root> <sub> *)`) is promoted to user scope, where one entry covers every project.
+- The local entry is removed **only once the promotion is verified on disk**. Coverage is
+  re-read from `settings.json` after the write, never assumed from what this pass intended
+  to write, so a failed or policy-filtered promotion can never revoke a grant the project
+  already had.
+- Everything else stays local: script blobs, absolute-path or quoted executables, `&` call
+  forms, shell keywords, and the non-shell families (`Read`/`Edit`/`Write`, MCP tools,
+  `WebFetch`). Those are the families Auto Learn keeps review-only, for the same reason — a
+  directory rule inferred from observed paths, or an opaque MCP tool, is not something one
+  project's approval should grant everywhere.
+- A `deny` rule beats a user `allow` entry, so a candidate your deny list matches is
+  reported, never promoted.
+- **Refused while Claude MAX is on.** Its blanket `Bash(*)` covers every local entry, so a
+  drain would empty the file — and MAX-off restores only the user-scope snapshot, so the
+  project's own grants would be gone for good.
+
+One redundancy the glob test cannot see is handled too: `Bash(git status)` is *not* matched
+by `Bash(git status *)`, which as a glob needs the space and something after it. When the
+family is granted and the entry differs from it only by that missing argument list, the entry
+is dead weight and goes. That check requires the family to key on the entry's own first
+token, which is what keeps an env-prefixed approval (`Bash(PYTHONUTF8=1 python -c ...)`,
+whose generalization drops the prefix) from being pruned against a family that would not
+match it.
+
+Before pruning anything it snapshots the project's pre-drain list to
+`~/.claude/backups/settings.local.<hash>.json` — a high-water union, one file per workspace.
+
+```bash
+bin/wildcard-perms --drain --dry-run                # report only, writes nothing
+bin/wildcard-perms --drain                          # promote, verify, prune
+bin/wildcard-perms --drain --workspace /path/to/repo
+```
+
+The hook does it automatically: Claude Code hands `cwd` to `PostToolUse`, which is exactly
+the project whose local file just changed. The extension does it on activation, on every
+write to a watched `.claude/settings.local.json`, and from the dashboard's
+**Project-local approvals** card (promote / redundant / project-only tallies plus a
+**Drain into user scope** button). Untrusted workspaces are read-only, and
+`permissionWildcarding.localDrain.enabled` turns the automatic pass off while leaving the
+button available.
+
+Codex has no counterpart to drain: it does not persist per-project approvals. Its
+`prefix_rule` file is authored by Auto Learn, at whichever scope `codexScope` names, and
+that choice is not second-guessed here.
+
+## Shell style the agent can wildcard
+
+Everything above acts *after* a prompt: approve once, generalize, never prompt for that
+family again. One class of friction escapes it completely. An approval is stored as the
+command **string** that was approved, and a compound command — `cd x && dotnet build`, or a
+multi-statement PowerShell block — has no single command root to key on, so
+`src/permissions.js` deliberately leaves it verbatim rather than shattering a quoted path
+into junk. Such an entry can never match a second command. A few hundred of them is what a
+full `settings.local.json` actually is.
+
+No generalizer can repair that after the fact, so the fix goes upstream: if the agent writes
+one command per call, the approval it produces is a family instead of a string literal. That
+is a prompt-side change, so it belongs in the agent's instructions — and the agent cannot
+install it itself, because editing its own permission surface is precisely what a permission
+classifier stops. So the extension writes it, into every installed agent's user-scope
+instruction file — `~/.claude/CLAUDE.md`, and `~/.codex/AGENTS.md` when Codex is present —
+as one short marker-fenced block:
+
+- one command per tool call — no `&&` / `;` / `|` chains, no multi-statement PowerShell
+- use the tool's own path flag rather than `cd`: `git -C <path> status`,
+  `npm --prefix <dir> run build`, `dotnet build <path>`, `tail -n 50 <file>`
+- call executables by bare name; a quoted absolute path can never be wildcarded at all
+- put multi-step work in a script and run the script — one permission, reusable forever,
+  which is the right answer whenever a build or a full verify needs several steps in order
+- `VAR=value <cmd>` prefixes are fine; they are stripped before matching
+
+A chain built only from already-allowed commands is fine — Claude Code checks each
+sub-command independently. The cost lands when a chain needs a *new* approval.
+
+Codex gets the same block for a different reason, and the block says so: Codex policy is an
+argv prefix for the program it actually executes, so a `bash -lc` wrapper around
+`cd x && dotnet build` is a `bash` invocation, and a learned `dotnet` prefix never applies to
+it. Neither agent's file is created unless that agent is installed — a target counts only if
+its config directory already exists, so a Claude-only machine never grows a `~/.codex`. Each
+file is backed up under its own name (`CLAUDE.md.pre-guidance`, `AGENTS.md.pre-guidance`)
+before it is first changed.
+
+The block is fenced by `<!-- BEGIN/END permission-wildcarding: shell style -->`, so it is
+idempotent to refresh, replaced rather than duplicated when a release changes the wording,
+and removed byte-for-byte when turned off. It is written on activation while
+`permissionWildcarding.guidance.enabled` is on (the default), from the dashboard's
+**Shell-style guidance** card, or from the CLI:
+
+```bash
+bin/wildcard-perms --guidance status
+bin/wildcard-perms --guidance on
+bin/wildcard-perms --guidance off
+```
+
 ## Memory-index lint
 
 The extension also keeps the Claude Code **file-memory index** honest. `MEMORY.md`
@@ -131,9 +248,20 @@ VSIX and works under a managed policy.
   `permissionWildcarding.memory.*` settings (`enabled`, `dir`, `lineBudget`, `totalBudget`).
   Command: `Permission Wildcarding: Lint memory index`.
 
-The semantic-recall side of memory hygiene lives in this repo at
-[`memory/recall.py`](memory/README.md) — a CPU (bge-small ONNX) tool, deliberately kept as
-a standalone script rather than bundled into the extension.
+The semantic-recall side of memory hygiene is [`memory/recall.py`](memory/README.md) — a CPU
+(bge-small ONNX) tool. The **script** ships inside the VSIX, so a fresh install can rebuild
+the index with no checkout on disk. The **32MB model** does not: a versioned extension dir
+would re-download it on every upgrade, so the Memory card fetches it on first use into
+`~/.claude/wildcarding/models/` — outside both the extension dir and any checkout, so it
+survives upgrades, a deleted clone, and a synced OneDrive folder. An existing copy anywhere
+on the usual search path is used as-is rather than re-fetched, and the vocab is seeded beside
+it first, because a model without its vocab fails at embed time rather than download time.
+
+No Python runs until you click **Rebuild recall index** (a full `--rebuild`, because you
+asked for one). The background sync is incremental instead: it fires only when the cache is
+genuinely behind the corpus — compared by name, size and mtime, excluding `MEMORY.md`, which
+is the index and is never embedded — and then re-embeds only the files that changed, without
+even loading the ONNX session when there is nothing to do.
 
 ## Auto Learn: Claude Code + Codex history
 
@@ -278,7 +406,7 @@ and [permissions](https://learn.chatgpt.com/docs/permissions) documentation.
 The current Auto Learn path is pure Node and does not call an LLM. CPU BGE embeddings for
 clustering and local Ollama labels or explanations are possible future advisory extensions,
 but neither is wired into Auto Learn today. If added, model output will not override
-deterministic parsing, risk classification, or `codex execpolicy check`. The standalone
+deterministic parsing, risk classification, or `codex execpolicy check`. The
 `memory/recall.py` BGE index described above is a separate memory-search feature and does not
 participate in permission learning.
 
@@ -464,9 +592,11 @@ gh release create v1.2.0 --generate-notes
 
 ## Note
 
-The live `PostToolUse` hook only generalizes permissions persisted to
-`~/.claude/settings.json` (approved with *"always / don't ask again"*). Auto Learn is the
+The live `PostToolUse` hook generalizes the permissions an *"always / don't ask again"*
+approval persists — in `~/.claude/settings.json`, and in the project's
+`.claude/settings.local.json`, which is where Claude Code puts them now. Auto Learn is the
 history-aware path: it can learn from confirmed successful one-time executions while retaining
-failures as negative evidence and ignoring unanswered calls.
+failures as negative evidence and ignoring unanswered calls. The guidance block is the
+prompt-side path: it stops un-generalizable approvals from being created at all.
 
 Requires Node >= 18. MIT licensed.

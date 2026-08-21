@@ -122,11 +122,21 @@ for everything.
 | Permission | Purpose |
 |---|---|
 | `Bash(dotnet *)` | All dotnet subcommands (build, run, test, publish…) |
+| `PowerShell(dotnet *)` | The same, from a PowerShell session |
+| `Bash(msbuild *)` | MSBuild invocations (`msbuild x.sln /t:Rebuild`) |
+| `PowerShell(msbuild *)` | The same, from a PowerShell session |
 
 > **Note:** This starter entry intentionally keeps the legacy root-wide scope.
 > Newly observed `dotnet` approvals now retain their subcommand boundary, but seeding
 > `Bash(dotnet *)` remains the friction-first choice documented here. Use
 > `permissions.deny` if you want to carve any operations back out.
+
+> **`msbuild` is fixed-purpose, not a dispatcher.** Its arguments are project files and
+> `/t:` switches rather than subcommands, so it is deliberately absent from
+> `MIXED_FAMILY_ROOTS`: a newly observed approval collapses to `Bash(msbuild *)` on its
+> own, matching what the seed grants. Both tools are listed because a .NET repo prompts
+> for `dotnet build` and `msbuild` interchangeably, and `Bash(...)` and `PowerShell(...)`
+> are separate permission namespaces — granting one never covers the other.
 
 ---
 

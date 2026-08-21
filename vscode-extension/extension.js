@@ -27,6 +27,9 @@ const {
   managedSettingsPaths, policySignalPaths, policyLimitsPath, policyRestrictions, assessPolicy,
 } = require('./src/policy-guard');
 const { extractInvocations, candidateKey } = require('./src/auto-learn');
+const { recallIndexCount, recallIndexStatus } = require('./src/recall-index');
+const { drainLocalSettings, localSettingsPath, LOCAL_RELATIVE } = require('./src/local-settings');
+const { guidanceStatusAll, setGuidanceAll } = require('./src/agent-guidance');
 const {
   applicationSummary, candidatePendingTargets, claudeDecisionExplanation,
   claudePermissionDecision, codexCheckVariants, codexExecpolicyArgs, codexRestartSuffix,
@@ -65,6 +68,8 @@ let autoLearnManager = null;
 let autoLearnManagerKey = '';
 let autoLearnCardCache = null;  // { key, data }; key includes the state file stamp
 let autoLearnWorkerRunner = null;
+let localDrainBounce = null;    // debounce for settings.local.json writes
+let localDrainAt = null;        // timestamp of the last local drain that changed something
 
 // ── settings.json helpers ─────────────────────────────────────────────────────
 function readSettings() {
@@ -351,13 +356,13 @@ function toolboxPython() {
 
 // Absolute path to recall.py, resolved in order:
 //   1. the configured override (permissionWildcarding.memory.recallScript)
-//   2. the dev layout — vscode-extension/ sits next to memory/ (works when running from
-//      the repo checkout, e.g. F5; NOT from an installed VSIX, which doesn't bundle the
-//      sibling memory/ dir, so __dirname points into the extensions folder instead)
-//   3. an open workspace folder that IS or CONTAINS the permission-wildcarding repo — the repo
-//      is normally open when you'd click Rebuild, and it can live on any drive, so probe the
-//      usual layouts (folder = repo | a projects/ dir | a .claude/ root) rather than a fixed path
-//   4. the ~/.claude/projects/permission-wildcarding convention
+//   2. the copy bundled into the VSIX by scripts/package.mjs — the normal case for an
+//      installed extension, and why a fresh install no longer needs a checkout at all
+//   3. the dev layout — vscode-extension/ sits next to memory/ (running from the repo, e.g. F5)
+//   4. an open workspace folder that IS or CONTAINS the permission-wildcarding repo — it can
+//      live on any drive, so probe the usual layouts (folder = repo | a projects/ dir |
+//      a .claude/ root) rather than a fixed path
+//   5. the ~/.claude/projects/permission-wildcarding convention
 // Empty string when none resolve — the rebuild button then guides the user to set it, while
 // the passive status probe keeps working regardless.
 function recallScriptPath() {
@@ -365,6 +370,9 @@ function recallScriptPath() {
   if (typeof c === 'string' && c.trim() && fs.existsSync(c.trim())) return c.trim();
 
   const hit = (p) => (p && fs.existsSync(p) ? p : '');
+
+  const bundled = hit(path.join(__dirname, 'memory', 'recall.py'));
+  if (bundled) return bundled;
 
   const dev = hit(path.join(__dirname, '..', 'memory', 'recall.py'));
   if (dev) return dev;
@@ -380,16 +388,47 @@ function recallScriptPath() {
   return hit(path.join(PROJECTS_DIR, 'permission-wildcarding', 'memory', 'recall.py'));
 }
 
-// Where bge-small.onnx lives — mirrors recall.py's own search order.
-function recallModelDir() {
-  const rp = recallScriptPath();
-  const cands = [
+// Stable home for the 32MB model, deliberately outside both the extension dir and any
+// checkout: the extension dir is replaced on every upgrade (which would mean a
+// re-download per version), and a checkout can be deleted or sit in a synced OneDrive
+// folder. Same ~/.claude/wildcarding state dir MAX mode writes its approve hook into.
+const RECALL_MODEL_HOME = path.join(os.homedir(), '.claude', 'wildcarding', 'models');
+const RECALL_MODEL_FILE = 'bge-small.onnx';
+const RECALL_VOCAB_FILE = 'bge-small.vocab.txt';
+
+// Every dir that could already hold the model, most stable first. These are read
+// probes: an existing copy anywhere here is used as-is and never re-downloaded.
+function recallModelCandidates() {
+  const script = recallScriptPath();
+  return [
     process.env.RECALL_MODEL_DIR,
-    rp ? path.join(path.dirname(rp), 'models') : '',
+    RECALL_MODEL_HOME,
+    script ? path.join(path.dirname(script), 'models') : '',
+    path.join(__dirname, 'memory', 'models'),
     path.join(__dirname, '..', 'memory', 'models'),
     'D:\\.claude\\projects\\desktopPet\\src\\Models',
-  ];
-  for (const d of cands) { if (d && fs.existsSync(path.join(d, 'bge-small.onnx'))) return d; }
+  ].filter(Boolean);
+}
+
+// Where a *usable* bge-small lives — mirrors recall.py's own search order, and requires
+// the vocab beside the model, because recall.py's Bge loads the vocab from whichever dir
+// it resolved the model in. A model-only dir would resolve here and then fail at embed
+// time, so it is skipped in favour of a complete one.
+function recallModelDir() {
+  for (const dir of recallModelCandidates()) {
+    if (fs.existsSync(path.join(dir, RECALL_MODEL_FILE)) &&
+        fs.existsSync(path.join(dir, RECALL_VOCAB_FILE))) return dir;
+  }
+  return '';
+}
+
+// A vocab to seed the model home from. Small and git-tracked, so the bundled copy is
+// always available even on a machine that has never held the model.
+function recallVocabSource() {
+  for (const dir of recallModelCandidates()) {
+    const candidate = path.join(dir, RECALL_VOCAB_FILE);
+    if (fs.existsSync(candidate)) return candidate;
+  }
   return '';
 }
 
@@ -404,19 +443,10 @@ function recallStatus() {
   return { py, modelDir, venv, model, state };
 }
 
-// How many memories are in the vector cache — read straight from recall_index.json
-// (no python). null when the cache hasn't been built yet.
-function recallIndexCount(memDir) {
-  try {
-    const idx = JSON.parse(fs.readFileSync(path.join(memDir, 'recall_index.json'), 'utf8'));
-    return Object.keys(idx.files || {}).length;
-  } catch { return null; }
-}
-
-// Fetch the CPU recall model on demand. Same asset recall.py/desktopPet already ship
-// (bge-small-en-v1.5, int8 ONNX, ~32MB) — the model itself is gitignored (only the
-// vocab is committed) because that's too big to ship in every VSIX/clone, so a fresh
-// install has nothing until a sibling copy is beside it or this runs. Source is
+// Fetch the CPU recall model on demand into RECALL_MODEL_HOME. Same asset
+// recall.py/desktopPet already ship (bge-small-en-v1.5, int8 ONNX, ~32MB). The model is
+// gitignored and stays out of the VSIX (only the vocab is committed and bundled) because
+// 32MB per release would be re-downloaded on every upgrade. Source is
 // Xenova/bge-small-en-v1.5 on Hugging Face (a public repo, no token). Follows
 // redirects itself (Node's https doesn't) since HF's /resolve/ URLs 302 to a CDN host.
 const RECALL_MODEL_URL = 'https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/main/onnx/model_quantized.onnx';
@@ -440,15 +470,34 @@ function httpsGetFollow(url, onResponse, redirectsLeft = 5) {
 
 // Downloads to `<dest>.tmp` and renames on success so a cancelled/failed run never
 // leaves a half-written bge-small.onnx that would falsely read as "model present".
-function downloadRecallModel(script) {
-  const modelDir = path.join(path.dirname(script), 'models');
-  const dest = path.join(modelDir, 'bge-small.onnx');
+function downloadRecallModel() {
+  const modelDir = RECALL_MODEL_HOME;
+  const dest = path.join(modelDir, RECALL_MODEL_FILE);
   const tmp = dest + '.tmp';
+  const vocabSource = recallVocabSource();
+  const vocabTarget = path.join(modelDir, RECALL_VOCAB_FILE);
 
   return vscode.window.withProgress(
     { location: vscode.ProgressLocation.Notification, title: 'permission-wildcarding: downloading recall model (bge-small, ~32MB)…', cancellable: true },
     (progress, token) => new Promise((resolve) => {
       fs.mkdirSync(modelDir, { recursive: true });
+
+      // Seed the vocab first: the model cannot load without it, and failing before a
+      // 32MB transfer is friendlier than failing after one.
+      if (!fs.existsSync(vocabTarget)) {
+        if (!vocabSource) {
+          vscode.window.showErrorMessage(
+            `permission-wildcarding: ${RECALL_VOCAB_FILE} not found — cannot set up the recall model.`);
+          resolve(false); return;
+        }
+        try { fs.copyFileSync(vocabSource, vocabTarget); }
+        catch (err) {
+          vscode.window.showErrorMessage(
+            `permission-wildcarding: could not copy ${RECALL_VOCAB_FILE} — ${err.message}`);
+          resolve(false); return;
+        }
+      }
+
       const out = fs.createWriteStream(tmp);
       let received = 0, total = 0, reported = 0, activeReq = null;
 
@@ -515,11 +564,12 @@ async function rebuildRecall() {
       'Download', 'Cancel'
     );
     if (choice !== 'Download') return;
-    const ok = await downloadRecallModel(script);
+    const ok = await downloadRecallModel();
     if (!ok) return;
     st = recallStatus();
     if (!st.model) {
-      vscode.window.showErrorMessage('permission-wildcarding: model download reported success but bge-small.onnx still was not detected — check the models/ folder next to recall.py.');
+      vscode.window.showErrorMessage(
+        `permission-wildcarding: model download reported success but ${RECALL_MODEL_FILE} still was not detected — check ${RECALL_MODEL_HOME}.`);
       return;
     }
   }
@@ -542,40 +592,41 @@ async function rebuildRecall() {
   );
 }
 
-// Silent background rebuild: no progress modal, no prompts, no downloads.
-// Only fires when the model + venv + script are already present AND the index
-// is behind the file count AND the cooldown (15 min) has expired.
+// Silent background sync: no progress modal, no prompts, no downloads. Fires only when
+// the script + venv + model are already present, the cache is genuinely behind the
+// corpus, and the cooldown (15 min) has expired.
+//
+// Runs recall.py WITHOUT --rebuild, i.e. its incremental build_or_update: entries for
+// deleted files are dropped, only changed files are re-embedded, and the ONNX session is
+// not even constructed when there is nothing to do. --rebuild is force=True and belongs
+// to the button, where the user asked for a full re-embed; on this path it re-embedded
+// the entire corpus every tick — and because staleness was a count comparison against a
+// file set that included MEMORY.md (which recall.py never embeds), every tick was 'stale'.
 const RECALL_AUTO_COOLDOWN_MS = 15 * 60 * 1000;
-function autoRebuildRecallIfStale() {
+function autoSyncRecallIfStale() {
   try {
     if (Date.now() - recallRebuildAt < RECALL_AUTO_COOLDOWN_MS) return;
     const { dir } = memoryReport();
     if (!dir) return;
-    const embedded = recallIndexCount(dir);
     const script = recallScriptPath();
     const st = recallStatus();
-    // Only auto-rebuild when everything is already in place — no downloads, no prompts.
+    // Only sync when everything is already in place — no downloads, no prompts.
     if (!script || !st.venv || !st.model) return;
-    // Count actual .md files in the memory dir (same set recall.py embeds).
-    let fileCount = 0;
-    try {
-      fileCount = fs.readdirSync(dir).filter((f) => f.endsWith('.md')).length;
-    } catch { return; }
-    if (embedded != null && embedded >= fileCount) return; // already current
+    if (!recallIndexStatus(dir).stale) return; // cache already matches the corpus
     recallRebuildAt = Date.now();
     const env = { ...process.env, RECALL_MODEL_DIR: st.modelDir, RECALL_MEMORY_DIR: dir, RECALL_REEXEC: '1' };
-    execFile(st.py, [script, '--rebuild'], { env, timeout: 180000 }, (err, _stdout, stderr) => {
+    execFile(st.py, [script, '--list'], { env, timeout: 180000 }, (err, _stdout, stderr) => {
       if (!err) {
         const n = recallIndexCount(dir);
         vscode.window.setStatusBarMessage(
-          `$(book) Recall index rebuilt${n != null ? ` — ${n} memories embedded` : ''}`, 5000
+          `$(book) Recall index synced${n != null ? ` — ${n} memories embedded` : ''}`, 5000
         );
       } else {
-        console.error('permission-wildcarding: auto recall rebuild failed —', (stderr || err.message || '').trim().slice(0, 300));
+        console.error('permission-wildcarding: auto recall sync failed —', (stderr || err.message || '').trim().slice(0, 300));
       }
       dashboard?.refresh();
     });
-  } catch { /* auto-rebuild is best-effort — never break anything else */ }
+  } catch { /* auto-sync is best-effort — never break anything else */ }
 }
 
 async function setRecallPath() {
@@ -599,13 +650,18 @@ function memoryCardData() {
     const { conf, dir, report } = memoryReport();
     if (dir && report) {
       const st = recallStatus();
+      // embedded/indexable both exclude MEMORY.md, so a complete cache reads N of N
+      // rather than looking one short forever.
+      const recall = recallIndexStatus(dir);
       out = {
         dir: dir.replace(os.homedir(), '~'),
         tokens: report.tokens,
         budgetTokens: Math.round(conf.totalBudget / 4),
         overBudget: report.bytes > conf.totalBudget,
         files: report.fileCount,
-        embedded: recallIndexCount(dir),
+        indexable: recall.indexable,
+        embedded: recall.embedded,
+        stale: recall.stale,
         over: report.over.length,
         broken: report.broken.length,
         unresolved: report.unresolved.length,
@@ -1287,6 +1343,49 @@ function registerAutoLearnWatchers(context) {
   resetAutoLearnTimer();
 }
 
+// Watch each workspace folder's .claude/settings.local.json — the file Claude
+// Code actually writes an "always approve" into. This is the loop that was
+// missing: the approval lands locally, its portable form is promoted to user
+// scope, and no other project ever prompts for that command again.
+function registerLocalWatchers(context) {
+  const watchers = [];
+  const attach = () => {
+    while (watchers.length) { try { watchers.pop().dispose(); } catch { /* already gone */ } }
+    for (const folder of vscode.workspace.workspaceFolders || []) {
+      try {
+        const watcher = vscode.workspace.createFileSystemWatcher(
+          new vscode.RelativePattern(folder, LOCAL_RELATIVE.split(path.sep).join('/'))
+        );
+        watcher.onDidChange(() => scheduleLocalDrain());
+        watcher.onDidCreate(() => scheduleLocalDrain());
+        watchers.push(watcher);
+        context.subscriptions.push(watcher);
+      } catch (error) {
+        console.error('permission-wildcarding: local-settings watcher failed —', error);
+      }
+    }
+  };
+  attach();
+  // A folder added mid-session brings its own local approvals with it. Both
+  // subscriptions are feature-tested rather than assumed: an unexpected host
+  // missing one must cost the drain its liveness, never activation.
+  if (typeof vscode.workspace.onDidChangeWorkspaceFolders === 'function') {
+    context.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      attach();
+      scheduleLocalDrain(1200);
+    }));
+  }
+  if (typeof vscode.workspace.onDidChangeConfiguration === 'function') {
+    context.subscriptions.push(vscode.workspace.onDidChangeConfiguration((event) => {
+      if (event.affectsConfiguration('permissionWildcarding.localDrain')) scheduleLocalDrain(200);
+      if (event.affectsConfiguration('permissionWildcarding.guidance')) ensureGuidance(true);
+    }));
+  }
+  context.subscriptions.push({
+    dispose() { while (watchers.length) { try { watchers.pop().dispose(); } catch { /* already gone */ } } },
+  });
+}
+
 function activate(context) {
   // Watch settings.json for any change (Claude Code approval, manual edit, etc.).
   // RelativePattern (not a plain string) — plain strings only watch files inside
@@ -1365,6 +1464,18 @@ function activate(context) {
     vscode.commands.registerCommand('permission-wildcarding.toggleCodexMax', () => toggleCodexMax())
   );
 
+  // Project-local approvals → user scope, and the shell-style block that stops
+  // the un-generalizable approvals being created in the first place.
+  context.subscriptions.push(
+    vscode.commands.registerCommand('permission-wildcarding.drainLocal', () => drainLocal(true)),
+    vscode.commands.registerCommand('permission-wildcarding.toggleGuidance', () => toggleGuidance())
+  );
+  try {
+    registerLocalWatchers(context);
+  } catch (err) {
+    console.error('permission-wildcarding: local-settings watchers failed —', err);
+  }
+
   // Persistent status-bar indicator so an active "skip everything" is never invisible.
   statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   statusBar.command = 'permission-wildcarding.toggleMax';
@@ -1373,10 +1484,15 @@ function activate(context) {
 
   // Process once on activation to catch anything missed while VS Code was closed.
   runWildcarding();
+  // Same for approvals that landed in a project's settings.local.json, and for
+  // the guidance block — an upgrade refreshes stale wording, and neither writes
+  // anything when the state is already right.
+  drainLocal();
+  ensureGuidance();
   startAutoLearn(context);
-  // Rebuild the recall index on startup if the model is present and the index is
-  // behind the file count. Deferred 10 s so the extension host settles first.
-  setTimeout(autoRebuildRecallIfStale, 10000);
+  // Sync the recall index on startup when the model is present and the cache is behind
+  // the corpus. Deferred 10 s so the extension host settles first.
+  setTimeout(autoSyncRecallIfStale, 10000);
 
   // Memory-index hygiene lint: status-bar bloat gauge + editor squiggles on over-budget
   // hook lines / broken index links. Isolated so a failure here never breaks wildcarding.
@@ -1397,7 +1513,7 @@ function activate(context) {
       );
       const bump = () => {
         clearTimeout(memBounce);
-        memBounce = setTimeout(() => { dashboard?.refresh(); autoRebuildRecallIfStale(); }, 350);
+        memBounce = setTimeout(() => { dashboard?.refresh(); autoSyncRecallIfStale(); }, 350);
       };
       w.onDidChange(bump); w.onDidCreate(bump); w.onDidDelete(bump);
       context.subscriptions.push(w);
@@ -1670,6 +1786,215 @@ function runWildcarding(manual = false) {
   dashboard?.refresh();
 }
 
+// ── project-local approvals ─────────────────────────────────────────────────────
+// Claude Code persists an "always approve" into the *project's*
+// .claude/settings.local.json, so that is where approvals actually pile up — and
+// nothing here used to read it. Promote the portable ones to user scope, where
+// one entry covers every project, then drop the local entries user scope now
+// covers. src/local-settings.js owns the rules; this owns the VS Code wiring.
+
+function localDrainEnabled() {
+  return vscode.workspace.getConfiguration('permissionWildcarding').get('localDrain.enabled', true);
+}
+
+// Writing into a workspace's .claude/ changes that project's files, so an
+// untrusted window reads but never writes — the same line the Codex
+// workspace-scope rule writer draws.
+function drainableRoots() {
+  if (!vscode.workspace.isTrusted) return [];
+  return (vscode.workspace.workspaceFolders || [])
+    .map((folder) => folder.uri.fsPath)
+    .filter((root) => fs.existsSync(localSettingsPath(root)));
+}
+
+function drainOneWorkspace(root, dryRun = false) {
+  return drainLocalSettings({
+    workspaceRoot: root,
+    readUserSettings: readSettings,
+    // The extension's own merge: rebase onto the newest settings.json and refresh
+    // the high-water backup, so a promoted entry is protected by the policy guard
+    // exactly like an approval the wildcarding pass generalized.
+    applyUserAllow: (entries) => {
+      const settings = readSettings() ?? {};
+      const existing = Array.isArray(settings?.permissions?.allow) ? settings.permissions.allow : [];
+      writeAllow(settings, processAllowList([...new Set([...existing, ...entries])]));
+    },
+    dryRun,
+  });
+}
+
+// Drain every open workspace folder. `manual` surfaces a message even when there
+// was nothing to do, so the button always answers.
+function drainLocal(manual = false) {
+  if (!manual && !localDrainEnabled()) return;
+  const roots = drainableRoots();
+  if (!roots.length) {
+    if (manual) {
+      vscode.window.setStatusBarMessage(
+        vscode.workspace.isTrusted
+          ? '$(shield) permission-wildcarding: no .claude/settings.local.json in this workspace'
+          : '$(shield) permission-wildcarding: workspace is not trusted — local drain skipped',
+        5000);
+    }
+    return;
+  }
+
+  const reports = [];
+  try {
+    getPolicyLock().locked(() => {
+      for (const root of roots) reports.push(drainOneWorkspace(root));
+    });
+  } catch (err) {
+    if (err?.code === POLICY_LOCK_CODE) {
+      // Auto Learn holds the lock; its write fires the settings watcher and we
+      // come back through here. Only a manual click deserves a message.
+      if (manual) vscode.window.setStatusBarMessage(`$(shield) permission-wildcarding: ${POLICY_LOCK_BUSY_MESSAGE}`, 5000);
+      return;
+    }
+    vscode.window.showErrorMessage(`permission-wildcarding: local drain failed — ${err.message}`);
+    return;
+  }
+
+  if (reports.some((report) => report.blocked === 'max')) {
+    if (manual) {
+      vscode.window.showWarningMessage(
+        'permission-wildcarding: Claude MAX is ON — its blanket Bash(*) layer covers every ' +
+        'project-local entry, so draining would empty that file and MAX-off would not bring it ' +
+        'back. Turn MAX off first.');
+    }
+    dashboard?.refresh();
+    return;
+  }
+
+  const promoted = reports.flatMap((report) => report.promoted);
+  const pruned = reports.reduce((sum, report) => sum + report.pruned.length, 0);
+  if (promoted.length || pruned) {
+    localDrainAt = Date.now();
+    lastRun = Date.now();
+    vscode.window.showInformationMessage(
+      `$(shield) Promoted ${promoted.length} project-local approval${promoted.length !== 1 ? 's' : ''} ` +
+      `to user scope, pruned ${pruned} now-redundant local ${pruned === 1 ? 'entry' : 'entries'}`,
+      { detail: promoted.map((p) => `→ ${p}`).join('\n') }
+    );
+  } else if (manual) {
+    const kept = reports.reduce((sum, report) => sum + report.kept, 0);
+    vscode.window.setStatusBarMessage(
+      `$(shield) permission-wildcarding: nothing to promote — ${kept} local ` +
+      `${kept === 1 ? 'entry is' : 'entries are'} project-specific`, 5000);
+  }
+  dashboard?.refresh();
+}
+
+function scheduleLocalDrain(delay = 900) {
+  clearTimeout(localDrainBounce);
+  localDrainBounce = setTimeout(() => drainLocal(), delay);
+}
+
+// Dashboard numbers come from a dry run over each folder, so the card shows what
+// a click would actually do rather than a raw entry count.
+function localCardData() {
+  const roots = (vscode.workspace.workspaceFolders || [])
+    .map((folder) => folder.uri.fsPath)
+    .filter((root) => fs.existsSync(localSettingsPath(root)));
+  if (!roots.length) return null;
+  let promote = 0; let prune = 0; let kept = 0; let blocked = false;
+  for (const root of roots) {
+    const report = drainOneWorkspace(root, true);
+    if (report.blocked) { blocked = true; kept += report.kept; continue; }
+    promote += report.promote.length;
+    prune += report.prune.length;
+    kept += report.kept;
+  }
+  return {
+    folders: roots.length,
+    file: roots.length === 1 ? localSettingsPath(roots[0]).replace(os.homedir(), '~') : LOCAL_RELATIVE,
+    promote, prune, kept, blocked,
+    trusted: vscode.workspace.isTrusted,
+    enabled: localDrainEnabled(),
+    lastRun: localDrainAt,
+  };
+}
+
+// ── agent guidance ──────────────────────────────────────────────────────────────
+// The one class of friction no generalizer can fix after the fact: a compound
+// command is stored verbatim when approved, so it never matches a second command.
+// The fix is upstream, in the agent's instructions — and the agent cannot install
+// it itself, because editing its own permission surface is what a classifier
+// stops. So the extension writes it, into ~/.claude/CLAUDE.md.
+
+function guidanceEnabled() {
+  return vscode.workspace.getConfiguration('permissionWildcarding').get('guidance.enabled', true);
+}
+
+// Keep CLAUDE.md in step with the setting on activation, and refresh a block
+// written by an older version. Silent when already correct: this runs on every
+// activation and must not rewrite the user's instruction file for nothing.
+function ensureGuidance(announce = false) {
+  try {
+    const want = guidanceEnabled();
+    const states = guidanceStatusAll().filter((state) => state.readable);
+    if (!states.length) return;
+    // Nothing to do when every installed agent already matches the setting — and
+    // when it is on, already has the current wording.
+    if (states.every((state) => state.on === want && (!want || state.current))) return;
+    const changed = setGuidanceAll(want).filter((result) => result.changed);
+    if (!changed.length) return;
+    if (announce || want) {
+      vscode.window.setStatusBarMessage(
+        `$(shield) permission-wildcarding: shell-style guidance ${want ? 'added to' : 'removed from'} ` +
+        changed.map((result) => result.agent).join(' + '),
+        6000);
+    }
+    dashboard?.refresh();
+  } catch (err) {
+    console.error('permission-wildcarding: guidance write failed —', err);
+  }
+}
+
+function toggleGuidance() {
+  const config = vscode.workspace.getConfiguration('permissionWildcarding');
+  const states = guidanceStatusAll();
+  // Off only when it is currently on everywhere it can be: a half-installed state
+  // (a new agent appeared, or one file was hand-edited) should complete, not undo.
+  const next = !(states.length && states.every((state) => state.on));
+  // Persist the intent as well as the file, or the next activation would undo it.
+  config.update('guidance.enabled', next, vscode.ConfigurationTarget.Global).then(
+    () => {
+      const results = setGuidanceAll(next);
+      const failed = results.filter((result) => result.error);
+      if (failed.length) {
+        vscode.window.showErrorMessage(
+          `permission-wildcarding: ${failed.map((result) => `${result.agent}: ${result.error}`).join('; ')}`);
+      } else {
+        vscode.window.showInformationMessage(
+          `permission-wildcarding: shell-style guidance ${next ? 'ON' : 'OFF'} — ` +
+          results.map((result) => result.path.replace(os.homedir(), '~')).join(', ') +
+          (next ? ' (applies from each agent’s next session)' : ''));
+      }
+      dashboard?.refresh();
+    },
+    (err) => vscode.window.showErrorMessage(`permission-wildcarding: ${err.message}`)
+  );
+}
+
+function guidanceCardData() {
+  try {
+    const states = guidanceStatusAll();
+    if (!states.length) return null;
+    return {
+      on: states.every((state) => state.on),
+      partial: states.some((state) => state.on) && !states.every((state) => state.on),
+      current: states.every((state) => !state.on || state.current),
+      readable: states.some((state) => state.readable),
+      agents: states.filter((state) => state.on).map((state) => state.agent),
+      targets: states.map((state) => state.agent),
+      path: states.map((state) => state.path.replace(os.homedir(), '~')).join(', '),
+    };
+  } catch {
+    return null;
+  }
+}
+
 // ── dashboard (Activity Bar webview) ────────────────────────────────────────────
 class WildcardingViewProvider {
   static viewId = 'permissionWildcarding.dashboard';
@@ -1698,6 +2023,8 @@ class WildcardingViewProvider {
         case 'toggleCodexMax': vscode.commands.executeCommand('permission-wildcarding.toggleCodexMax'); break;
         case 'rebuildRecall': vscode.commands.executeCommand('permission-wildcarding.rebuildRecall'); break;
         case 'lintMemory':   vscode.commands.executeCommand('permission-wildcarding.lintMemory'); break;
+        case 'drainLocal':   vscode.commands.executeCommand('permission-wildcarding.drainLocal'); break;
+        case 'toggleGuidance': vscode.commands.executeCommand('permission-wildcarding.toggleGuidance'); break;
         case 'refresh':      this.refresh(); break;
         case 'remove':       this._remove(msg.value); break;
       }
@@ -1755,6 +2082,8 @@ class WildcardingViewProvider {
       })(),
       autoLearn,
       memory: memoryCardData(),
+      local: localCardData(),
+      guidance: guidanceCardData(),
     });
   }
 
@@ -1902,6 +2231,23 @@ class WildcardingViewProvider {
     <button class="bypass" id="codexMaxBtn">⚡ Turn Codex MAX ON</button>
   </div>
 
+  <div class="card" id="localCard" style="display:none">
+    <div class="status"><span id="locdot" class="dot idle"></span><span id="loctext">Project-local approvals</span></div>
+    <div class="muted sub" id="locsub"></div>
+    <div class="stats" style="margin-top:8px">
+      <div class="stat"><div class="n" id="locpromote">–</div><div class="l">promote</div></div>
+      <div class="stat"><div class="n" id="locprune">–</div><div class="l">redundant</div></div>
+      <div class="stat"><div class="n" id="lockept">–</div><div class="l">project-only</div></div>
+    </div>
+    <button class="restore" id="drainLocal" title="Promote portable local approvals to user scope, then drop the ones user scope covers">⤴  Drain into user scope</button>
+  </div>
+
+  <div class="card" id="guidanceCard" style="display:none">
+    <div class="status"><span id="gddot" class="dot idle"></span><span id="gdtext">Shell-style guidance</span></div>
+    <div class="muted sub" id="gdsub"></div>
+    <button class="bypass" id="guidanceBtn">Add to ~/.claude/CLAUDE.md</button>
+  </div>
+
   <div class="card" id="memCard" style="display:none">
     <div class="status"><span id="llmDot" class="dot idle"></span><span id="llmText">CPU LLM</span></div>
     <div class="muted sub" id="memDir"></div>
@@ -2029,8 +2375,15 @@ class WildcardingViewProvider {
     if (m.overBudget) $('memTok').style.color = 'var(--vscode-charts-red, #f85149)';
     else $('memTok').style.color = '';
     $('memFiles').textContent = m.files;
+    $('memFiles').title = m.indexable == null
+      ? 'markdown files in the memory dir'
+      : m.indexable + ' indexable + MEMORY.md (the index itself is never embedded)';
     $('memEmb').textContent = m.embedded == null ? '–' : m.embedded;
-    $('memEmb').title = m.embedded == null ? 'recall cache not built yet — click Rebuild' : 'memories in the recall vector cache';
+    $('memEmb').title = m.embedded == null
+      ? 'recall cache not built yet — click Rebuild'
+      : m.embedded + ' of ' + (m.indexable == null ? '?' : m.indexable) + ' indexable memories embedded'
+        + (m.stale ? ' — cache is behind the files' : '');
+    $('memEmb').style.color = m.stale ? 'var(--vscode-charts-yellow, #d29922)' : '';
 
     const issues = [];
     if (m.over)   issues.push(m.over + ' over budget');
@@ -2050,6 +2403,53 @@ class WildcardingViewProvider {
     }
   }
 
+  function renderLocal(l) {
+    const card = $('localCard');
+    if (!l) { card.style.display = 'none'; return; }
+    card.style.display = '';
+    const pending = l.promote + l.prune;
+    $('locdot').className = 'dot' + (pending && l.trusted && !l.blocked ? '' : ' idle');
+    $('loctext').textContent = l.blocked
+      ? 'Project-local approvals — blocked by MAX'
+      : (pending ? 'Project-local approvals: ' + pending + ' to drain' : 'Project-local approvals: drained');
+    $('loctext').style.fontWeight = '600';
+    $('locsub').textContent = l.blocked
+      ? 'Claude MAX covers every local entry — turn MAX off before draining'
+      : (!l.trusted ? 'workspace not trusted — read-only'
+        : (l.folders > 1 ? l.folders + ' folders · ' + l.file : l.file)
+          + (l.enabled ? '' : ' · auto-drain off'));
+    $('locpromote').textContent = l.promote;
+    $('locprune').textContent = l.prune;
+    $('lockept').textContent = l.kept;
+    $('locpromote').title = 'portable command families that would move to user scope';
+    $('locprune').title = 'local entries user scope already grants';
+    $('lockept').title = 'entries only this project can justify (script blobs, absolute paths, MCP tools)';
+    $('drainLocal').disabled = !l.trusted || !!l.blocked || pending === 0;
+    $('drainLocal').textContent = pending
+      ? '⤴  Drain ' + pending + ' into user scope'
+      : '⤴  Nothing to drain';
+  }
+
+  function renderGuidance(g) {
+    const card = $('guidanceCard');
+    if (!g) { card.style.display = 'none'; return; }
+    card.style.display = '';
+    $('gddot').className = 'dot' + (g.on && g.current ? '' : ' idle');
+    const state = g.on ? (g.current ? 'ON' : 'ON (older wording)') : (g.partial ? 'PARTIAL' : 'OFF');
+    $('gdtext').textContent = 'Shell-style guidance: ' + state
+      + (g.agents.length ? ' — ' + g.agents.join(' + ') : '');
+    $('gdtext').style.fontWeight = '600';
+    $('gdsub').textContent = g.on || g.partial
+      ? 'one command per call → every approval generalizes · ' + g.path
+      : 'teach ' + g.targets.join(' + ') + ' to write approvals that can be wildcarded';
+    const btn = $('guidanceBtn');
+    btn.disabled = !g.readable;
+    btn.classList.toggle('on', !!g.on);
+    btn.textContent = g.on
+      ? 'Remove from ' + g.targets.length + ' instruction file' + (g.targets.length !== 1 ? 's' : '')
+      : 'Add to ' + g.targets.join(' + ') + ' instructions';
+  }
+
   function render(d) {
     $('dot').className = 'dot' + (d.active ? '' : ' idle');
     $('statusText').textContent = d.active ? 'Active' : 'Idle — settings.json not found';
@@ -2057,6 +2457,8 @@ class WildcardingViewProvider {
     renderMax(d.max);
     renderCodexMax(d.codexMax);
     renderAutoLearn(d.autoLearn);
+    renderLocal(d.local);
+    renderGuidance(d.guidance);
     renderMemory(d.memory);
     $('lastRun').textContent = timeAgo(d.lastRun);
     $('backup').textContent = d.backupCount
@@ -2104,6 +2506,8 @@ class WildcardingViewProvider {
   $('rebuild').addEventListener('click', () => vscode.postMessage({ type: 'rebuildRecall' }));
   $('maxBtn').addEventListener('click', () => vscode.postMessage({ type: 'toggleMax' }));
   $('codexMaxBtn').addEventListener('click', () => vscode.postMessage({ type: 'toggleCodexMax' }));
+  $('drainLocal').addEventListener('click', () => vscode.postMessage({ type: 'drainLocal' }));
+  $('guidanceBtn').addEventListener('click', () => vscode.postMessage({ type: 'toggleGuidance' }));
   window.addEventListener('message', (e) => { if (e.data?.type === 'data') render(e.data); });
   applyCollapsed();
   vscode.postMessage({ type: 'refresh' });
@@ -2115,6 +2519,7 @@ class WildcardingViewProvider {
 
 async function deactivate() {
   clearTimeout(debounceTimer);
+  clearTimeout(localDrainBounce);
   clearTimeout(memBounce);
   clearTimeout(autoLearnBounce);
   clearInterval(autoLearnTimer);

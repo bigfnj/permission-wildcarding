@@ -58,6 +58,7 @@ test('extension activates with mocked VS Code and deactivates without live polic
         configurationHandler = handler;
         return disposable();
       },
+      onDidChangeWorkspaceFolders() { return disposable(); },
     },
   };
 

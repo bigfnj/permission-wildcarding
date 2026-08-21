@@ -15,6 +15,8 @@ const {
   CODEX_CONFIG, applyCodexMax, isCodexMaxOn, readApproval, sandboxMode,
   readEnterpriseBundle, targetApproval,
 } = require('../src/codex-max');
+const { drainLocalSettings } = require('../src/local-settings');
+const { guidanceStatusAll, setGuidanceAll } = require('../src/agent-guidance');
 
 const SETTINGS  = path.join(os.homedir(), '.claude', 'settings.json');
 const PACK_PATH = path.join(__dirname, '..', 'patterns', 'starter-pack.json');
@@ -22,12 +24,18 @@ const LEARN_USAGE = 'usage: wildcard-perms --learn scan|status|apply|undo ' +
   '[--mode observe|recommend|auto-safe] [--workspace <path>] ' +
   '[--codex-scope user|workspace|off] [--threshold <count>] ' +
   '[--codex-executable <path>]\n';
+const DRAIN_USAGE = 'usage: wildcard-perms --drain [--workspace <path>] [--dry-run]\n';
+const GUIDANCE_USAGE = 'usage: wildcard-perms --guidance on|off|status\n';
 
 const argv = process.argv.slice(2);
 if (argv.includes('--learn')) {
   learn(argv);
 } else if (argv.includes('--seed')) {
   seed();
+} else if (argv.includes('--drain')) {
+  drain(argv);
+} else if (argv.includes('--guidance')) {
+  guidance(argv);
 } else if (argv.includes('--codex-max')) {
   codexMax(argv);
 } else if (argv.includes('--max')) {
@@ -35,9 +43,14 @@ if (argv.includes('--learn')) {
 } else if (argv.includes('--bypass')) {
   bypass(argv);
 } else {
-  // Hook mode: drain stdin (Claude Code sends JSON context we don't need)
+  // Hook mode. Claude Code sends a JSON context on stdin, and one field of it
+  // matters: `cwd` names the project whose settings.local.json may have just
+  // received the approval that fired this hook.
+  let input = '';
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (chunk) => { input += chunk; });
+  process.stdin.on('end', () => run(input));
   process.stdin.resume();
-  process.stdin.on('end', run);
 }
 
 function learnOption(args, name, fallback) {
@@ -123,14 +136,14 @@ function writeSettings(settings) {
   writeFileAtomicSync(SETTINGS, JSON.stringify(settings, null, 2) + '\n');
 }
 
-function run() {
+function run(input) {
   const settings = readSettings();
-  if (!settings) process.exit(0);
+  if (!settings) finish(input);
 
   const before = settings?.permissions?.allow ?? [];
   const after  = processAllowList(before);
 
-  if (JSON.stringify(before) === JSON.stringify(after)) process.exit(0);
+  if (JSON.stringify(before) === JSON.stringify(after)) finish(input);
 
   try {
     writeSettings({
@@ -147,7 +160,170 @@ function run() {
     process.stderr.write(`wildcard-perms: write error: ${err.message}\n`);
   }
 
+  finish(input);
+}
+
+// One exit path for the hook, so the project-local drain runs whether or not the
+// user-scope pass had anything to change. Claude Code persists an "always
+// approve" to the project's settings.local.json, which no pass here used to
+// read — the hook fires immediately after that write, so this is the moment to
+// promote it.
+function finish(input) {
+  drainFromHook(input);
   process.exit(0);
+}
+
+// Merge entries into the user-scope allow list, generalizing and pruning the
+// result exactly as the hook pass would, so a promoted permission is
+// indistinguishable from one approved directly.
+function mergeUserAllow(entries) {
+  const settings = readSettings() ?? {};
+  const existing = Array.isArray(settings?.permissions?.allow) ? settings.permissions.allow : [];
+  const merged = processAllowList([...new Set([...existing, ...entries])]);
+  writeSettings({
+    ...settings,
+    permissions: { ...(settings.permissions ?? {}), allow: merged },
+  });
+}
+
+function drainWorkspace(workspaceRoot, { dryRun = false } = {}) {
+  return drainLocalSettings({
+    workspaceRoot,
+    readUserSettings: readSettings,
+    applyUserAllow: mergeUserAllow,
+    dryRun,
+  });
+}
+
+// The hook path is quiet by design: a busy lock is not an error (the next tool
+// call fires the hook again), and a project with no local approvals is the norm.
+// Anything noisier would print on every single tool use.
+function drainFromHook(input) {
+  let cwd;
+  try { cwd = JSON.parse(String(input || '{}'))?.cwd; }
+  catch { return; }
+  if (typeof cwd !== 'string' || !cwd) return;
+  try {
+    createPolicyLock({ lockPath: POLICY_LOCK_PATH }).locked(() => {
+      const report = drainWorkspace(cwd);
+      if (!report.changed) return;
+      process.stderr.write(
+        `wildcard-perms: local drain — promoted ${report.promoted.length}, ` +
+        `pruned ${report.pruned.length}, kept ${report.kept}\n`
+      );
+    });
+  } catch { /* lock busy, or an unreadable project — the next hook run retries */ }
+}
+
+// Promote a project's local approvals into user scope and drop the ones user
+// scope now covers. `--dry-run` reports without writing either file.
+function drain(args) {
+  let workspaceRoot;
+  try {
+    workspaceRoot = path.resolve(learnOption(args, '--workspace', process.cwd()));
+  } catch (err) {
+    process.stderr.write(`wildcard-perms --drain: ${err.message}\n${DRAIN_USAGE}`);
+    process.exit(1);
+  }
+  const dryRun = args.includes('--dry-run');
+
+  withPolicyLock('--drain', () => {
+    const report = drainWorkspace(workspaceRoot, { dryRun });
+
+    if (report.error) {
+      process.stderr.write(`wildcard-perms --drain: ${report.path}: ${report.error}\n`);
+      process.exitCode = 1;
+      return;
+    }
+    if (report.blocked === 'max') {
+      process.stderr.write(
+        'wildcard-perms --drain: Claude MAX is ON — its blanket Bash(*)/PowerShell(*) layer ' +
+        'covers every local entry, so a drain would empty the file and MAX-off would not ' +
+        'bring it back. Turn MAX off first.\n'
+      );
+      process.exitCode = 1;
+      return;
+    }
+    if (!report.exists) {
+      process.stdout.write(`wildcard-perms --drain: no project-local approvals at ${report.path}\n`);
+      return;
+    }
+    if (!report.changed) {
+      process.stdout.write(
+        `wildcard-perms --drain: nothing to do — ${report.kept} local ` +
+        `${report.kept === 1 ? 'entry is' : 'entries are'} project-specific\n`
+      );
+      return;
+    }
+
+    const promoted = dryRun ? report.promote : report.promoted;
+    const pruned = dryRun ? report.prune : report.pruned;
+    process.stdout.write(
+      `wildcard-perms --drain${dryRun ? ' (dry run)' : ''}: ` +
+      `${dryRun ? 'would promote' : 'promoted'} ${promoted.length} to user scope, ` +
+      `${dryRun ? 'would prune' : 'pruned'} ${pruned.length} local ` +
+      `${pruned.length === 1 ? 'entry' : 'entries'}, kept ${report.kept}\n`
+    );
+    if (promoted.length) process.stdout.write(promoted.map((p) => `  + ${p}`).join('\n') + '\n');
+    if (!dryRun && !report.verified) {
+      process.stderr.write(
+        '  note: not every promotion is present in settings.json — managed policy may be ' +
+        'filtering it. Nothing was pruned on its account.\n'
+      );
+    }
+    for (const { candidate, rule } of report.denied) {
+      process.stdout.write(`  ! ${candidate} not promoted — your deny rule ${rule} outranks it\n`);
+    }
+    if (report.backup) process.stdout.write(`  snapshot: ${report.backup}\n`);
+  });
+}
+
+// Install (or remove) the managed shell-style block in ~/.claude/CLAUDE.md. The
+// wildcarder can only generalize an approval that names one command, so this is
+// the half of the job that has to happen in the agent's instructions.
+function guidance(args) {
+  const cmd = (args[args.indexOf('--guidance') + 1] || 'status').toLowerCase();
+
+  if (cmd === 'status') {
+    const states = guidanceStatusAll();
+    if (!states.length) {
+      process.stdout.write('wildcard-perms guidance: no agent instruction file found\n');
+      return;
+    }
+    for (const state of states) {
+      process.stdout.write(
+        `wildcard-perms guidance [${state.agent}]: ${state.on ? 'ON' : 'OFF'}` +
+        `${state.on && !state.current ? ' (older wording — run --guidance on to refresh)' : ''} ` +
+        `(${state.readable ? state.path : `unreadable: ${state.path}`})\n`
+      );
+    }
+    return;
+  }
+
+  if (cmd !== 'on' && cmd !== 'off') {
+    process.stderr.write(GUIDANCE_USAGE);
+    process.exit(1);
+  }
+
+  const results = setGuidanceAll(cmd === 'on');
+  if (!results.length) {
+    process.stderr.write('wildcard-perms --guidance: no agent instruction file to write\n');
+    process.exit(1);
+  }
+  for (const result of results) {
+    if (result.error) {
+      process.stderr.write(`wildcard-perms --guidance [${result.agent}]: ${result.error}\n`);
+      process.exitCode = 1;
+      continue;
+    }
+    process.stdout.write(
+      `wildcard-perms guidance [${result.agent}]: ${cmd.toUpperCase()}` +
+      `${result.changed ? '' : ' (already)'} — ${result.path}\n`
+    );
+  }
+  if (cmd === 'on' && results.some((result) => result.changed)) {
+    process.stdout.write('  loaded in every session of every project from the next session on.\n');
+  }
 }
 
 function seed() {
