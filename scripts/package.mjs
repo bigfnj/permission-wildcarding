@@ -25,6 +25,17 @@ for (const entry of readdirSync(join(root, 'src'), { withFileTypes: true })
   cpSync(join(root, 'src', entry.name), join(extensionSrc, entry.name));
 }
 
+// 1b. Bundle the memory recall script + its vocab, so an installed VSIX resolves
+// recall.py without a checkout on disk. The 32MB model stays a download: a versioned
+// extension dir would re-fetch it on every upgrade, so the extension keeps it in
+// ~/.claude/wildcarding/models instead.
+const extMemory = join(ext, 'memory');
+rmSync(extMemory, { recursive: true, force: true });
+mkdirSync(join(extMemory, 'models'), { recursive: true });
+cpSync(join(root, 'memory', 'recall.py'), join(extMemory, 'recall.py'));
+cpSync(join(root, 'memory', 'models', 'bge-small.vocab.txt'),
+  join(extMemory, 'models', 'bge-small.vocab.txt'));
+
 // 2. Optional version override (release tag).
 const override = process.argv[2]?.replace(/^v/, '').trim();
 const pkgPath = join(ext, 'package.json');

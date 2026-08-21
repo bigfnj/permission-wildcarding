@@ -43,12 +43,24 @@ Ranked output is `cosine  file  description  > best-matching line`. ~0.5+ is a r
 
 | var | default | meaning |
 |---|---|---|
-| `RECALL_MEMORY_DIR` | `~/.claude/projects/d---claude/memory` | corpus to index |
-| `RECALL_MODEL_DIR`  | `./models`, then desktopPet's copy | where `bge-small.onnx` lives |
+| `RECALL_MEMORY_DIR` | auto-discovered: the `~/.claude/projects/*/memory` holding the most memory files | corpus to index |
+| `RECALL_MODEL_DIR`  | `./models` beside this script | where `bge-small.onnx` lives |
+
+The corpus is discovered rather than hardcoded because Claude Code derives the project slug
+from the working directory, so renaming a working root relocates the whole store. The VS Code
+extension pins both vars explicitly when it spawns this script, so its card and this tool
+always agree on which dir they are talking about.
 
 ## Model asset
 
 `models/bge-small.vocab.txt` is committed; `models/bge-small.onnx` (~32 MB) is gitignored.
-To restore it on a fresh clone, copy `bge-small.onnx` from `desktopPet/src/Models/`, or export
-`BAAI/bge-small-en-v1.5` to ONNX. The tool degrades with a clear message if the model is absent
-(`--lint` still works without it).
+Easiest restore on a fresh clone: click **Rebuild recall index** in the VS Code extension's
+Memory card, which downloads it (with a confirmation prompt) into
+`~/.claude/wildcarding/models/` and copies the vocab beside it — a stable home that survives
+extension upgrades and clone deletion. Point `RECALL_MODEL_DIR` there to share the one copy,
+or copy `bge-small.onnx` from `desktopPet/src/Models/` / export `BAAI/bge-small-en-v1.5` to
+ONNX yourself. The tool degrades with a clear message if the model is absent (`--lint` still
+works without it).
+
+Whichever dir wins, the vocab must sit beside the model: `Bge` loads
+`bge-small.vocab.txt` from the same dir it resolved `bge-small.onnx` in.
