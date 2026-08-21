@@ -1,7 +1,7 @@
 # Starter Pack — permission-wildcarding
 
 Seed list of commonly-approved Claude Code permissions. `patterns/starter-pack.json`
-is the source of truth and now carries a comprehensive snapshot (230+ entries) taken
+is the source of truth and now carries a comprehensive snapshot (290+ entries) taken
 from a real, fully-wildcarded allow list — command roots for the standard dev toolbox
 (git, gh, node/npm/npx, uv, ripgrep/fd/jq/yq, ffmpeg/imagemagick/poppler/ghostscript/
 pandoc/tesseract, duckdb, sqlite-utils, and more), a broad set of PowerShell cmdlets
@@ -231,6 +231,23 @@ for everything.
 |---|---|
 | `Bash(devtools *)` | Tool inventory: report, check, outdated |
 | `Bash(smoke-test *)` | End-to-end smoke test |
+| `Bash(claude *)` | The Claude Code CLI itself (`config`, `mcp`, `setup-token`, …) |
+| `Bash(sh *)` | POSIX shell, alongside the existing `bash` entry |
+| `PowerShell(code *)` / `PowerShell(tokei *)` | VS Code and LOC stats from a PowerShell session |
+
+---
+
+## Containers
+
+| Permission | Purpose |
+|---|---|
+| `Bash(docker *)` / `PowerShell(docker *)` | Docker CLI |
+| `Bash(podman *)` / `PowerShell(podman *)` | Podman CLI (rootless containers) |
+| `PowerShell(docker-compose *)` | Compose v1 binary |
+
+> **Why `docker-compose` needs its own entry:** `docker *` as a glob requires the
+> space after `docker`, so it never matches `docker-compose ...`. Same reason
+> `wsl *` and `wsl.exe *` are both listed.
 
 ---
 
@@ -244,6 +261,16 @@ for everything.
 | `Bash(cmd.exe *)` | Run Windows Command Prompt |
 | `Bash(powershell.exe *)` | Run Windows PowerShell |
 | `Bash(pwsh *)` | Run PowerShell 7+ (cross-platform) |
+| `Bash(wsl *)` / `PowerShell(wsl *)` / `PowerShell(wsl.exe *)` | Run WSL distros |
+| `PowerShell(Get-ScheduledTask *)` | Inspect scheduled tasks (read-only) |
+| `PowerShell(Get-WindowsOptionalFeature *)` | Query optional Windows features |
+| `PowerShell(Get-WmiObject *)` | Legacy WMI queries (read-only) |
+| `PowerShell(Get-ExecutionPolicy *)` | Read the current execution policy |
+
+> **`Set-ExecutionPolicy` is deliberately absent.** The pack ships destructive
+> *file* and *process* roots (`rm`, `Remove-Item`, `Stop-Process`) because those
+> are routine work; changing the machine's script-signing posture is a different
+> class of thing and stays a prompt.
 
 ---
 
