@@ -144,10 +144,41 @@ test('only a bulk loss is repaired without asking', () => {
   assert.equal(assessPolicy({ live: nearlyIntact, backup: BACKUP }).bulkLoss, false);
 });
 
+// Regression: the guard read a settings.json it could not parse as a settings.json
+// that grants nothing, so all 307 backup entries looked missing, the loss cleared
+// the bulk-loss line, and it auto-restored the entire list against a file that was
+// intact the whole time. Claude Code rewrites this file in place on every /model
+// and /effort change, so the mid-write window is hit in normal use.
+test('a settings.json that could not be read is unknown, not empty', () => {
+  const unknown = assessPolicy({ live: null, backup: BACKUP });
+  assert.equal(unknown.unreadable, true);
+  assert.equal(unknown.restorable, 0, 'nothing is restorable from a state we did not observe');
+  assert.equal(unknown.bulkLoss, false, 'and nothing is written');
+  assert.deepEqual(unknown.missing, { allow: [], deny: [] });
+  assert.deepEqual(unknown.shadowed, [], 'shadowing is a claim about a live surface we lack');
+
+  // Omitting live entirely is the same unknown, not an implicit empty policy.
+  assert.equal(assessPolicy({ backup: BACKUP }).bulkLoss, false);
+
+  // An allow list that is genuinely empty still reads as the wipe it is.
+  const wiped = assessPolicy({ live: { permissions: { allow: [], deny: [] } }, backup: BACKUP });
+  assert.equal(wiped.unreadable, false);
+  assert.equal(wiped.restorable, 6);
+  assert.equal(wiped.bulkLoss, true, 'a real wipe must still be repaired');
+});
+
 test('managed settings are looked for where an administrator would put them', () => {
   assert.match(managedSettingsPaths('win32')[0], /ClaudeCode[\\/]managed-settings\.json$/);
   assert.match(managedSettingsPaths('darwin')[0], /Application Support[\\/]ClaudeCode[\\/]managed-settings\.json$/);
   assert.match(managedSettingsPaths('linux')[0], /etc[\\/]claude-code[\\/]managed-settings\.json$/);
+  // Windows moved: 2.1.245 probes Program Files (measured from its own debug log),
+  // older builds used ProgramData. Both are watched, current location first.
+  const windows = managedSettingsPaths('win32');
+  assert.equal(windows.length, 2);
+  assert.match(windows[0], /Program Files[\\/]ClaudeCode[\\/]managed-settings\.json$/);
+  assert.match(windows[1], /ProgramData[\\/]ClaudeCode[\\/]managed-settings\.json$/);
+  // policy-limits.json rides along, so the server-delivered case is watched too.
+  assert.equal(policySignalPaths('win32').length, 3);
 });
 
 // The matcher here is a deliberate second copy of the one in autoLearnUi.js, so

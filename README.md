@@ -671,8 +671,11 @@ no local artefact at all. A guard keyed to the admin-dropped file would watch no
 So the trigger is **"approvals stopped being there"** — source-agnostic, and it catches every
 cause: a managed refresh, a role change pushed from the console, a bad edit, a reinstall. The
 check runs on every `settings.json` change, on any change to the policy files
-(`%PROGRAMDATA%\ClaudeCode\managed-settings.json`, `~/.claude/policy-limits.json`), and once
-at startup so a change made while VS Code was closed is still caught.
+(`%PROGRAMFILES%\ClaudeCode\managed-settings.json`, `%PROGRAMDATA%\ClaudeCode\managed-settings.json`,
+`~/.claude/policy-limits.json`), and once at startup so a change made while VS Code was closed
+is still caught. Watcher events are debounced before the check runs: a single Claude Code start
+re-saves `policy-limits.json` several times while `settings.json` is being rewritten, and the
+conclusion this pass draws is too large to draw mid-burst.
 
 "Missing" means **no longer granted**, not "no longer present verbatim". A backup entry is
 still granted if a broader live wildcard covers it — which is the normal state, not damage:
@@ -681,6 +684,16 @@ every specific entry under `Bash(*)`. The guard uses the wildcarder's own covera
 covered entry is never counted as lost. Without this, turning MAX on (which collapses the
 whole list under `Bash(*)`) reads as losing hundreds of entries and auto-"restores" them on
 every change — the churn that makes MAX look like it re-enables itself.
+
+"Missing" also requires having **looked**. A `settings.json` that exists but does not parse is
+not a `settings.json` that grants nothing: Claude Code rewrites that file in place on every
+`/model`, `/effort` and approval, so a watcher event lands inside a write often enough to
+matter, and the zero-byte window of a truncate-then-write parses as no permissions at all.
+Unknown is reported as unknown — the guard says nothing, writes nothing, and looks again on the
+next event. A file that is genuinely **absent** is a different case and still restores, because
+then there is nothing to lose. The same distinction guards every write: rebasing onto a fallback
+snapshot when the real file cannot be parsed is how a recovery feature would emit a
+`settings.json` holding nothing but `permissions`, taking `model`, `env` and `hooks` with it.
 
 Only a **bulk** loss is repaired without asking — losing most of the list is damage, whereas
 pruning one entry with the ✕ button is an instruction. The prune drops that entry from the
@@ -709,8 +722,8 @@ Cutting a GitHub Release builds and attaches the `.vsix` automatically via
 taken from the release tag, so you don't hand-edit `package.json`:
 
 ```bash
-gh release create v1.2.2 --generate-notes
-# -> workflow packages permission-wildcarding-1.2.2.vsix and attaches it to the release
+gh release create v1.2.3 --generate-notes
+# -> workflow packages permission-wildcarding-1.2.3.vsix and attaches it to the release
 ```
 
 Before tagging, run the tests and the memory-index lint. The lint also fails on gate

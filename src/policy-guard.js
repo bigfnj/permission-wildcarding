@@ -52,10 +52,19 @@ function policySignalPaths(platform = process.platform, home = os.homedir()) {
 }
 
 // Where an administrator drops managed settings, per platform.
+//
+// Windows has two locations and current Claude Code reads the Program Files one
+// (measured against 2.1.245, which logs the path it probes). ProgramData stays in
+// the list behind it: it is where older builds looked, and watching a path that
+// no longer receives the file is how a guard watches nothing.
 function managedSettingsPaths(platform = process.platform, home = os.homedir()) {
   if (platform === 'win32') {
+    const programFiles = process.env.PROGRAMFILES || 'C:\\Program Files';
     const programData = process.env.PROGRAMDATA || 'C:\\ProgramData';
-    return [path.join(programData, 'ClaudeCode', 'managed-settings.json')];
+    return [
+      path.join(programFiles, 'ClaudeCode', 'managed-settings.json'),
+      path.join(programData, 'ClaudeCode', 'managed-settings.json'),
+    ];
   }
   if (platform === 'darwin') {
     return [path.join('/Library', 'Application Support', 'ClaudeCode', 'managed-settings.json')];
@@ -155,17 +164,30 @@ function isBulkLoss(missingCount, backupSize, options = {}) {
 }
 
 // One assessment, so callers never have to decide which half is actionable.
+//
+// `live` is the parsed settings.json, or null/undefined for "it exists but could
+// not be read just now". Those are not the same thing and the difference decides
+// whether anything is written: a file that will not parse grants nothing *that we
+// can see*, while an empty allow list grants nothing *in fact*. Reading the first
+// as the second makes every entry in the backup look missing, which is how a
+// watcher event landing mid-write became a reported wipe of the whole list and an
+// auto-restore of all of it. Unknown is reported as unknown, and nothing is
+// restorable from a state we could not observe.
 function assessPolicy({ live, backup, managed, limits, claimed } = {}) {
-  const missing = missingFromLive(live, backup);
+  const unreadable = live === null || live === undefined;
+  const missing = unreadable ? { allow: [], deny: [] } : missingFromLive(live, backup);
+  // Shadowing is a statement about the live surface, so it needs the same
+  // evidence. `claimed` is an explicit surface from the caller and stands in.
   const surface = claimed
     ? list(claimed)
-    : [...new Set([...list(live?.permissions?.allow), ...list(backup?.allow)])];
+    : (unreadable ? [] : [...new Set([...list(live?.permissions?.allow), ...list(backup?.allow)])]);
   const restorable = missing.allow.length + missing.deny.length;
   const backupSize = list(backup?.allow).length + list(backup?.deny).length;
   return {
+    unreadable,
     missing,
     restorable,
-    bulkLoss: isBulkLoss(restorable, backupSize),
+    bulkLoss: !unreadable && isBulkLoss(restorable, backupSize),
     shadowed: shadowedByManaged(managed, surface),
     capabilities: managedCapabilities(managed),
     restrictions: policyRestrictions(limits),
