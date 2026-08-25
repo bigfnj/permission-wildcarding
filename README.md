@@ -239,7 +239,7 @@ Claude Code's file memory has two different things in it. **Reference material**
 model crashes", "where that venv lives") only matters once you are already on the subject,
 so it is fine on demand. **Standing orders** ("never `git add -A` in a shared checkout",
 "0 em dashes in prose") are not, because *you cannot recall a rule you are already
-breaking* — nothing triggers the lookup. And `MEMORY.md` is a list of one-line hooks, so
+breaking*, because nothing triggers the lookup. And `MEMORY.md` is a list of one-line hooks, so
 the enforceable half of a rule sits in a file that only loads if a recall happens to
 surface it.
 
@@ -262,7 +262,7 @@ metadata:
 
 Selection is on `scope`, **not** `type`: a `reference` earns residency exactly when its
 failure is silent. The gate text lives in the memory file so the compiler needs no
-judgement at runtime — the compression happens once, when you write the memory.
+judgement at runtime. The compression happens once, when you write the memory.
 
 ```bash
 python memory/recall.py --gates-compile   # -> ~/.claude/gates.generated.md, deterministic + hashed
@@ -288,8 +288,8 @@ start is worse than a slightly stale block, and `--gates status` still reports s
 
 > **Under a managed policy the hook may never fire.** `allowManagedHooksOnly` is enforced
 > *per event*: a user hook runs only on an event the managed policy itself defines. On a box
-> whose policy defines only `PostToolUse`, a user `SessionStart` entry is dropped silently —
-> measured, with a real session start and a `/clear` both leaving the compiled file
+> whose policy defines only `PostToolUse`, a user `SessionStart` entry is dropped silently.
+> Measured, with a real session start and a `/clear` both leaving the compiled file
 > untouched, while a `PostToolUse` canary fired 4 times out of 4. (`claude -p` runs no hooks
 > at all, so it cannot be used to test this.) **The extension does not depend on the hook:**
 > it watches the memory dir directly and recompiles on change, which is the better trigger
@@ -713,13 +713,12 @@ gh release create v1.2.2 --generate-notes
 # -> workflow packages permission-wildcarding-1.2.2.vsix and attaches it to the release
 ```
 
-Before tagging, run the acceptance suite. It is read-only apart from the Node tests and
-proves the two managed blocks, the CLI, the recall index, and the extension's corpus watcher
-all still behave — including that a memory edit triggers a recompile with the extension
-active in VS Code:
+Before tagging, run the tests and the memory-index lint. The lint also fails on gate
+source drift, so a release cannot ship with the resident block behind its source memories:
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\verify-release.ps1
+```bash
+node --test test/*.test.js          # all pass
+python memory/recall.py --lint      # index clean, gates not stale vs source
 ```
 
 ## Note
