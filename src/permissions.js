@@ -381,6 +381,32 @@ function withAllow(settings, allow) {
   return { ...settings, permissions: { ...(settings?.permissions ?? {}), allow } };
 }
 
+// Auto mode routes every decision through Claude Code's classifier, and it drops
+// any allow entry that would bypass that classifier. Measured against 2.1.238 and
+// 2.1.245: in auto mode `Bash(*)`, `PowerShell(*)` and every interpreter root
+// (bash, python, node, npx, ssh, xargs, lua, and their PowerShell twins) load with
+// "Ignoring dangerous permission … (bypasses classifier)"; in default mode the
+// same list loads intact.
+//
+// So MAX cannot keep its promise in auto mode. Worse, it would still collapse the
+// specific entries it replaced, leaving a shorter allow list *and* no blanket to
+// stand in for it — strictly worse than never touching MAX. The mode therefore
+// travels with the toggle, and comes back when MAX goes off.
+const CLASSIFIER_MODE = 'auto';
+const MAX_MODE = 'default';
+
+function classifierModeOn(settings) {
+  return settings?.permissions?.defaultMode === CLASSIFIER_MODE;
+}
+
+// `mode === null` removes the key rather than writing a value the user never had.
+function withMode(settings, mode) {
+  const permissions = { ...(settings?.permissions ?? {}) };
+  if (mode === null || mode === undefined) delete permissions.defaultMode;
+  else permissions.defaultMode = mode;
+  return { ...settings, permissions };
+}
+
 function isMaxAllowOn(settings) {
   const allow = settings?.permissions?.allow;
   return Array.isArray(allow) && MAX_MARKERS.every((m) => allow.includes(m));
@@ -391,9 +417,14 @@ function isMaxAllowOn(settings) {
 function enableMaxAllow(settings) {
   if (isMaxAllowOn(settings)) return { changed: false, settings };
   const current = Array.isArray(settings?.permissions?.allow) ? settings.permissions.allow : [];
-  writeMaxState({ allowSnapshot: current, savedAt: new Date().toISOString() });
+  const previousMode = settings?.permissions?.defaultMode ?? null;
+  writeMaxState({ allowSnapshot: current, defaultMode: previousMode, savedAt: new Date().toISOString() });
   const merged = processAllowList([...new Set([...current, ...buildMaxAllowSet(current)])]);
-  return { changed: true, settings: withAllow(settings, merged) };
+  const switchedMode = classifierModeOn(settings);
+  const next = switchedMode
+    ? withMode(withAllow(settings, merged), MAX_MODE)
+    : withAllow(settings, merged);
+  return { changed: true, settings: next, switchedMode: switchedMode ? CLASSIFIER_MODE : null };
 }
 
 // Layer 1 disable: restore the pre-MAX snapshot *and* keep anything granted
@@ -408,11 +439,19 @@ function enableMaxAllow(settings) {
 function disableMaxAllow(settings) {
   if (!isMaxAllowOn(settings)) return { changed: false, settings };
   const current = Array.isArray(settings?.permissions?.allow) ? settings.permissions.allow : [];
-  const snap = readMaxState().allowSnapshot;
+  const state = readMaxState();
+  const snap = state.allowSnapshot;
   const blanket = new Set(buildMaxAllowSet(current));
   const kept = current.filter((p) => !blanket.has(p));
   const restored = Array.isArray(snap) ? [...new Set([...snap, ...kept])] : kept;
-  return { changed: true, settings: withAllow(settings, restored) };
+  // Hand the permission mode back too, but only if it is still the one MAX put
+  // there. A mode the user changed by hand while MAX was on is theirs to keep.
+  const restoreMode = Object.prototype.hasOwnProperty.call(state, 'defaultMode')
+    && settings?.permissions?.defaultMode === MAX_MODE;
+  const next = restoreMode
+    ? withMode(withAllow(settings, restored), state.defaultMode)
+    : withAllow(settings, restored);
+  return { changed: true, settings: next, restoredMode: restoreMode ? state.defaultMode : null };
 }
 
 // Write Layer 2's hook script to its stable path (idempotent).
@@ -467,8 +506,13 @@ function maxLayers(settings) {
 
 // Turn both layers on/off in a single settings transform.
 function applyMax(settings, on) {
-  let s = settings, changed = false;
-  const step = (res) => { if (res.changed) { s = res.settings; changed = true; } };
+  let s = settings, changed = false, switchedMode = null, restoredMode = null;
+  const step = (res) => {
+    if (!res.changed) return;
+    s = res.settings; changed = true;
+    if (res.switchedMode) switchedMode = res.switchedMode;
+    if (res.restoredMode !== undefined && res.restoredMode !== null) restoredMode = res.restoredMode;
+  };
   if (on) {
     step(enableMaxAllow(s));
     step(registerApproveHook(s));
@@ -476,13 +520,14 @@ function applyMax(settings, on) {
     step(disableMaxAllow(s));
     step(unregisterApproveHook(s));
   }
-  return { changed, settings: s };
+  return { changed, settings: s, switchedMode, restoredMode };
 }
 
 module.exports = {
   generalizePermission, mineWildcard, BASH_SCRIPT_KEYWORDS,
   isCoveredBy, prunePermissions, processAllowList, writeFileAtomicSync,
   BYPASS_MODE, BYPASS_STATE_FILE, currentMode, isBypassOn, applyBypass, readBypassState,
+  CLASSIFIER_MODE, MAX_MODE, classifierModeOn,
   MAX_ALLOW_CORE, MAX_MARKERS, MAX_STATE_FILE, APPROVE_SCRIPT, APPROVE_COMMAND,
   detectMcpServers, buildMaxAllowSet, isMaxAllowOn, enableMaxAllow, disableMaxAllow,
   ensureApproveScript, isApproveHookOn, registerApproveHook, unregisterApproveHook,

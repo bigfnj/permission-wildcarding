@@ -70,7 +70,9 @@ let autoLearnManager = null;
 let autoLearnManagerKey = '';
 let autoLearnCardCache = null;  // { key, data }; key includes the state file stamp
 let autoLearnWorkerRunner = null;
+let policyBounce = null;        // debounce for policy-signal / settings-change guard runs
 let localDrainBounce = null;    // debounce for settings.local.json writes
+let localDrainRetries = 0;      // consecutive deferrals while settings.json was unreadable
 let localDrainAt = null;        // timestamp of the last local drain that changed something
 
 // ── settings.json helpers ─────────────────────────────────────────────────────
@@ -79,6 +81,36 @@ function readSettings() {
     return JSON.parse(fs.readFileSync(SETTINGS, 'utf8'));
   } catch {
     return null; // missing or mid-write
+  }
+}
+
+// Same read, but it says *why* there is no value. "The file is not there" and "the
+// file could not be read this instant" collapse into the same null above, which is
+// fine for a caller that only wants a value and wrong for anything that reasons
+// about loss: Claude Code rewrites settings.json in place on every /model, /effort
+// and approval, and it re-saves policy-limits.json several times during startup,
+// so a watcher event landing inside one of those writes is routine rather than
+// exotic. Absent means the backup should step in; unreadable means wait and look
+// again, because the alternative is concluding that everything is gone.
+const SETTINGS_ABSENT     = 'absent';
+const SETTINGS_PRESENT    = 'present';
+const SETTINGS_UNREADABLE = 'unreadable';
+const SETTINGS_UNREADABLE_CODE = 'SETTINGS_UNREADABLE';
+
+function readSettingsState() {
+  let raw;
+  try {
+    raw = fs.readFileSync(SETTINGS, 'utf8');
+  } catch (err) {
+    return err?.code === 'ENOENT'
+      ? { state: SETTINGS_ABSENT, settings: {} }
+      : { state: SETTINGS_UNREADABLE, settings: null };
+  }
+  try {
+    return { state: SETTINGS_PRESENT, settings: JSON.parse(raw) };
+  } catch {
+    // Includes the zero-byte window of a truncate-then-write.
+    return { state: SETTINGS_UNREADABLE, settings: null };
   }
 }
 
@@ -91,7 +123,21 @@ function writeAllow(settings, allow, denyAdditions) {
   // Rebase the intended allow-list delta onto the newest parseable settings so
   // a concurrent Claude/Codex settings write does not lose unrelated fields or
   // approvals that arrived after this operation began.
-  const latest = readSettings() ?? settings;
+  const state = readSettingsState();
+  // The one case where falling back to the caller's snapshot is destructive: the
+  // file is there, it just could not be parsed. `settings` is often `{}` on that
+  // path, and the spread below would then write a settings.json holding nothing
+  // but `permissions`, taking model, effortLevel, env and hooks with it. Refuse,
+  // and let the caller report it — every call site already does.
+  if (state.state === SETTINGS_UNREADABLE) {
+    const err = new Error(`${SETTINGS} exists but could not be parsed, so it is not safe to write over`);
+    // Coded like the policy lock, and for the same reason: a background writer
+    // should treat this as "come back in a moment", not as a failure to shout
+    // about. Whatever is mid-write finishes and its change re-triggers us.
+    err.code = SETTINGS_UNREADABLE_CODE;
+    throw err;
+  }
+  const latest = state.state === SETTINGS_PRESENT ? state.settings : settings;
   const originalAllow = Array.isArray(settings?.permissions?.allow) ? settings.permissions.allow : [];
   const latestAllow = Array.isArray(latest?.permissions?.allow) ? latest.permissions.allow : [];
   const removed = new Set(originalAllow.filter((entry) => !allow.includes(entry)));
@@ -110,6 +156,15 @@ function writeAllow(settings, allow, denyAdditions) {
   // renameSync raced Claude Code's own settings.json writes → intermittent EPERM.
   writeFileAtomicSync(SETTINGS, JSON.stringify(updated, null, 2) + '\n');
   backupPolicy(rebasedAllow, rebasedDeny);
+  // What actually landed, measured against the file this write rebased onto — not
+  // against the caller's older snapshot. A caller that reports its own intent
+  // instead ends up announcing "+299 restored" over a file that already had them.
+  return {
+    allow: rebasedAllow,
+    deny: rebasedDeny,
+    addedAllow: rebasedAllow.filter((entry) => !latestAllow.includes(entry)).length,
+    addedDeny: rebasedDeny.filter((entry) => !latestDeny.includes(entry)).length,
+  };
 }
 
 // ── policy backup / restore ─────────────────────────────────────────────────────
@@ -218,8 +273,14 @@ function readPolicyLimits() {
 function onManagedPolicyChanged() {
   const backup = readBackup();
   if (!backup) return;
+  const liveState = readSettingsState();
+  // Say nothing when the file could not be read. The next settings write or policy
+  // event brings us straight back here, and by then it parses; guessing in the
+  // meantime means guessing "all of it went missing", against a file that is
+  // usually intact and mid-write.
+  if (liveState.state === SETTINGS_UNREADABLE) return;
   const managed = readManagedSettings();
-  const live = readSettings() ?? {};
+  const live = liveState.settings;
   const assessment = assessPolicy({
     live, backup, managed: managed?.settings, limits: readPolicyLimits(),
   });
@@ -228,9 +289,7 @@ function onManagedPolicyChanged() {
   // Only a bulk loss is repaired without asking. Removing one entry is an
   // instruction (the ✕ prune already forgets it from the backup); losing most of
   // the list is damage.
-  if (assessment.bulkLoss) {
-    restoreFromBackup();
-  } else if (assessment.restorable) {
+  if (!assessment.bulkLoss && assessment.restorable) {
     // Small loss: an instruction, not damage — so ask rather than auto-restore.
     // "Forget them" drops the entries from the high-water backup, which is the
     // fix for a stale backup nagging forever about entries the user pruned by
@@ -252,8 +311,17 @@ function onManagedPolicyChanged() {
   }
 
   const notes = [];
+  let restored = null;
   if (assessment.bulkLoss) {
-    notes.push(`re-asserted ${assessment.restorable} entries that went missing`);
+    // One notification per event: the restore reports back instead of raising its
+    // own toast, so the count below is what the write actually changed on disk. A
+    // restore that turns out to be a no-op says nothing at all, which is the
+    // second line of defence against announcing a loss that never happened.
+    restored = restoreFromBackup({ announce: false });
+    if (restored) {
+      const count = restored.addedAllow + restored.addedDeny;
+      notes.push(`re-asserted ${count} ${count === 1 ? 'entry' : 'entries'} that went missing`);
+    }
   }
   if (assessment.shadowed.length) {
     // These cannot be recovered, only explained — say so rather than implying
@@ -282,7 +350,7 @@ function onManagedPolicyChanged() {
       ? assessment.restrictions.map((name) => `  ${name}: not allowed`).join('\n')
       : '  none recorded');
     channel.appendLine('');
-    channel.appendLine(`Re-asserted: ${assessment.bulkLoss ? assessment.restorable : 0} entries`);
+    channel.appendLine(`Re-asserted: ${restored ? restored.addedAllow + restored.addedDeny : 0} entries`);
     if (assessment.shadowed.length) {
       channel.appendLine('');
       channel.appendLine('Overridden by managed policy (not recoverable):');
@@ -294,21 +362,50 @@ function onManagedPolicyChanged() {
   });
 }
 
+// Watcher events arrive in bursts, and this pass draws a much larger conclusion
+// from them than the wildcarding pass does, so it gets the same treatment: settle
+// first, then look once. Measured on this machine, a single Claude Code start
+// re-saved policy-limits.json four times in 40 seconds while settings.json was
+// being rewritten in place, and each of those fired the guard immediately.
+const POLICY_CHECK_DEBOUNCE_MS = 1500;
+
+function schedulePolicyCheck(delay = POLICY_CHECK_DEBOUNCE_MS) {
+  clearTimeout(policyBounce);
+  policyBounce = setTimeout(() => {
+    try { onManagedPolicyChanged(); } catch { /* a watcher must never surface a stack */ }
+  }, delay);
+}
+
 // Merge the backup into the current allow and deny lists, then generalize/prune
 // the allow half. Used to recover after a policy wipe — a superset merge, so it
 // never removes anything.
-function restoreFromBackup() {
+//
+// Returns what the write changed, or null when nothing was written. `announce:
+// false` hands the reporting to the caller so one event cannot raise two toasts.
+function restoreFromBackup(options = {}) {
+  const announce = options.announce !== false;
   const backup = readBackup();
   if (!backup) {
     vscode.window.showWarningMessage(`permission-wildcarding: no backup found at ${LATEST_BACKUP}`);
-    return;
+    return null;
   }
   if (!backup.allow.length && !backup.deny.length) {
     vscode.window.showWarningMessage('permission-wildcarding: backup is empty — nothing to restore');
-    return;
+    return null;
   }
 
-  const settings = readSettings() ?? {};
+  const liveState = readSettingsState();
+  // Restoring "over" a file we cannot parse would compare the backup against an
+  // allow list we never read, so every entry looks missing and the merge has no
+  // live half to preserve. An absent file is different: there is nothing to lose.
+  if (liveState.state === SETTINGS_UNREADABLE) {
+    vscode.window.showWarningMessage(
+      `permission-wildcarding: ${SETTINGS} could not be parsed — not restoring over it. ` +
+      'Fix the file (or close whatever is writing it) and run Restore again.'
+    );
+    return null;
+  }
+  const settings = liveState.settings ?? {};
   const current  = Array.isArray(settings.permissions?.allow) ? settings.permissions.allow : [];
   const currentDeny = Array.isArray(settings.permissions?.deny) ? settings.permissions.deny : [];
   // Never restore the MAX blanket markers (Bash(*) / PowerShell(*)) from backup.
@@ -321,27 +418,36 @@ function restoreFromBackup() {
   const missingDeny = backup.deny.filter((rule) => !currentDeny.includes(rule));
 
   if (JSON.stringify(current) === JSON.stringify(merged) && !missingDeny.length) {
-    vscode.window.setStatusBarMessage('$(history) permission-wildcarding: policy already matches backup', 4000);
+    if (announce) {
+      vscode.window.setStatusBarMessage('$(history) permission-wildcarding: policy already matches backup', 4000);
+    }
     dashboard?.refresh();
-    return;
+    return null;
   }
 
+  let written = null;
   try {
     // One atomic write carries both halves, so there is no window in which the
     // allow list is restored while its boundary is still missing.
-    writeAllow(settings, merged, missingDeny);
+    written = writeAllow(settings, merged, missingDeny);
     lastRun = Date.now();
-    const added = merged.filter(p => !current.includes(p)).length;
-    vscode.window.showInformationMessage(
-      `$(history) Restored from backup — +${added} allow → ${merged.length} entries` +
-      (missingDeny.length
-        ? `, +${missingDeny.length} deny ${missingDeny.length === 1 ? 'rule' : 'rules'} restored`
-        : '')
-    );
+    if (announce) {
+      // Plain text: notification bodies do not expand codicons, so a `$(history)`
+      // here reaches the user verbatim. The status-bar calls keep theirs, where
+      // the substitution does happen.
+      vscode.window.showInformationMessage(
+        `permission-wildcarding: restored from backup — +${written.addedAllow} allow ` +
+        `(${written.allow.length} ${written.allow.length === 1 ? 'entry' : 'entries'} now active)` +
+        (written.addedDeny
+          ? `, +${written.addedDeny} deny ${written.addedDeny === 1 ? 'rule' : 'rules'}`
+          : '')
+      );
+    }
   } catch (err) {
     vscode.window.showErrorMessage(`permission-wildcarding: restore failed — ${err.message}`);
   }
   dashboard?.refresh();
+  return written;
 }
 
 // ── memory card: recall (CPU LLM) status + vector-cache rebuild ─────────────────
@@ -585,7 +691,7 @@ async function rebuildRecall() {
           vscode.window.showErrorMessage(`permission-wildcarding: recall rebuild failed — ${(stderr || err.message || '').trim().slice(0, 300)}`);
         } else {
           const n = recallIndexCount(dir);
-          vscode.window.showInformationMessage(`$(book) Recall index rebuilt${n != null ? ` — ${n} memories embedded` : ''}.`);
+          vscode.window.showInformationMessage(`permission-wildcarding: recall index rebuilt${n != null ? ` — ${n} memories embedded` : ''}.`);
         }
         dashboard?.refresh();
         resolve();
@@ -1397,7 +1503,7 @@ function activate(context) {
   );
   // Loss is checked on every settings change, not only on a policy-file event:
   // server-delivered org policy can remove approvals with no local file to watch.
-  const onSettingsChanged = () => { schedule(); try { onManagedPolicyChanged(); } catch {} };
+  const onSettingsChanged = () => { schedule(); schedulePolicyCheck(); };
   watcher.onDidChange(onSettingsChanged);
   watcher.onDidCreate(onSettingsChanged);
   context.subscriptions.push(watcher);
@@ -1410,12 +1516,14 @@ function activate(context) {
       const managedWatcher = vscode.workspace.createFileSystemWatcher(
         new vscode.RelativePattern(vscode.Uri.file(path.dirname(managedPath)), path.basename(managedPath))
       );
-      managedWatcher.onDidChange(() => onManagedPolicyChanged());
-      managedWatcher.onDidCreate(() => onManagedPolicyChanged());
+      managedWatcher.onDidChange(() => schedulePolicyCheck());
+      managedWatcher.onDidCreate(() => schedulePolicyCheck());
       context.subscriptions.push(managedWatcher);
     } catch { /* an unwatchable system path must never block activation */ }
   }
-  // Catch a policy that landed while VS Code was closed.
+  // Catch a policy that landed while VS Code was closed. Not debounced: this one
+  // is a single shot rather than a burst, and if settings.json happens to be
+  // mid-write right now the read guard makes it a no-op instead of a false alarm.
   try { onManagedPolicyChanged(); } catch { /* never block activation */ }
 
   // Codex config.toml drives the Codex half of the friction indicator.
@@ -1717,7 +1825,7 @@ function toggleCodexMax() {
     );
   } else {
     vscode.window.showInformationMessage(
-      `$(shield) Codex MAX OFF — approval_policy=${res.restoredTo ?? 'unset (key removed)'}. Restart Codex to apply.`
+      `permission-wildcarding: Codex MAX OFF — approval_policy=${res.restoredTo ?? 'unset (key removed)'}. Restart Codex to apply.`
     );
   }
   updateStatusBar();
@@ -1733,6 +1841,8 @@ function toggleMax() {
   // and the write would be re-pruned back out.
   let turningOn = false;
   let layers = null;
+  let switchedMode = null;
+  let restoredMode = null;
   try {
     getPolicyLock().locked(() => {
       const settings = readSettings();
@@ -1743,6 +1853,8 @@ function toggleMax() {
       turningOn = !isMaxOn(settings);
       const res = applyMax(settings, turningOn);
       if (!res.changed) return;
+      switchedMode = res.switchedMode;
+      restoredMode = res.restoredMode;
       writeFileAtomicSync(SETTINGS, JSON.stringify(res.settings, null, 2) + '\n');
       if (!turningOn) {
         // Purge MAX blanket entries from the backup so the policy guard does not
@@ -1766,15 +1878,21 @@ function toggleMax() {
   if (layers && turningOn) {
     vscode.window.showWarningMessage(
       `⚡ MAX mode ON — every prompt skipped via allow-wildcards${layers.hook ? ' + approve hook' : ''} ` +
-      '(deny rules + circuit breakers still apply). Reload the window for the approve hook to take effect.',
+      '(deny rules + circuit breakers still apply). Reload the window for the approve hook to take effect.' +
+      (switchedMode
+        ? ` Permission mode switched from ${switchedMode} to default: auto mode discards Bash(*) as ` +
+          'classifier-bypassing, so MAX would have granted nothing there. MAX off puts the mode back.'
+        : ''),
       'Reload Window'
     ).then((choice) => {
       if (choice === 'Reload Window') vscode.commands.executeCommand('workbench.action.reloadWindow');
     });
   } else if (layers) {
     vscode.window.showInformationMessage(
-      '$(shield) MAX mode OFF — restored your allow list, kept anything approved while MAX was on, ' +
-      'and removed the approve hook. Reload the window to apply.'
+      'permission-wildcarding: MAX mode OFF — restored your allow list, kept anything approved while MAX was on, ' +
+      'and removed the approve hook.' +
+      (restoredMode ? ` Permission mode restored to ${restoredMode}.` : '') +
+      ' Reload the window to apply.'
     );
   }
   updateStatusBar();
@@ -1846,7 +1964,7 @@ function runWildcarding(manual = false) {
     const removedList = before.filter(p => !after.includes(p));
     if (addedList.length || removedList.length) {
       vscode.window.showInformationMessage(
-        `$(shield) Wildcarded ${addedList.length} permission${addedList.length !== 1 ? 's' : ''}, pruned ${removedList.length} — ${after.length} total`,
+        `permission-wildcarding: wildcarded ${addedList.length} permission${addedList.length !== 1 ? 's' : ''}, pruned ${removedList.length} — ${after.length} total`,
         { detail: addedList.map(p => `→ ${p}`).join('\n') }
       );
       vscode.window.setStatusBarMessage(
@@ -1924,9 +2042,23 @@ function drainLocal(manual = false) {
       if (manual) vscode.window.setStatusBarMessage(`$(shield) permission-wildcarding: ${POLICY_LOCK_BUSY_MESSAGE}`, 5000);
       return;
     }
+    if (err?.code === SETTINGS_UNREADABLE_CODE) {
+      // settings.json is mid-write. Promoting a project-local entry can wait; the
+      // entries stay in settings.local.json until a later pass picks them up, so a
+      // retry is enough and a startup toast about a transient is not. Bounded,
+      // because a file that stays unparseable is a different problem and retrying
+      // it every three seconds forever would not be the fix for it.
+      if (localDrainRetries < 20) { localDrainRetries += 1; scheduleLocalDrain(3000); }
+      if (manual) {
+        vscode.window.setStatusBarMessage(
+          '$(shield) permission-wildcarding: settings.json is mid-write — retrying the drain shortly', 5000);
+      }
+      return;
+    }
     vscode.window.showErrorMessage(`permission-wildcarding: local drain failed — ${err.message}`);
     return;
   }
+  localDrainRetries = 0;
 
   if (reports.some((report) => report.blocked === 'max')) {
     if (manual) {
@@ -1945,7 +2077,7 @@ function drainLocal(manual = false) {
     localDrainAt = Date.now();
     lastRun = Date.now();
     vscode.window.showInformationMessage(
-      `$(shield) Promoted ${promoted.length} project-local approval${promoted.length !== 1 ? 's' : ''} ` +
+      `permission-wildcarding: promoted ${promoted.length} project-local approval${promoted.length !== 1 ? 's' : ''} ` +
       `to user scope, pruned ${pruned} now-redundant local ${pruned === 1 ? 'entry' : 'entries'}`,
       { detail: promoted.map((p) => `→ ${p}`).join('\n') }
     );
@@ -2847,6 +2979,7 @@ class WildcardingViewProvider {
 
 async function deactivate() {
   clearTimeout(debounceTimer);
+  clearTimeout(policyBounce);
   clearTimeout(localDrainBounce);
   clearTimeout(memBounce);
   clearTimeout(autoLearnBounce);

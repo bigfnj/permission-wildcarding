@@ -140,6 +140,23 @@ for everything.
 
 ---
 
+## C / C++ (CMake)
+
+| Permission | Purpose |
+|---|---|
+| `Bash(cmake *)` | Configure and build (`cmake -B build`, `cmake --build build`) |
+| `PowerShell(cmake *)` | The same, from a PowerShell session |
+| `Bash(ctest *)` | Run the configured test suite (`ctest --test-dir build`) |
+| `PowerShell(ctest *)` | The same, from a PowerShell session |
+
+> **`ctest` is listed separately because `cmake` does not cover it.** They are distinct
+> executables, so a `cmake` wildcard never matches a `ctest` invocation, and a
+> configure-build-test loop prompts on its last step otherwise. Both are fixed-purpose:
+> their arguments are paths and switches rather than subcommands, so a newly observed
+> approval collapses to the root on its own, matching what the seed grants.
+
+---
+
 ## GitHub CLI
 
 | Permission | Purpose |
@@ -331,6 +348,29 @@ should opt into on your own machine rather than inherit from a seed:
 ---
 
 ## Known Limitations
+
+### Auto mode discards the interpreter roots
+
+Claude Code's `auto` permission mode routes every decision through its classifier, and it
+drops any allow entry that would bypass that classifier. Twenty of the seed's entries are
+affected: `Bash(bash *)`, `Bash(sh *)`, `Bash(python *)`, `Bash(python3 *)`, `Bash(node *)`,
+`Bash(npx *)`, `Bash(ssh *)`, `Bash(perl *)`, `Bash(xargs *)`, `Bash(lua *)`, and the
+`PowerShell(...)` twins for `python`, `python3`, `node`, `ssh`, `cmd`, `powershell`,
+`powershell.exe`, `wsl.exe`, `Start-Process` and `Add-Type`.
+
+They are **not** dead entries. Load the same `settings.json` in `default` mode and every one
+of them applies; only auto mode filters them, logging `Ignoring dangerous permission …
+(bypasses classifier)` for each. So the seed keeps them, and which mode you run decides
+whether they do anything. Measured against 2.1.238 and 2.1.245, so this tracks the mode
+rather than the version.
+
+Two things follow. Sibling spellings are not interchangeable: `Bash(powershell *)`,
+`Bash(cmd.exe *)`, `Bash(pwsh *)`, `Bash(wsl *)`, `Bash(scp *)`, `Bash(timeout *)` and
+`Bash(nohup *)` all survive auto mode while their `PowerShell(...)` counterparts do not, and
+`Bash(scp *)` survives where `Bash(ssh *)` does not. And narrowing the argument does not
+help: a managed `Bash(python -m pytest:*)` is refused for the same reason. If you need those
+families to be pre-approved, run in `default` mode; if you want the classifier deciding, run
+auto and expect these to be ignored.
 
 ### Compound commands are checked per sub-command
 
