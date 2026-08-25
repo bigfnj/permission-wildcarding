@@ -164,6 +164,10 @@ if (-not (Test-Path $py)) {
     Check 'index is within its byte budget' (-not ($lint -match 'over budget')) ''
     Check 'resident entries within the ceiling' (-not ($lint -match 'over the attention ceiling')) ''
     Check 'every standing order is compiled' (-not ($lint -match 'not compiled')) ''
+    # Source drift: a gate edited but never recompiled. `--gates status` cannot see this, so
+    # lint is the only guard, and a release must not ship with the resident block behind source.
+    Check 'compiled gates are not stale vs source' (-not ($lint -match 'STALE')) `
+        'run recall.py --gates-compile if this fails'
     $bytes = [regex]::Match($lint, 'MEMORY\.md: (\d+) bytes')
     $ents = [regex]::Match($lint, '(\d+) resident index entries')
     if ($bytes.Success -and $ents.Success) {

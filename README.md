@@ -307,7 +307,9 @@ Notes worth knowing:
   once the block is installed, so it never spawns Python for someone who has not opted in.
   A first compile stays an explicit action on the **Memory gates** card.
 - `recall.py --lint` reports what is still uncompiled: `scope: global` with no gate block,
-  `type: feedback` with no `scope:`, resident entry count, and demotion candidates.
+  `type: feedback` with no `scope:`, resident entry count, and demotion candidates. It also
+  flags **source drift**: a gate block edited but never recompiled, which `--gates status`
+  cannot see because it compares the installed block to the compiled file, not to the memory.
 - Repo-scoped gates belong in that repo's **gitignored `CLAUDE.local.md`**, so a personal
   judgement call stays out of shared history.
 
@@ -707,8 +709,8 @@ Cutting a GitHub Release builds and attaches the `.vsix` automatically via
 taken from the release tag, so you don't hand-edit `package.json`:
 
 ```bash
-gh release create v1.2.1 --generate-notes
-# -> workflow packages permission-wildcarding-1.2.1.vsix and attaches it to the release
+gh release create v1.2.2 --generate-notes
+# -> workflow packages permission-wildcarding-1.2.2.vsix and attaches it to the release
 ```
 
 Before tagging, run the acceptance suite. It is read-only apart from the Node tests and
