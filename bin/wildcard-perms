@@ -607,5 +607,14 @@ function max(args) {
     if (cmd === 'on') {
       process.stdout.write('  deny rules and hard circuit breakers still apply.\n');
     }
+    if (res.switchedMode) {
+      process.stdout.write(
+        `  permission mode switched from ${res.switchedMode} to default: auto mode discards Bash(*) as\n` +
+        '  classifier-bypassing, so MAX would have granted nothing there. --max off puts the mode back.\n'
+      );
+    }
+    if (res.restoredMode) {
+      process.stdout.write(`  permission mode restored to ${res.restoredMode}.\n`);
+    }
   });
 }

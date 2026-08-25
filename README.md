@@ -519,9 +519,9 @@ two mechanisms, because they fail in different ways.
 
 ### MAX mode (recommended)
 
-`MAX` skips every prompt using **two independent layers**, and never touches
-`defaultMode` — so it keeps working even where corporate policy blocks Claude Code's
-own bypass mode (`disableBypassPermissionsMode`):
+`MAX` skips every prompt using **two independent layers**, and never needs bypass mode
+— so it keeps working even where corporate policy blocks Claude Code's own
+(`disableBypassPermissionsMode`):
 
 - **Layer 1 — blanket allow-list wildcards.** Injects `Bash(*)`, `PowerShell(*)`,
   `Read(*)`, `Edit`, `Write`, `WebFetch(*)`, `WebSearch`, and a `mcp__<server>__*` for
@@ -534,6 +534,19 @@ own bypass mode (`disableBypassPermissionsMode`):
   including brand-new MCP servers the allow list can't express — closing Layer 1's only
   gap. Being a user hook, it's the layer an org "managed hooks only" policy would
   disable, which is exactly why Layer 1 is the fallback.
+
+**MAX and Claude Code's `auto` mode are mutually exclusive**, and the toggle handles that
+for you. Auto mode routes every decision through Claude Code's classifier, and it discards
+any allow entry that would bypass the classifier: load the same `settings.json` under both
+modes and auto mode logs `Ignoring dangerous permission Bash(*) … (bypasses classifier)`,
+along with every interpreter root (`Bash(bash *)`, `Bash(python *)`, `Bash(node *)`,
+`Bash(npx *)`, `Bash(ssh *)`, `Bash(xargs *)`, `Bash(lua *)`, and their `PowerShell(...)`
+twins), while default mode loads all of them intact. Layer 1 *is* a blanket wildcard, so in
+auto mode it grants nothing — and MAX would still have collapsed your specific entries
+underneath it, leaving a shorter list and no blanket to stand in for it. So MAX-on moves
+`defaultMode` off `auto`, records what it was, and MAX-off puts it back. A mode you changed
+by hand while MAX was on is left alone. Measured against 2.1.238 and 2.1.245; this is a
+property of the mode, not of the version.
 
 Turning MAX **on** snapshots your real allow list to `~/.claude/backups/wildcarding-max.json`
 and writes the hook to `~/.claude/wildcarding/approve-all.js`; turning it **off** restores

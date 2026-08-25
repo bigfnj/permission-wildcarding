@@ -1841,6 +1841,8 @@ function toggleMax() {
   // and the write would be re-pruned back out.
   let turningOn = false;
   let layers = null;
+  let switchedMode = null;
+  let restoredMode = null;
   try {
     getPolicyLock().locked(() => {
       const settings = readSettings();
@@ -1851,6 +1853,8 @@ function toggleMax() {
       turningOn = !isMaxOn(settings);
       const res = applyMax(settings, turningOn);
       if (!res.changed) return;
+      switchedMode = res.switchedMode;
+      restoredMode = res.restoredMode;
       writeFileAtomicSync(SETTINGS, JSON.stringify(res.settings, null, 2) + '\n');
       if (!turningOn) {
         // Purge MAX blanket entries from the backup so the policy guard does not
@@ -1874,7 +1878,11 @@ function toggleMax() {
   if (layers && turningOn) {
     vscode.window.showWarningMessage(
       `⚡ MAX mode ON — every prompt skipped via allow-wildcards${layers.hook ? ' + approve hook' : ''} ` +
-      '(deny rules + circuit breakers still apply). Reload the window for the approve hook to take effect.',
+      '(deny rules + circuit breakers still apply). Reload the window for the approve hook to take effect.' +
+      (switchedMode
+        ? ` Permission mode switched from ${switchedMode} to default: auto mode discards Bash(*) as ` +
+          'classifier-bypassing, so MAX would have granted nothing there. MAX off puts the mode back.'
+        : ''),
       'Reload Window'
     ).then((choice) => {
       if (choice === 'Reload Window') vscode.commands.executeCommand('workbench.action.reloadWindow');
@@ -1882,7 +1890,9 @@ function toggleMax() {
   } else if (layers) {
     vscode.window.showInformationMessage(
       'permission-wildcarding: MAX mode OFF — restored your allow list, kept anything approved while MAX was on, ' +
-      'and removed the approve hook. Reload the window to apply.'
+      'and removed the approve hook.' +
+      (restoredMode ? ` Permission mode restored to ${restoredMode}.` : '') +
+      ' Reload the window to apply.'
     );
   }
   updateStatusBar();
