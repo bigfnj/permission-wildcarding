@@ -140,6 +140,23 @@ for everything.
 
 ---
 
+## C / C++ (CMake)
+
+| Permission | Purpose |
+|---|---|
+| `Bash(cmake *)` | Configure and build (`cmake -B build`, `cmake --build build`) |
+| `PowerShell(cmake *)` | The same, from a PowerShell session |
+| `Bash(ctest *)` | Run the configured test suite (`ctest --test-dir build`) |
+| `PowerShell(ctest *)` | The same, from a PowerShell session |
+
+> **`ctest` is listed separately because `cmake` does not cover it.** They are distinct
+> executables, so a `cmake` wildcard never matches a `ctest` invocation, and a
+> configure-build-test loop prompts on its last step otherwise. Both are fixed-purpose:
+> their arguments are paths and switches rather than subcommands, so a newly observed
+> approval collapses to the root on its own, matching what the seed grants.
+
+---
+
 ## GitHub CLI
 
 | Permission | Purpose |
