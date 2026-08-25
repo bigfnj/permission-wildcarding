@@ -94,77 +94,98 @@ applies to it.
 Managed by permission-wildcarding. Remove this block, or turn it off with
 \`wildcard-perms --guidance off\`.`;
 
-function guidanceBlock() {
-  return `${BEGIN}\n${GUIDANCE_BODY}\n${END}\n`;
-}
+// A managed block is a marker pair plus a body. The shell-style text above is one
+// instance; the compiled memory gates in `agent-gates.js` are another. Each closes over
+// its own markers, so adding a block cannot change how an existing one behaves, and an
+// "off" on one can never tear out the other.
+function createManagedBlock({ begin, end, body }) {
+  // Resolved per call, never captured: a static block hands back a const, while the gates
+  // block reads whatever the compiler last wrote. That is what makes a corpus-derived
+  // block's staleness detectable at all, with no version to bump.
+  const bodyText = () => (typeof body === 'function' ? body() : body);
+  const block = () => `${begin}\n${bodyText()}\n${end}\n`;
 
-// Marker-fenced, so a rewrite replaces exactly what a previous version wrote and
-// an "off" leaves the rest of the file untouched. Matching is anchored on the
-// markers rather than the body text, which is what lets the wording change
-// between releases without stranding an old copy.
-function blockRange(text) {
-  const start = text.indexOf(BEGIN);
-  if (start === -1) return null;
-  const end = text.indexOf(END, start);
-  if (end === -1) return null;
-  return { start, end: end + END.length };
-}
-
-function hasGuidance(text) {
-  return blockRange(typeof text === 'string' ? text : '') !== null;
-}
-
-// Whether the installed block is the current wording. An upgrade should refresh
-// a stale block silently; an unchanged one must not produce a write, or the
-// extension would rewrite CLAUDE.md on every activation.
-function isCurrent(text) {
-  const range = blockRange(typeof text === 'string' ? text : '');
-  if (!range) return false;
-  return text.slice(range.start, range.end) === guidanceBlock().trimEnd();
-}
-
-// Compute the file content for turning guidance on/off. Pure, so the decision is
-// testable without a filesystem: returns `changed: false` for a no-op.
-function applyGuidance(text, on) {
-  const current = typeof text === 'string' ? text : '';
-  const range = blockRange(current);
-
-  if (!on) {
-    if (!range) return { changed: false, text: current };
-    // Take the trailing newline with the block, and the blank line that was
-    // inserted ahead of it, so removing and re-adding is a round trip. The
-    // separator sweep eats the newline that ended the user's own last line too,
-    // so put exactly one back — a text file keeps its final newline.
-    let start = range.start;
-    let end = range.end;
-    while (end < current.length && current[end] === '\n') end += 1;
-    while (start > 0 && current[start - 1] === '\n') start -= 1;
-    let next = current.slice(0, start) + current.slice(end);
-    if (next.length && !next.endsWith('\n')) next += '\n';
-    return { changed: next !== current, text: next };
+  // Marker-fenced, so a rewrite replaces exactly what a previous version wrote and
+  // an "off" leaves the rest of the file untouched. Matching is anchored on the
+  // markers rather than the body text, which is what lets the wording change
+  // between releases without stranding an old copy.
+  function blockRange(text) {
+    const start = text.indexOf(begin);
+    if (start === -1) return null;
+    const stop = text.indexOf(end, start);
+    if (stop === -1) return null;
+    return { start, end: stop + end.length };
   }
 
-  if (range) {
-    if (isCurrent(current)) return { changed: false, text: current };
-    const next = current.slice(0, range.start) + guidanceBlock().trimEnd() + current.slice(range.end);
-    return { changed: true, text: next };
+  function has(text) {
+    return blockRange(typeof text === 'string' ? text : '') !== null;
   }
 
-  // Append rather than prepend: the user's own instructions keep their position
-  // at the top of the file, where they were written to be read first.
-  const separator = current.length === 0 ? '' : current.endsWith('\n\n') ? '' : current.endsWith('\n') ? '\n' : '\n\n';
-  return { changed: true, text: `${current}${separator}${guidanceBlock()}` };
+  // Whether the installed block is the current wording. An upgrade should refresh
+  // a stale block silently; an unchanged one must not produce a write, or the
+  // extension would rewrite CLAUDE.md on every activation.
+  function isCurrent(text) {
+    const range = blockRange(typeof text === 'string' ? text : '');
+    if (!range) return false;
+    return text.slice(range.start, range.end) === block().trimEnd();
+  }
+
+  // Compute the file content for turning the block on/off. Pure, so the decision is
+  // testable without a filesystem: returns `changed: false` for a no-op.
+  function apply(text, on) {
+    const current = typeof text === 'string' ? text : '';
+    const range = blockRange(current);
+
+    if (!on) {
+      if (!range) return { changed: false, text: current };
+      // Take the trailing newline with the block, and the blank line that was
+      // inserted ahead of it, so removing and re-adding is a round trip. The
+      // separator sweep eats the newline that ended the user's own last line too,
+      // so put exactly one back — a text file keeps its final newline.
+      let start = range.start;
+      let stop = range.end;
+      while (stop < current.length && current[stop] === '\n') stop += 1;
+      while (start > 0 && current[start - 1] === '\n') start -= 1;
+      let next = current.slice(0, start) + current.slice(stop);
+      if (next.length && !next.endsWith('\n')) next += '\n';
+      return { changed: next !== current, text: next };
+    }
+
+    if (range) {
+      if (isCurrent(current)) return { changed: false, text: current };
+      const next = current.slice(0, range.start) + block().trimEnd() + current.slice(range.end);
+      return { changed: true, text: next };
+    }
+
+    // Append rather than prepend: the user's own instructions keep their position
+    // at the top of the file, where they were written to be read first.
+    const separator = current.length === 0 ? '' : current.endsWith('\n\n') ? '' : current.endsWith('\n') ? '\n' : '\n\n';
+    return { changed: true, text: `${current}${separator}${block()}` };
+  }
+
+  return { begin, end, block, blockRange, has, isCurrent, apply };
 }
+
+// The shell-style instance, plus delegates that keep every existing call site and test
+// working unchanged: the suite that was green before the split is the proof it still is.
+const SHELL_BLOCK = createManagedBlock({ begin: BEGIN, end: END, body: () => GUIDANCE_BODY });
+
+const guidanceBlock = SHELL_BLOCK.block;
+const hasGuidance = SHELL_BLOCK.has;
+const isCurrent = SHELL_BLOCK.isCurrent;
+const applyGuidance = SHELL_BLOCK.apply;
 
 function readGuidanceFile(file) {
   try { return fs.readFileSync(file, 'utf8'); }
   catch (error) { return error.code === 'ENOENT' ? '' : null; }
 }
 
-function guidanceStatus(file = guidancePath()) {
+// `block` is additive and defaults to the shell-style instance, so every existing caller
+// keeps its behaviour while `agent-gates.js` can drive the same file plumbing.
+function guidanceStatus(file = guidancePath(), block = SHELL_BLOCK) {
   const text = readGuidanceFile(file);
   if (text === null) return { path: file, readable: false, on: false, current: false };
-  return { path: file, readable: true, on: hasGuidance(text), current: isCurrent(text) };
+  return { path: file, readable: true, on: block.has(text), current: block.isCurrent(text) };
 }
 
 // Drive the change. Backs the file up on first modification — this is the user's
@@ -176,12 +197,13 @@ function setGuidance(on, {
   // Named per target, so the Claude and Codex instruction files cannot overwrite
   // each other's pre-change copy in the shared backup directory.
   backupName = 'CLAUDE.md.pre-guidance',
+  block = SHELL_BLOCK,
 } = {}) {
   const text = readGuidanceFile(file);
   if (text === null) return { changed: false, error: `cannot read ${file}`, path: file, on: false };
 
-  const result = applyGuidance(text, on);
-  if (!result.changed) return { changed: false, path: file, on: hasGuidance(text), error: null };
+  const result = block.apply(text, on);
+  if (!result.changed) return { changed: false, path: file, on: block.has(text), error: null };
 
   try {
     if (text.length) {
@@ -191,7 +213,7 @@ function setGuidance(on, {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     writeFileAtomicSync(file, result.text);
   } catch (error) {
-    return { changed: false, path: file, on: hasGuidance(text), error: error.message };
+    return { changed: false, path: file, on: block.has(text), error: error.message };
   }
   return { changed: true, path: file, on: !!on, error: null };
 }
@@ -222,4 +244,5 @@ module.exports = {
   guidancePath, codexGuidancePath, guidanceTargets, installedGuidanceTargets,
   guidanceBlock, hasGuidance, isCurrent, applyGuidance,
   guidanceStatus, setGuidance, guidanceStatusAll, setGuidanceAll,
+  createManagedBlock, SHELL_BLOCK,
 };

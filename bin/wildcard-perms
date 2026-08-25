@@ -4,6 +4,7 @@
 const fs = require('fs');
 const path = require('path');
 const os  = require('os');
+const { spawnSync } = require('child_process');
 const {
   processAllowList, writeFileAtomicSync, applyBypass, isBypassOn, currentMode,
   applyMax, isMaxOn, maxLayers,
@@ -17,6 +18,7 @@ const {
 } = require('../src/codex-max');
 const { drainLocalSettings } = require('../src/local-settings');
 const { guidanceStatusAll, setGuidanceAll } = require('../src/agent-guidance');
+const { gatesStatusAll, setGatesAll } = require('../src/agent-gates');
 
 const SETTINGS  = path.join(os.homedir(), '.claude', 'settings.json');
 const PACK_PATH = path.join(__dirname, '..', 'patterns', 'starter-pack.json');
@@ -26,6 +28,7 @@ const LEARN_USAGE = 'usage: wildcard-perms --learn scan|status|apply|undo ' +
   '[--codex-executable <path>]\n';
 const DRAIN_USAGE = 'usage: wildcard-perms --drain [--workspace <path>] [--dry-run]\n';
 const GUIDANCE_USAGE = 'usage: wildcard-perms --guidance on|off|status\n';
+const GATES_USAGE = 'usage: wildcard-perms --gates on|off|status|refresh\n';
 
 const argv = process.argv.slice(2);
 if (argv.includes('--learn')) {
@@ -36,6 +39,8 @@ if (argv.includes('--learn')) {
   drain(argv);
 } else if (argv.includes('--guidance')) {
   guidance(argv);
+} else if (argv.includes('--gates')) {
+  gates(argv);
 } else if (argv.includes('--codex-max')) {
   codexMax(argv);
 } else if (argv.includes('--max')) {
@@ -323,6 +328,76 @@ function guidance(args) {
   }
   if (cmd === 'on' && results.some((result) => result.changed)) {
     process.stdout.write('  loaded in every session of every project from the next session on.\n');
+  }
+}
+
+// The compiled memory gates. Same install plumbing as --guidance, separate markers and
+// separate switch: one is this repo's wording, the other is whatever recall.py last
+// compiled out of the memory corpus, so neither may turn the other off.
+function gates(args) {
+  const cmd = (args[args.indexOf('--gates') + 1] || 'status').toLowerCase();
+
+  if (cmd === 'status') {
+    const states = gatesStatusAll();
+    if (!states.length) {
+      process.stdout.write('wildcard-perms gates: no agent instruction file found\n');
+      return;
+    }
+    for (const state of states) {
+      process.stdout.write(
+        `wildcard-perms gates [${state.agent}]: ${state.on ? 'ON' : 'OFF'}` +
+        `${state.on && !state.current ? ' (corpus changed — run --gates on to refresh)' : ''}` +
+        `${state.compiled ? '' : ' (nothing compiled)'} ` +
+        `(${state.readable ? state.path : `unreadable: ${state.path}`})\n`
+      );
+    }
+    return;
+  }
+
+  // `refresh` = compile then install, which is what a SessionStart hook wants: edit a gate
+  // in a memory file and the next session is correct with no remembered step. recall.py
+  // re-execs itself into the toolbox venv, so a bare `python` is enough here.
+  if (cmd === 'refresh') {
+    const recall = path.join(__dirname, '..', 'memory', 'recall.py');
+    const compile = spawnSync(process.env.TOOLBOX_PYTHON || 'python', [recall, '--gates-compile'],
+      { encoding: 'utf8' });
+    if (compile.error || compile.status !== 0) {
+      // Non-fatal by design: a hook that fails loudly on every session start is worse than
+      // a slightly stale block, and --gates status still reports the staleness.
+      process.stderr.write('wildcard-perms --gates refresh: compile failed, '
+        + `installing whatever was last compiled (${compile.error?.message
+          || (compile.stderr || '').trim() || `exit ${compile.status}`})\n`);
+    }
+  }
+
+  if (cmd !== 'on' && cmd !== 'off' && cmd !== 'refresh') {
+    process.stderr.write(GATES_USAGE);
+    process.exit(1);
+  }
+
+  const results = setGatesAll(cmd !== 'off');
+  if (!results.length) {
+    process.stderr.write('wildcard-perms --gates: no agent instruction file to write\n');
+    process.exit(1);
+  }
+  for (const result of results) {
+    if (result.error) {
+      process.stderr.write(`wildcard-perms --gates [${result.agent}]: ${result.error}\n`);
+      process.exitCode = 1;
+      continue;
+    }
+    // `refresh` is the SessionStart hook, and a hook's stdout can be folded into the
+    // session's context. Stay silent when nothing changed, so the common case costs no
+    // tokens and a line appearing actually means something moved.
+    if (cmd === 'refresh' && !result.changed) continue;
+    process.stdout.write(
+      `wildcard-perms gates [${result.agent}]: ${cmd.toUpperCase()}` +
+      `${result.changed ? '' : ' (already)'} — ${result.path}\n`
+    );
+  }
+  if (cmd !== 'off' && results.some((result) => result.changed)) {
+    process.stdout.write('  standing orders resident from the next session on.'
+      + (cmd === 'on' ? ' Re-run after editing a gate in a memory file.\n' : '\n'));
   }
 }
 

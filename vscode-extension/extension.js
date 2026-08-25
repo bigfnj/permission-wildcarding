@@ -20,7 +20,7 @@ const {
   createPolicyLock, POLICY_LOCK_CODE, POLICY_LOCK_PATH, POLICY_LOCK_BUSY_MESSAGE,
 } = require('./src/policy-lock');
 const {
-  CODEX_CONFIG, applyCodexMax, isCodexMaxOn, readApproval, sandboxMode,
+  CODEX_CONFIG, CODEX_BUNDLE_CACHE, applyCodexMax, isCodexMaxOn, readApproval, sandboxMode,
   readEnterpriseBundle, targetApproval, enterpriseDecisionFor,
 } = require('./src/codex-max');
 const {
@@ -30,6 +30,7 @@ const { extractInvocations, candidateKey } = require('./src/auto-learn');
 const { recallIndexCount, recallIndexStatus } = require('./src/recall-index');
 const { drainLocalSettings, localSettingsPath, LOCAL_RELATIVE } = require('./src/local-settings');
 const { guidanceStatusAll, setGuidanceAll } = require('./src/agent-guidance');
+const { gatesStatusAll, setGatesAll, readCompiled, compiledPath } = require('./src/agent-gates');
 const {
   applicationSummary, candidatePendingTargets, claudeDecisionExplanation,
   claudePermissionDecision, codexCheckVariants, codexExecpolicyArgs, codexRestartSuffix,
@@ -57,6 +58,7 @@ let dashboard = null;        // WildcardingViewProvider instance
 let lastRun = null;          // timestamp of the last write we made
 let statusBar = null;        // persistent status-bar indicator while MAX/bypass is on
 let memBounce = null;        // debounce for MEMORY.md-driven dashboard refreshes
+let gatesBounce = null;      // debounce for corpus-driven gate recompiles
 let recallRebuildAt = 0;     // timestamp of the last auto-rebuild (cooldown gate)
 let autoLearnBounce = null;  // debounce for Claude/Codex transcript writes
 let autoLearnTimer = null;   // periodic reconciliation timer
@@ -406,7 +408,7 @@ function recallModelCandidates() {
     script ? path.join(path.dirname(script), 'models') : '',
     path.join(__dirname, 'memory', 'models'),
     path.join(__dirname, '..', 'memory', 'models'),
-    'D:\\.claude\\projects\\desktopPet\\src\\Models',
+    'D:\\.ai-work\\projects\\desktopPet\\src\\Models',
   ].filter(Boolean);
 }
 
@@ -1426,6 +1428,35 @@ function activate(context) {
     context.subscriptions.push(codexWatcher);
   } catch { /* never block activation */ }
 
+  // The org's signed requirements bundle, which decides whether Codex MAX is legal at all.
+  // Codex owns this file and refetches it on its own schedule, so the card would otherwise
+  // keep reporting "org policy caps approval" from a stale cache long after an account or
+  // policy change made `never` legal — right up until something unrelated forced a render.
+  try {
+    const bundleWatcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(
+        vscode.Uri.file(path.dirname(CODEX_BUNDLE_CACHE)), path.basename(CODEX_BUNDLE_CACHE))
+    );
+    bundleWatcher.onDidChange(() => { updateStatusBar(); dashboard?.refresh(); });
+    bundleWatcher.onDidCreate(() => { updateStatusBar(); dashboard?.refresh(); });
+    bundleWatcher.onDidDelete(() => { updateStatusBar(); dashboard?.refresh(); });
+    context.subscriptions.push(bundleWatcher);
+  } catch { /* never block activation */ }
+
+  // The compiled gates file. Whoever recompiles (the CLI, or the SessionStart hook) only
+  // writes this file; watching it is what turns a corpus edit into an installed block
+  // without waiting for the next activation. ensureGates is a no-op when already current.
+  try {
+    const gatesFile = compiledPath();
+    const gatesWatcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(vscode.Uri.file(path.dirname(gatesFile)), path.basename(gatesFile))
+    );
+    gatesWatcher.onDidChange(() => ensureGates());
+    gatesWatcher.onDidCreate(() => ensureGates());
+    gatesWatcher.onDidDelete(() => dashboard?.refresh());
+    context.subscriptions.push(gatesWatcher);
+  } catch { /* never block activation */ }
+
   // Sidebar dashboard (Activity Bar → webview).
   dashboard = new WildcardingViewProvider(context);
   context.subscriptions.push(
@@ -1468,7 +1499,8 @@ function activate(context) {
   // the un-generalizable approvals being created in the first place.
   context.subscriptions.push(
     vscode.commands.registerCommand('permission-wildcarding.drainLocal', () => drainLocal(true)),
-    vscode.commands.registerCommand('permission-wildcarding.toggleGuidance', () => toggleGuidance())
+    vscode.commands.registerCommand('permission-wildcarding.toggleGuidance', () => toggleGuidance()),
+    vscode.commands.registerCommand('permission-wildcarding.toggleGates', () => toggleGates())
   );
   try {
     registerLocalWatchers(context);
@@ -1489,6 +1521,9 @@ function activate(context) {
   // anything when the state is already right.
   drainLocal();
   ensureGuidance();
+  // Gates too. Install-only: this never spawns python, so a corpus edit reaches the block
+  // through the compiled file that the CLI or the SessionStart hook last wrote.
+  ensureGates();
   startAutoLearn(context);
   // Sync the recall index on startup when the model is present and the cache is behind
   // the corpus. Deferred 10 s so the extension host settles first.
@@ -1520,6 +1555,44 @@ function activate(context) {
     }
   } catch (err) {
     console.error('permission-wildcarding: memory-card watcher failed —', err);
+  }
+
+  // Recompile the gates when the corpus that produced them changes.
+  //
+  // A SessionStart hook would be the obvious home for this and it does not work under a
+  // managed policy. Enforcement of `allowManagedHooksOnly` is PER EVENT: a user hook runs
+  // only on an event the managed policy itself defines. Measured on a box whose policy
+  // defines PostToolUse and nothing else — a user PostToolUse canary fired 4 times out of 4,
+  // while a real session start and a /clear both left the compiled file untouched.
+  //
+  // A memory file changing is the better trigger regardless. It is the actual cause, it
+  // fires once per edit instead of once per session, and the extension is not a hook, so no
+  // policy can switch it off. Gated on the block already being installed, so this never
+  // spawns python for anyone who has not opted in.
+  try {
+    for (const dir of discoverDirs({ enabled: true, dir: '', lineBudget: 300, totalBudget: 12000 })) {
+      const w = vscode.workspace.createFileSystemWatcher(
+        new vscode.RelativePattern(vscode.Uri.file(dir), '*.md')
+      );
+      const bump = (uri) => {
+        // The index carries hooks, never gate blocks, and it changes far more often.
+        if (uri && path.basename(uri.fsPath) === 'MEMORY.md') return;
+        if (!gatesEnabled()) return;
+        try {
+          if (!gatesStatusAll().some((state) => state.on)) return;
+        } catch { return; }
+        clearTimeout(gatesBounce);
+        // Long debounce on purpose: editing a memory tends to save several times, and each
+        // compile is a python spawn.
+        gatesBounce = setTimeout(() => {
+          compileGates({ quiet: true }).then((ok) => { if (ok) ensureGates(); });
+        }, 2000);
+      };
+      w.onDidChange(bump); w.onDidCreate(bump); w.onDidDelete(bump);
+      context.subscriptions.push(w);
+    }
+  } catch (err) {
+    console.error('permission-wildcarding: gates corpus watcher failed —', err);
   }
 }
 
@@ -1951,30 +2024,53 @@ function ensureGuidance(announce = false) {
   }
 }
 
-function toggleGuidance() {
+async function toggleGuidance() {
   const config = vscode.workspace.getConfiguration('permissionWildcarding');
   const states = guidanceStatusAll();
-  // Off only when it is currently on everywhere it can be: a half-installed state
-  // (a new agent appeared, or one file was hand-edited) should complete, not undo.
-  const next = !(states.length && states.every((state) => state.on));
+  // Off only when it is on everywhere it can be AND already the shipped wording. A
+  // half-installed or stale state (a new agent appeared, a file was hand-edited, or a
+  // release changed the text) should complete or refresh, not undo — which also means the
+  // dashboard finally has a refresh path instead of only remove.
+  const next = !(states.length && states.every((state) => state.on && state.current));
+
+  // Removal is the only direction that costs something: every compound command starts
+  // prompting again. The control lives on a dashboard people open just to read status, so
+  // a modal makes a stray click harmless. Adding needs no confirmation, being the
+  // recoverable direction.
+  if (!next) {
+    const files = states.map((state) => state.path.replace(os.homedir(), '~')).join(', ');
+    const choice = await vscode.window.showWarningMessage(
+      'Remove shell-style guidance?',
+      {
+        modal: true,
+        detail: `Deletes the managed block from ${files}. Approvals stop generalizing, so `
+          + 'compound commands prompt again on every variation. Your own text is left '
+          + 'untouched and a backup is written first, and you can re-add it any time.',
+      },
+      'Remove');
+    if (choice !== 'Remove') return;
+  }
+
   // Persist the intent as well as the file, or the next activation would undo it.
-  config.update('guidance.enabled', next, vscode.ConfigurationTarget.Global).then(
-    () => {
-      const results = setGuidanceAll(next);
-      const failed = results.filter((result) => result.error);
-      if (failed.length) {
-        vscode.window.showErrorMessage(
-          `permission-wildcarding: ${failed.map((result) => `${result.agent}: ${result.error}`).join('; ')}`);
-      } else {
-        vscode.window.showInformationMessage(
-          `permission-wildcarding: shell-style guidance ${next ? 'ON' : 'OFF'} — ` +
-          results.map((result) => result.path.replace(os.homedir(), '~')).join(', ') +
-          (next ? ' (applies from each agent’s next session)' : ''));
-      }
-      dashboard?.refresh();
-    },
-    (err) => vscode.window.showErrorMessage(`permission-wildcarding: ${err.message}`)
-  );
+  try {
+    await config.update('guidance.enabled', next, vscode.ConfigurationTarget.Global);
+  } catch (err) {
+    vscode.window.showErrorMessage(`permission-wildcarding: ${err.message}`);
+    return;
+  }
+
+  const results = setGuidanceAll(next);
+  const failed = results.filter((result) => result.error);
+  if (failed.length) {
+    vscode.window.showErrorMessage(
+      `permission-wildcarding: ${failed.map((result) => `${result.agent}: ${result.error}`).join('; ')}`);
+  } else {
+    vscode.window.showInformationMessage(
+      `permission-wildcarding: shell-style guidance ${next ? 'ON' : 'OFF'} — ` +
+      results.map((result) => result.path.replace(os.homedir(), '~')).join(', ') +
+      (next ? ' (applies from each agent’s next session)' : ''));
+  }
+  dashboard?.refresh();
 }
 
 function guidanceCardData() {
@@ -1986,6 +2082,187 @@ function guidanceCardData() {
       partial: states.some((state) => state.on) && !states.every((state) => state.on),
       current: states.every((state) => !state.on || state.current),
       readable: states.some((state) => state.readable),
+      agents: states.filter((state) => state.on).map((state) => state.agent),
+      targets: states.map((state) => state.agent),
+      path: states.map((state) => state.path.replace(os.homedir(), '~')).join(', '),
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ── memory gates ────────────────────────────────────────────────────────────────
+// The guidance block above carries wording that ships in this repo. This one carries the
+// user's own standing orders: `recall.py --gates-compile` lifts the `<!-- gate -->` section
+// out of every memory marked `scope: global` and writes them to ~/.claude/gates.generated.md,
+// which this block installs verbatim.
+//
+// Why a resident block rather than leaving them in the memory index: the index is a list of
+// one-line hooks, so the enforceable half of a rule sits in a file that only loads if a
+// recall happens to surface it. That works for reference material and fails for standing
+// orders, because you cannot recall a rule you are already breaking — nothing triggers the
+// lookup. Policy has to be resident; facts do not.
+//
+// Installing is a file read, so it runs on activation. COMPILING spawns python, so it stays
+// an explicit action the card offers when there is nothing compiled yet.
+
+function gatesEnabled() {
+  return vscode.workspace.getConfiguration('permissionWildcarding').get('gates.enabled', true);
+}
+
+// How many gates the compiled file holds. Counts the bullets the compiler emits rather than
+// parsing it, so a hand-mangled file reads as 0 instead of throwing.
+function compiledGateCount() {
+  try {
+    const text = readCompiled();
+    return text ? (text.match(/^- \*\*/gm) || []).length : 0;
+  } catch {
+    return 0;
+  }
+}
+
+// Compiling needs python but NOT the embedding model: --gates-compile only reads frontmatter
+// and lifts marker-fenced text, so the model precondition that gates a recall rebuild does
+// not apply. Resolves false when it could not run, having already told the user why.
+// `quiet` is for the corpus watcher below: a background recompile that fails must not throw
+// a modal at someone who was only editing a note, so it reports to the console instead.
+function compileGates({ quiet = false } = {}) {
+  const warn = (msg, action) => {
+    if (quiet) { console.error('permission-wildcarding: ' + msg); return; }
+    if (action) {
+      vscode.window.showWarningMessage('permission-wildcarding: ' + msg, action)
+        .then((c) => { if (c === action) setRecallPath(); });
+    } else {
+      vscode.window.showWarningMessage('permission-wildcarding: ' + msg);
+    }
+  };
+  const script = recallScriptPath();
+  if (!script) {
+    warn('recall.py not found, so gates cannot be compiled.', 'Set recall.py path…');
+    return Promise.resolve(false);
+  }
+  const st = recallStatus();
+  if (!st.venv) {
+    warn(`DevToolbox venv python not found at ${st.py} — cannot compile gates.`);
+    return Promise.resolve(false);
+  }
+  const { dir } = memoryReport();
+  return new Promise((resolve) => {
+    const env = { ...process.env, RECALL_REEXEC: '1', ...(dir ? { RECALL_MEMORY_DIR: dir } : {}) };
+    execFile(st.py, [script, '--gates-compile'], { env, timeout: 60000 }, (err, _out, stderr) => {
+      if (err) {
+        const detail = (stderr || err.message || '').trim().slice(0, 300);
+        if (quiet) console.error('permission-wildcarding: gate compile failed —', detail);
+        else vscode.window.showErrorMessage(`permission-wildcarding: gate compile failed — ${detail}`);
+        resolve(false);
+        return;
+      }
+      resolve(true);
+    });
+  });
+}
+
+// Keep the instruction files in step with the setting on activation, and refresh a block
+// whose corpus has changed. Silent when already correct, because this runs on every
+// activation and must not rewrite the user's instruction file for nothing.
+function ensureGates(announce = false) {
+  try {
+    const want = gatesEnabled();
+    const states = gatesStatusAll().filter((state) => state.readable);
+    if (!states.length) return;
+    // Never install without a compile. setGatesAll refuses anyway, and reporting success
+    // here would leave the card claiming ON while enforcing nothing.
+    if (want && !states.some((state) => state.compiled)) return;
+    if (states.every((state) => state.on === want && (!want || state.current))) return;
+    const changed = setGatesAll(want).filter((result) => result.changed);
+    if (!changed.length) return;
+    if (announce || want) {
+      vscode.window.setStatusBarMessage(
+        `$(law) permission-wildcarding: memory gates ${want ? 'added to' : 'removed from'} ` +
+        changed.map((result) => result.agent).join(' + '),
+        6000);
+    }
+    dashboard?.refresh();
+  } catch (err) {
+    console.error('permission-wildcarding: gates write failed —', err);
+  }
+}
+
+async function toggleGates() {
+  const config = vscode.workspace.getConfiguration('permissionWildcarding');
+  let states = gatesStatusAll();
+  // Same rule as guidance: a stale or half-installed state should refresh or complete
+  // rather than undo, so `off` only happens from a fully installed, current block.
+  const next = !(states.length && states.every((state) => state.on && state.current));
+
+  if (next && !states.some((state) => state.compiled)) {
+    const choice = await vscode.window.showWarningMessage(
+      'No gates compiled yet.',
+      {
+        modal: true,
+        detail: 'Memory gates are built from your own memory files: each one marked '
+          + '`scope: global` with a <!-- gate --> block holding its resident lines. Compile '
+          + 'them first and the managed block gets installed from the result.',
+      },
+      'Compile now');
+    if (choice !== 'Compile now') return;
+    if (!await compileGates()) return;
+    states = gatesStatusAll();
+    if (!states.some((state) => state.compiled)) {
+      vscode.window.showWarningMessage(
+        'permission-wildcarding: nothing to install — no memory carries a <!-- gate --> block '
+        + 'with `scope: global`.');
+      dashboard?.refresh();
+      return;
+    }
+  }
+
+  if (!next) {
+    const files = states.map((state) => state.path.replace(os.homedir(), '~')).join(', ');
+    const choice = await vscode.window.showWarningMessage(
+      'Remove memory gates?',
+      {
+        modal: true,
+        detail: `Deletes the managed block from ${files}. Your standing orders stop being `
+          + 'loaded every session, so they apply only when a recall happens to surface them. '
+          + 'The memory files themselves are untouched and a backup is written first.',
+      },
+      'Remove');
+    if (choice !== 'Remove') return;
+  }
+
+  try {
+    await config.update('gates.enabled', next, vscode.ConfigurationTarget.Global);
+  } catch (err) {
+    vscode.window.showErrorMessage(`permission-wildcarding: ${err.message}`);
+    return;
+  }
+
+  const results = setGatesAll(next);
+  const failed = results.filter((result) => result.error);
+  if (failed.length) {
+    vscode.window.showErrorMessage(
+      `permission-wildcarding: ${failed.map((result) => `${result.agent}: ${result.error}`).join('; ')}`);
+  } else {
+    vscode.window.showInformationMessage(
+      `permission-wildcarding: memory gates ${next ? 'ON' : 'OFF'} — ` +
+      results.map((result) => result.path.replace(os.homedir(), '~')).join(', ') +
+      (next ? ' (applies from each agent’s next session)' : ''));
+  }
+  dashboard?.refresh();
+}
+
+function gatesCardData() {
+  try {
+    const states = gatesStatusAll();
+    if (!states.length) return null;
+    return {
+      on: states.every((state) => state.on),
+      partial: states.some((state) => state.on) && !states.every((state) => state.on),
+      current: states.every((state) => !state.on || state.current),
+      readable: states.some((state) => state.readable),
+      compiled: states.some((state) => state.compiled),
+      count: compiledGateCount(),
       agents: states.filter((state) => state.on).map((state) => state.agent),
       targets: states.map((state) => state.agent),
       path: states.map((state) => state.path.replace(os.homedir(), '~')).join(', '),
@@ -2025,6 +2302,7 @@ class WildcardingViewProvider {
         case 'lintMemory':   vscode.commands.executeCommand('permission-wildcarding.lintMemory'); break;
         case 'drainLocal':   vscode.commands.executeCommand('permission-wildcarding.drainLocal'); break;
         case 'toggleGuidance': vscode.commands.executeCommand('permission-wildcarding.toggleGuidance'); break;
+        case 'toggleGates': vscode.commands.executeCommand('permission-wildcarding.toggleGates'); break;
         case 'refresh':      this.refresh(); break;
         case 'remove':       this._remove(msg.value); break;
       }
@@ -2084,6 +2362,7 @@ class WildcardingViewProvider {
       memory: memoryCardData(),
       local: localCardData(),
       guidance: guidanceCardData(),
+      gates: gatesCardData(),
     });
   }
 
@@ -2141,6 +2420,16 @@ class WildcardingViewProvider {
           background: var(--vscode-button-secondaryBackground, transparent);
           color: var(--vscode-button-secondaryForeground, var(--vscode-foreground)); }
   button.bypass.on { background: var(--vscode-charts-red, #f85149); color: #fff; border-color: transparent; }
+  /* Guidance ON is the state you want, not a danger state, so it must not inherit the red
+     bypass look — red there says "you are exposed", which is backwards. Quiet it right
+     down: the remove action should not read as the card's primary call to action. */
+  button.bypass.managed, button.bypass.managed.on {
+    background: transparent; color: var(--vscode-descriptionForeground);
+    border-color: var(--vscode-panel-border); font-weight: 400;
+  }
+  button.bypass.managed:hover:not(:disabled) {
+    color: var(--vscode-foreground); border-color: var(--vscode-focusBorder);
+  }
   button.bypass:hover { background: var(--vscode-button-secondaryHoverBackground, var(--vscode-list-hoverBackground)); }
   button.bypass.on:hover { filter: brightness(1.1); }
   button.bypass:disabled { opacity: 0.5; cursor: not-allowed; }
@@ -2246,6 +2535,12 @@ class WildcardingViewProvider {
     <div class="status"><span id="gddot" class="dot idle"></span><span id="gdtext">Shell-style guidance</span></div>
     <div class="muted sub" id="gdsub"></div>
     <button class="bypass" id="guidanceBtn">Add to ~/.claude/CLAUDE.md</button>
+  </div>
+
+  <div class="card" id="gatesCard" style="display:none">
+    <div class="status"><span id="mgdot" class="dot idle"></span><span id="mgtext">Memory gates</span></div>
+    <div class="muted sub" id="mgsub"></div>
+    <button class="bypass" id="gatesBtn">Compile and add</button>
   </div>
 
   <div class="card" id="memCard" style="display:none">
@@ -2445,9 +2740,40 @@ class WildcardingViewProvider {
     const btn = $('guidanceBtn');
     btn.disabled = !g.readable;
     btn.classList.toggle('on', !!g.on);
+    // Installed-and-current is the resting state, so the button goes quiet and the ellipsis
+    // announces the confirm dialog. Stale wording gets the honest label instead, now that
+    // toggling a stale block refreshes it rather than tearing it out.
+    btn.classList.toggle('managed', !!g.on && !!g.current);
     btn.textContent = g.on
-      ? 'Remove from ' + g.targets.length + ' instruction file' + (g.targets.length !== 1 ? 's' : '')
+      ? (g.current ? 'Remove guidance…' : 'Refresh wording')
       : 'Add to ' + g.targets.join(' + ') + ' instructions';
+  }
+
+  function renderGates(g) {
+    const card = $('gatesCard');
+    if (!g) { card.style.display = 'none'; return; }
+    card.style.display = '';
+    $('mgdot').className = 'dot' + (g.on && g.current ? '' : ' idle');
+    const state = !g.compiled ? 'nothing compiled'
+      : g.on ? (g.current ? 'ON' : 'ON (corpus changed)')
+        : (g.partial ? 'PARTIAL' : 'OFF');
+    $('mgtext').textContent = 'Memory gates: ' + state
+      + (g.on && g.count ? ' — ' + g.count + ' gate' + (g.count === 1 ? '' : 's') : '');
+    $('mgtext').style.fontWeight = '600';
+    $('mgsub').textContent = !g.compiled
+      ? 'no memory carries a scope:global gate block yet'
+      : g.on || g.partial
+        ? 'your standing orders, resident every session · ' + g.path
+        : g.count + ' compiled gate' + (g.count === 1 ? '' : 's') + ' waiting to be installed';
+    const btn = $('gatesBtn');
+    btn.disabled = !g.readable;
+    btn.classList.toggle('on', !!g.on);
+    // Same treatment as guidance: installed-and-current is the resting state, so the button
+    // stops shouting and the ellipsis warns that a confirm follows.
+    btn.classList.toggle('managed', !!g.on && !!g.current);
+    btn.textContent = !g.compiled ? 'Compile gates'
+      : g.on ? (g.current ? 'Remove gates…' : 'Refresh from memory')
+        : 'Add to ' + g.targets.join(' + ') + ' instructions';
   }
 
   function render(d) {
@@ -2459,6 +2785,7 @@ class WildcardingViewProvider {
     renderAutoLearn(d.autoLearn);
     renderLocal(d.local);
     renderGuidance(d.guidance);
+    renderGates(d.gates);
     renderMemory(d.memory);
     $('lastRun').textContent = timeAgo(d.lastRun);
     $('backup').textContent = d.backupCount
@@ -2508,6 +2835,7 @@ class WildcardingViewProvider {
   $('codexMaxBtn').addEventListener('click', () => vscode.postMessage({ type: 'toggleCodexMax' }));
   $('drainLocal').addEventListener('click', () => vscode.postMessage({ type: 'drainLocal' }));
   $('guidanceBtn').addEventListener('click', () => vscode.postMessage({ type: 'toggleGuidance' }));
+  $('gatesBtn').addEventListener('click', () => vscode.postMessage({ type: 'toggleGates' }));
   window.addEventListener('message', (e) => { if (e.data?.type === 'data') render(e.data); });
   applyCollapsed();
   vscode.postMessage({ type: 'refresh' });

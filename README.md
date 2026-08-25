@@ -21,7 +21,8 @@ subcommand. The safety boundary for the legacy hook is still your
 
 - **`bin/wildcard-perms`** — the hook executable and CLI (Node); also supports
   `--learn scan|status|apply|undo`, `--seed`, `--drain [--dry-run]` (project-local
-  approvals), `--guidance on|off|status` (agent shell style), `--max on|off|status`
+  approvals), `--guidance on|off|status` (agent shell style),
+  `--gates on|off|status|refresh` (memory gates), `--max on|off|status`
   (MAX mode), and `--bypass on|off|status` (see below).
 - **`src/permissions.js`** — the live Claude allow-list generalization logic, a
   legacy syntax-only mining helper, and the MAX-mode and bypass toggles.
@@ -39,7 +40,11 @@ subcommand. The safety boundary for the legacy hook is still your
 - **`src/agent-guidance.js`** — the marker-fenced shell-style block written into each
   installed agent's user-scope instruction file (`~/.claude/CLAUDE.md`, and
   `~/.codex/AGENTS.md` when Codex is present), the only way to fix the approvals no
-  generalizer can ever match twice (see below).
+  generalizer can ever match twice (see below). `createManagedBlock` is the marker-fenced
+  primitive both blocks are built from.
+- **`src/agent-gates.js`** — the second managed block: your own standing orders, compiled
+  out of your Claude Code file memory by `recall.py --gates-compile`. Separate markers and
+  a separate switch, so neither block can turn the other off (see below).
 - **`memory/recall.py`** / **`src/recall-index.js`** — the CPU semantic-recall script
   (bge-small ONNX), which the VSIX bundles, and the shared staleness predicate the
   extension uses to decide whether re-embedding is needed at all.
@@ -225,6 +230,86 @@ bin/wildcard-perms --guidance status
 bin/wildcard-perms --guidance on
 bin/wildcard-perms --guidance off
 ```
+
+## Memory gates: your standing orders, made resident
+
+The block above carries wording that ships in this repo. This one carries **yours**.
+
+Claude Code's file memory has two different things in it. **Reference material** ("which
+model crashes", "where that venv lives") only matters once you are already on the subject,
+so it is fine on demand. **Standing orders** ("never `git add -A` in a shared checkout",
+"0 em dashes in prose") are not, because *you cannot recall a rule you are already
+breaking* — nothing triggers the lookup. And `MEMORY.md` is a list of one-line hooks, so
+the enforceable half of a rule sits in a file that only loads if a recall happens to
+surface it.
+
+So mark the standing orders and compile them into the instruction file:
+
+```markdown
+---
+name: my_rule
+metadata:
+  type: feedback
+  scope: global          # global -> ~/.claude/CLAUDE.md; anything else -> that repo
+---
+
+<!-- gate -->
+- **Writing file content with escapes.** Use Write/Edit, never a heredoc. Verify with `cat -A`.
+<!-- /gate -->
+
+**Why:** the long version, for a human. Not compiled.
+```
+
+Selection is on `scope`, **not** `type`: a `reference` earns residency exactly when its
+failure is silent. The gate text lives in the memory file so the compiler needs no
+judgement at runtime — the compression happens once, when you write the memory.
+
+```bash
+python memory/recall.py --gates-compile   # -> ~/.claude/gates.generated.md, deterministic + hashed
+bin/wildcard-perms --gates status
+bin/wildcard-perms --gates on             # install into every installed agent's file
+bin/wildcard-perms --gates refresh        # compile then install; silent when unchanged
+bin/wildcard-perms --gates off
+```
+
+`--gates refresh` is built for a `SessionStart` hook, so an edited gate is live in the next
+session with nothing to remember:
+
+```json
+"SessionStart": [
+  { "hooks": [ { "type": "command",
+      "command": "node \"/abs/path/to/bin/wildcard-perms\" --gates refresh" } ] }
+]
+```
+
+It prints nothing when nothing changed, because a hook's stdout can be folded into session
+context. A compile failure is deliberately non-fatal: a hook that errors on every session
+start is worse than a slightly stale block, and `--gates status` still reports staleness.
+
+> **Under a managed policy the hook may never fire.** `allowManagedHooksOnly` is enforced
+> *per event*: a user hook runs only on an event the managed policy itself defines. On a box
+> whose policy defines only `PostToolUse`, a user `SessionStart` entry is dropped silently —
+> measured, with a real session start and a `/clear` both leaving the compiled file
+> untouched, while a `PostToolUse` canary fired 4 times out of 4. (`claude -p` runs no hooks
+> at all, so it cannot be used to test this.) **The extension does not depend on the hook:**
+> it watches the memory dir directly and recompiles on change, which is the better trigger
+> anyway and is not something a policy can switch off.
+
+Notes worth knowing:
+
+- **Separate markers** from the shell-style block, with independent switches, so
+  `--guidance off` cannot take your gates with it (and vice versa). Both are tested
+  byte-for-byte.
+- **Nothing compiled means nothing installed.** The installer refuses rather than fencing
+  off a heading with no rules under it and reporting success.
+- The extension **installs** on activation (a file read) and watches both the compiled file
+  and the memory dir itself, recompiling 2 s after a memory changes. That watcher only runs
+  once the block is installed, so it never spawns Python for someone who has not opted in.
+  A first compile stays an explicit action on the **Memory gates** card.
+- `recall.py --lint` reports what is still uncompiled: `scope: global` with no gate block,
+  `type: feedback` with no `scope:`, resident entry count, and demotion candidates.
+- Repo-scoped gates belong in that repo's **gitignored `CLAUDE.local.md`**, so a personal
+  judgement call stays out of shared history.
 
 ## Memory-index lint
 
@@ -538,6 +623,42 @@ untouched. `off` restores the file byte for byte, including removing the key ent
 never had one. A bare key is always written into the top-level table, never appended at
 end-of-file where it would land inside the last `[table]` and be silently ignored.
 
+## Design principle: watch the cause, don't hook the event
+
+This whole tool rests on one decision. **The automation lives in a VS Code extension, not in a
+Claude Code hook**, and that is what makes it survive a locked-down managed policy.
+
+A `SessionStart` or `PreToolUse` hook is the obvious way to make an agent do something
+automatically, and it is exactly what an org policy can take away. `allowManagedHooksOnly` is
+enforced **per event**: a user hook runs only on an event the managed policy itself defines. On
+a machine whose policy defines only `PostToolUse`, a user `SessionStart` hook is dropped
+silently. The entry sits in `settings.json` and never fires. Measured, not assumed: a
+`PostToolUse` canary fired on 4 of 4 tool calls, while a real session start and a `/clear` both
+left the hook's output untouched. (`claude -p` runs no hooks at all, so it cannot even be used
+to test the question.)
+
+The extension is not a hook, so no policy toggle can reach it. That reframes the whole build:
+
+- **Trigger on the cause, not the ceremony.** The thing you actually care about is a file
+  changing, so watch that file. Memory gates recompile when a memory in the corpus changes,
+  which is better than a session hook on the merits: it is the real cause, it fires once per
+  edit instead of once per session, and it needs no session to have started. The `MAX` restore
+  watches "approvals stopped being granted" rather than any single policy file, for the same
+  reason (see below).
+- **Keep a CLI that does the work, and let both the watcher and a hook call it.** `wildcard-perms
+  --gates refresh` is one command. The extension's watcher calls it; a `SessionStart` hook calls
+  the same command where policy permits one. The behavior does not depend on which fired.
+- **Write to instruction files, not to the agent's live state.** A managed policy can stop a hook
+  from running but cannot stop the agent from reading `~/.claude/CLAUDE.md`. Anything that must be
+  resident every session goes there as a marker-fenced block, which is also how the agent-guidance
+  and memory-gates blocks work.
+- **Everything ships as pure Node or a bundled CPU script**, with no dependency on a hook being
+  allowed to fire, so the same VSIX behaves identically on an unrestricted box and a locked one.
+
+The rule of thumb: if a behavior would normally hang off a hook, ask what filesystem change that
+hook was really reacting to, and watch that instead. A hook is a convenience the environment can
+revoke; a file is not.
+
 ## When managed policy lands
 
 **Org policy does not necessarily arrive as a file.** A console-managed organization
@@ -586,8 +707,17 @@ Cutting a GitHub Release builds and attaches the `.vsix` automatically via
 taken from the release tag, so you don't hand-edit `package.json`:
 
 ```bash
-gh release create v1.2.0 --generate-notes
-# -> workflow packages permission-wildcarding-1.2.0.vsix and attaches it to the release
+gh release create v1.2.1 --generate-notes
+# -> workflow packages permission-wildcarding-1.2.1.vsix and attaches it to the release
+```
+
+Before tagging, run the acceptance suite. It is read-only apart from the Node tests and
+proves the two managed blocks, the CLI, the recall index, and the extension's corpus watcher
+all still behave — including that a memory edit triggers a recompile with the extension
+active in VS Code:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\verify-release.ps1
 ```
 
 ## Note

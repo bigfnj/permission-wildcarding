@@ -2,7 +2,7 @@
   "name": "permission-wildcarding",
   "displayName": "Permission Wildcarding",
   "description": "Reduces Claude Code and Codex approval friction. Generalizes approved permissions into command-family wildcards on change, learns from Claude Code and Codex history (Auto Learn), recommends deterministic safe policy, writes separate Claude and validated Codex outputs, drains project-local approvals into user scope, installs a wildcardable shell style for the agent, and includes memory-index diagnostics and MAX/bypass controls.",
-  "version": "1.1.0",
+  "version": "1.2.1",
   "publisher": "local",
   "license": "MIT",
   "repository": {
@@ -100,6 +100,11 @@
         "command": "permission-wildcarding.toggleGuidance",
         "title": "Permission Wildcarding: Toggle shell-style guidance in ~/.claude/CLAUDE.md",
         "icon": "$(book)"
+      },
+      {
+        "command": "permission-wildcarding.toggleGates",
+        "title": "Permission Wildcarding: Toggle memory gates in ~/.claude/CLAUDE.md",
+        "icon": "$(law)"
       },
       {
         "command": "permission-wildcarding.lintMemory",
@@ -209,6 +214,11 @@
           "type": "boolean",
           "default": true,
           "markdownDescription": "Maintain a short managed block in each installed agent’s user-scope instruction file (`~/.claude/CLAUDE.md`, and `~/.codex/AGENTS.md` when Codex is installed) telling the agent to write one command per tool call. An approval is stored as the command *string*: a single command becomes a reusable wildcard, while a compound command (`cd x && build`, multi-statement PowerShell) is stored verbatim and never matches again — the friction no generalizer can fix after the fact. Codex needs it for a different reason: its policy is an argv prefix for the program actually executed, so a `bash -lc` wrapper around `cd x && build` is a `bash` invocation that no rule for the real tool can match. Marker-fenced, so turning it off removes exactly what was added."
+        },
+        "permissionWildcarding.gates.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Maintain a second managed block holding your own **standing orders**, compiled out of your Claude Code file-memory. `recall.py --gates-compile` lifts the `<!-- gate -->` section from every memory marked `scope: global` into `~/.claude/gates.generated.md`, and this installs it into each agent's instruction file. Why it needs to be resident: the memory index is a list of one-line hooks, so the enforceable half of a rule sits in a file that only loads if a recall surfaces it — which never happens for a rule you are already breaking, because nothing triggers the lookup. Reference material is fine on demand; policy is not. Installing is a file read and runs on activation; compiling spawns python and stays an explicit action. Marker-fenced separately from the shell-style block, so turning either off leaves the other byte-identical."
         },
         "permissionWildcarding.memory.enabled": {
           "type": "boolean",
