@@ -24,7 +24,7 @@ Config via env:
                                              holding the most memory files)
     RECALL_MODEL_DIR    bge-small.onnx dir   (default ./models, then desktopPet's copy)
 """
-import os, sys, re, json, argparse, unicodedata
+import os, sys, re, json, argparse, hashlib, unicodedata
 
 # --- runtime shim: onnxruntime + numpy live in the DevToolbox venv, not system python.
 # Re-run under the venv python via subprocess (NOT os.execv -- Windows detaches the
@@ -82,6 +82,13 @@ EXCLUDE = {"MEMORY.md"}        # the index is just hooks; skip it as a search ta
 EMBED_ID = "bge-small-onnx"    # cache identity; bump to force a full re-embed
 LINT_LINE_WARN = 300           # chars; a dense one-line hook ceiling -- over this is drifting to changelog
 LINT_TOTAL_WARN = 12000        # bytes; whole always-loaded index getting heavy
+LINT_ENTRY_WARN = 16           # resident entries. Attention dilutes per-entry, not per-byte: 3k
+                               # tokens costs nothing, 50 entries competing for relevance does.
+                               # Set from the real floor after the 2026-08-24 diet (52 -> 11:
+                               # 7 recall triggers + 4 entries nothing else can trigger), with
+                               # headroom for a few triggers. 0 would mean report-only.
+GATE_BEGIN = "<!-- gate -->"   # a scope:global memory's resident lines, lifted verbatim into
+GATE_END = "<!-- /gate -->"    # the managed CLAUDE.md block so the compiler needs no judgement
 UNK, CLS, SEP = "[UNK]", "[CLS]", "[SEP]"
 
 
@@ -253,6 +260,14 @@ def _norm(s):
     return s.strip().lower().replace("-", "_")
 
 
+def _fm(text, key):
+    """One frontmatter scalar. Shapes vary across the corpus -- some files nest under
+    `metadata:`, older ones are flat -- so match the key at any indent instead of parsing
+    YAML. `^\\s*type:` cannot collide with `node_type:`: only whitespace may precede it."""
+    m = re.search(rf'^\s*{key}:\s*(.+)$', text[:400], re.MULTILINE)
+    return m.group(1).strip().strip('"').strip("'") if m else ""
+
+
 def _strip_code(text):
     """Blank out fenced + inline code spans so example [[links]] written inside
     backticks (e.g. `[[...]]`) aren't counted as real wiki-links."""
@@ -265,7 +280,11 @@ def _strip_code(text):
 
 def lint():
     """Audit the always-loaded index for bloat and broken links. No model needed."""
-    mem = open(os.path.join(MEMORY_DIR, "MEMORY.md"), encoding="utf-8", errors="replace").read()
+    index = os.path.join(MEMORY_DIR, "MEMORY.md")
+    if not os.path.exists(index):
+        print(f"\n  no MEMORY.md at {index} -- nothing to lint\n")
+        return
+    mem = open(index, encoding="utf-8", errors="replace").read()
     total = len(mem.encode("utf-8"))
     print(f'\n  MEMORY.md: {total} bytes (~{total // 4} tokens loaded every session), '
           f'target < {LINT_TOTAL_WARN}')
@@ -273,16 +292,25 @@ def lint():
         print(f"  ! index is {total - LINT_TOTAL_WARN} bytes over budget")
     print()
 
-    valid, stems, mem_norm = set(), [], _norm(mem)
+    valid, stems, meta, texts = set(), [], {}, {}
     for name in os.listdir(MEMORY_DIR):
         if not name.endswith(".md"):
             continue
         stem = name[:-3]
         stems.append(stem)
-        head = open(os.path.join(MEMORY_DIR, name), encoding="utf-8", errors="replace").read()[:400]
-        m = re.search(r'^\s*name:\s*(.+)$', head, re.MULTILINE)
-        slug = m.group(1).strip().strip('"').strip("'") if m else stem
-        valid.add(_norm(stem)); valid.add(_norm(slug))
+        text = open(os.path.join(MEMORY_DIR, name), encoding="utf-8", errors="replace").read()
+        texts[stem] = text
+        valid.add(_norm(stem)); valid.add(_norm(_fm(text, "name") or stem))
+        # Frontmatter reads stay capped at the head, but a gate block can sit anywhere in
+        # the body, so that one looks at the whole file.
+        meta[stem] = (_fm(text, "type"), _fm(text, "scope"), GATE_BEGIN in text)
+
+    entries = [ln for ln in mem.splitlines() if ln.startswith("- ")]
+    print(f"  {len(entries)} resident index entries" +
+          (f", target < {LINT_ENTRY_WARN}" if LINT_ENTRY_WARN else " (no ceiling set yet)"))
+    if LINT_ENTRY_WARN and len(entries) > LINT_ENTRY_WARN:
+        print(f"  ! {len(entries) - LINT_ENTRY_WARN} entries over the attention ceiling")
+    print()
 
     over = [(len(ln), i, ln) for i, ln in enumerate(mem.splitlines(), 1)
             if ln.startswith("- ") and len(ln) > LINT_LINE_WARN]
@@ -301,9 +329,45 @@ def lint():
             print(f"    {t}")
         print()
 
-    alltext = mem + "".join(open(os.path.join(MEMORY_DIR, s + ".md"), encoding="utf-8",
-                                 errors="replace").read() for s in stems)
-    unresolved = sorted({l for l in re.findall(r'\[\[([^\]]+)\]\]', _strip_code(alltext))
+    # Standing orders have to be resident: a gate you must remember to go look up never
+    # fires, because nothing triggers the lookup. These two checks are what the gate
+    # compiler needs before it can run unattended -- `scope:` says which instruction file a
+    # rule belongs in, the gate block says which of its lines to lift out.
+    feedback = sorted(s for s in stems if meta[s][0] == "feedback")
+    no_scope = [s for s in feedback if not meta[s][1]]
+    if no_scope:
+        print("  type: feedback with no `scope:` -- compiler cannot place these:")
+        for s in no_scope:
+            print(f"    {s}")
+        print()
+
+    no_gate = [s for s in stems if meta[s][1] == "global" and not meta[s][2]]
+    if no_gate:
+        print(f"  scope: global with no {GATE_BEGIN} block -- resident-eligible, not compiled:")
+        for s in no_gate:
+            print(f"    {s}")
+        print()
+
+    # Reference material wearing a standing order's clothes. These only matter once you are
+    # already on the subject, so they belong behind a recall query. Reported and never
+    # acted on: demoting a memory with no trigger pointing at it makes it invisible rather
+    # than merely quiet, and invisible is the one failure you cannot see happening.
+    demote = []
+    for ln in entries:
+        m = re.search(r'\]\(([^)#]+)\.md', ln)
+        if m and meta.get(m.group(1), ("",))[0] in ("project", "reference"):
+            demote.append((meta[m.group(1)][0], m.group(1), len(ln) + 1))
+    if demote:
+        print(f"  {len(demote)} demotion candidate(s), ~{sum(n for _, _, n in demote)} bytes "
+              f"-- lookup-on-demand, not standing orders:")
+        for t, stem, n in sorted(demote, key=lambda r: -r[2])[:8]:
+            print(f"    {n:4d} ch  {t:9s} {stem}")
+        if len(demote) > 8:
+            print(f"    ... and {len(demote) - 8} more")
+        print()
+
+    unresolved = sorted({l for l in re.findall(r'\[\[([^\]]+)\]\]',
+                                               _strip_code(mem + "".join(texts.values())))
                          if _norm(l) not in valid})
     if unresolved:
         print("  unresolved [[links]] (typo, or a forward-link not written yet):")
@@ -311,8 +375,66 @@ def lint():
             print(f"    [[{l}]]")
         print()
 
-    if not (over or broken):
-        print("  clean: every index line within budget, all index links resolve.\n")
+    if not (over or broken or no_scope or no_gate or demote):
+        print("  clean: index within budget, links resolve, every standing order compiled.\n")
+
+
+GATES_OUT = os.path.expanduser(r"~/.claude/gates.generated.md")
+
+
+def compile_gates():
+    """Lift every scope:global gate block into one block for the installer to drop into
+    CLAUDE.md. No judgement happens here -- the compression happened when the memory was
+    written, which is exactly what lets this run unattended. Sorted by filename and hashed
+    so a re-run is byte-identical and the installer can skip an unchanged rewrite; that
+    hash is what replaces the string-compare the static guidance block gets for free."""
+    # A missing memory dir is a normal state (a fresh machine, a mocked HOME), not a crash.
+    # This runs from a SessionStart hook, where an unhandled traceback would land in the
+    # agent's face on every single session start.
+    if not os.path.isdir(MEMORY_DIR):
+        print(f"\n  no memory dir at {MEMORY_DIR} -- nothing to compile\n")
+        return
+
+    blocks = []
+    for name in sorted(os.listdir(MEMORY_DIR)):
+        if not name.endswith(".md") or name in EXCLUDE:
+            continue
+        text = open(os.path.join(MEMORY_DIR, name), encoding="utf-8", errors="replace").read()
+        # Selected on scope, not type. Residency is a question of reach, and a `reference`
+        # can be every bit as resident-worthy as a `feedback` when its failure mode is
+        # silent -- a heredoc eating backslashes raises nothing, so no trigger ever fires
+        # and a lookup never happens. The gate block itself is the opt-in.
+        if _fm(text, "scope") != "global":
+            continue
+        m = re.search(re.escape(GATE_BEGIN) + r"(.*?)" + re.escape(GATE_END), text, re.DOTALL)
+        if m:
+            blocks.append((name, m.group(1).strip()))
+
+    body = "\n".join(b for _, b in blocks)
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
+    # No gates means write NOTHING, not a header over an empty body. The installer's
+    # "refuse to install an empty block" guard tests this file's content, and a file that
+    # always carried a header would sail straight past it and fence off a heading with no
+    # rules under it -- reporting gates ON while enforcing none.
+    out = ("" if not blocks else
+           f"<!-- generated by recall.py --gates-compile; sha {digest} -->\n"
+           f"## Standing gates ({len(blocks)} memories, managed)\n\n{body}\n")
+    # newline="\n" on purpose: a CRLF translation on Windows would change the bytes and
+    # make the hash useless as a "has anything actually changed" signal.
+    os.makedirs(os.path.dirname(GATES_OUT), exist_ok=True)
+    with open(GATES_OUT, "w", encoding="utf-8", newline="\n") as f:
+        f.write(out)
+
+    if not blocks:
+        print(f"\n  no scope:global gate blocks found -- wrote 0 bytes to {GATES_OUT}")
+        print("  (the installer will refuse rather than fence off an empty block)\n")
+        return
+
+    print(f"\n  compiled {len(blocks)} gate(s), {len(out)} bytes, sha {digest}")
+    print(f"  -> {GATES_OUT}\n")
+    for name, _ in blocks:
+        print(f"    {name}")
+    print()
 
 
 def selftest():
@@ -338,11 +460,15 @@ def main():
     ap.add_argument("--rebuild", action="store_true", help="force re-embed every file")
     ap.add_argument("--list", action="store_true", help="show what's indexed and exit")
     ap.add_argument("--lint", action="store_true", help="audit index bloat + links (no model)")
+    ap.add_argument("--gates-compile", action="store_true",
+                    help="lift scope:global gate blocks into ~/.claude/gates.generated.md")
     ap.add_argument("--selftest", action="store_true", help="verify the embedder's reference cosines")
     args = ap.parse_args()
 
     if args.lint:
         lint(); return
+    if args.gates_compile:
+        compile_gates(); return
     if args.selftest:
         selftest(); return
     if args.rebuild:

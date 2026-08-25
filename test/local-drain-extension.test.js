@@ -26,6 +26,9 @@ function harness(tempHome, { guidance = true, localDrain = true } = {}) {
   const commands = new Map();
   const messages = [];
   const warnings = [];
+  // Answers a test can queue for a modal confirm. An empty queue resolves undefined, which
+  // is a dismissal -- the right default, since that is what a stray click should amount to.
+  const warningAnswers = [];
   const vscode = {
     ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
     RelativePattern: class RelativePattern {
@@ -44,7 +47,10 @@ function harness(tempHome, { guidance = true, localDrain = true } = {}) {
       setStatusBarMessage() {},
       showErrorMessage() {},
       showInformationMessage(message) { messages.push(message); },
-      showWarningMessage(message) { warnings.push(message); return Promise.resolve(undefined); },
+      showWarningMessage(message) {
+        warnings.push(message);
+        return Promise.resolve(warningAnswers.length ? warningAnswers.shift() : undefined);
+      },
     },
     workspace: {
       isTrusted: true,
@@ -101,6 +107,7 @@ function harness(tempHome, { guidance = true, localDrain = true } = {}) {
     commands,
     messages,
     warnings,
+    warningAnswers,
     async dispose() {
       await extension.deactivate();
       Module._load = originalLoad;
@@ -198,7 +205,14 @@ test('activation installs the shell-style block, and the toggle takes it away', 
     assert.ok(text.includes(BEGIN), 'guidance block installed');
     assert.equal(text.split(BEGIN).length - 1, 1);
 
-    // The toggle reads the file state, so it removes what activation added.
+    // Removal sits behind a modal now, because the control lives on a dashboard opened
+    // just to read status. A dismissed confirm has to leave the block exactly where it is.
+    await app.commands.get('permission-wildcarding.toggleGuidance')();
+    assert.ok(fs.readFileSync(env.claudeMd, 'utf8').includes(BEGIN),
+      'a dismissed confirm changes nothing');
+
+    // Confirmed, the toggle reads the file state and removes what activation added.
+    app.warningAnswers.push('Remove');
     await app.commands.get('permission-wildcarding.toggleGuidance')();
     assert.equal(fs.readFileSync(env.claudeMd, 'utf8'), '# My instructions\n');
   } finally {
