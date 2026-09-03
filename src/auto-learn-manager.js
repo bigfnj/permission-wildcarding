@@ -453,15 +453,21 @@ function defaultCodexValidator(text, context) {
     // an error with no remedy reads as the feature being broken; the setting has
     // existed all along and nothing said so. An explicit path is honoured
     // directly, batch shim included.
-    if (process.platform === 'win32' && !launch.resolved) throw new Error(
+    //
+    // Raised from two places because the two platforms fail differently: on
+    // Windows resolution has to succeed before spawn is even attempted, while
+    // on POSIX the name is handed to spawn and comes back ENOENT. Same advice
+    // either way, so the message is built once.
+    const notFound = new Error(
       `codex executable not found: ${executable}. Looked on PATH and in the standard ` +
       'npm locations. Point at it with the permissionWildcarding.autoLearn.codexExecutable ' +
       'setting, or --codex-executable on the CLI, e.g. ' +
-      'C:/Users/<you>/AppData/Roaming/npm/codex.cmd',
+      '/usr/local/bin/codex, or C:/Users/<you>/AppData/Roaming/npm/codex.cmd',
     );
+    if (process.platform === 'win32' && !launch.resolved) throw notFound;
     const result = spawnSync(launch.file, launch.args,
       { encoding: 'utf8', windowsHide: true, timeout: 30000, ...launch.options });
-    if (result.error) throw result.error;
+    if (result.error) throw result.error.code === 'ENOENT' ? notFound : result.error;
     if (result.status !== 0) throw new Error(
       `codex execpolicy check rejected generated rules: ${clean(result.stderr || result.stdout || `exit ${result.status}`, 500)}`,
     );

@@ -1,6 +1,22 @@
 'use strict';
 
-const { ruleMatches } = require('./src/permission-match');
+// The shared modules live in two places depending on layout: `./src/` inside a
+// packaged extension, where scripts/package.mjs copies repo-root src/ next to
+// this file, and `../src/` in the repository, where that copy is generated and
+// gitignored. extension.js gets away with `./src/` only because its one test
+// installs a Module._load hook to redirect it; this file is required directly
+// by several tests, so it has to resolve without help or a fresh checkout
+// cannot run the suite at all. CI runs npm test before packaging, which is
+// exactly that condition.
+function requireShared(name) {
+  try { return require(`./src/${name}`); }
+  catch (error) {
+    if (error.code !== 'MODULE_NOT_FOUND') throw error;
+    return require(`../src/${name}`);
+  }
+}
+
+const { ruleMatches } = requireShared('permission-match');
 
 const TARGETS = new Set(['claude', 'codex']);
 
