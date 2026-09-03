@@ -164,3 +164,38 @@ test('policy summaries name only changed targets and restart Codex only when nee
   assert.equal(codexRestartSuffix(['claude']), '');
   assert.match(codexRestartSuffix(['codex']), /Restart Codex/);
 });
+
+// Regression: coverage was judged from the Claude allow list for every target
+// at once, so a family already allowed for Claude was hidden even while it
+// still owed Codex a rule. The picker is the only route to a Codex grant, so
+// hiding it there meant the grant could never be made at all.
+test('coverage is judged per target, so a pending Codex grant is never hidden', () => {
+  const settings = { permissions: { allow: ['Bash(git *)'], deny: [] } };
+  const both = ['claude', 'codex'];
+  const candidate = (pending) => ({
+    key: `git status:${pending.join('+')}`, claudePermission: 'Bash(git status *)',
+    disposition: 'review', meetsThreshold: true,
+    eligibleTargets: both, pendingTargets: pending,
+  });
+
+  // Only Claude left to grant, and the allow list already covers it: still
+  // redundant, still hidden.
+  const claudeOnly = reviewableCandidates([candidate(['claude'])], {}, both, settings);
+  assert.equal(claudeOnly.covered.length, 1);
+  assert.equal(claudeOnly.candidates.length, 0);
+
+  // Codex is still owed a rule, so the Claude entry does not settle it.
+  for (const pending of [['codex'], ['claude', 'codex']]) {
+    const result = reviewableCandidates([candidate(pending)], {}, both, settings);
+    assert.equal(result.covered.length, 0, `${pending} should not count as covered`);
+    assert.equal(result.candidates.length, 1, `${pending} should stay in the picker`);
+  }
+
+  // A candidate with no Claude rule to compare against is never covered.
+  const noRule = reviewableCandidates([{
+    key: 'ctest', claudePermission: null, disposition: 'review', meetsThreshold: true,
+    eligibleTargets: ['codex'], pendingTargets: ['codex'],
+  }], {}, both, settings);
+  assert.equal(noRule.covered.length, 0);
+  assert.equal(noRule.candidates.length, 1);
+});

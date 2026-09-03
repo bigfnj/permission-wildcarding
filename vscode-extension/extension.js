@@ -27,6 +27,7 @@ const {
   managedSettingsPaths, policySignalPaths, policyLimitsPath, policyRestrictions, assessPolicy,
 } = require('./src/policy-guard');
 const { extractInvocations, candidateKey } = require('./src/auto-learn');
+const { commandLaunch } = require('./src/exec-resolve');
 const { recallIndexCount, recallIndexStatus } = require('./src/recall-index');
 const { drainLocalSettings, localSettingsPath, LOCAL_RELATIVE } = require('./src/local-settings');
 const { guidanceStatusAll, setGuidanceAll } = require('./src/agent-guidance');
@@ -1208,9 +1209,12 @@ async function cycleAutoLearnMode() {
 }
 
 function execFileCaptured(executable, args) {
+  // Same PATHEXT asymmetry the Auto Learn validator hits: a bare name that a
+  // PATH check finds can still be unlaunchable when it resolves to a shim.
+  const launch = commandLaunch(executable, args);
   return new Promise((resolve, reject) => {
-    execFile(executable, args, {
-      windowsHide: true, timeout: 30000, maxBuffer: 1024 * 1024,
+    execFile(launch.file, launch.args, {
+      windowsHide: true, timeout: 30000, maxBuffer: 1024 * 1024, ...launch.options,
     }, (error, stdout, stderr) => {
       if (error) {
         error.detail = String(stderr || stdout || error.message).trim();

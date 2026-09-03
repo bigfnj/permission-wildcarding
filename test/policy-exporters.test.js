@@ -216,3 +216,38 @@ test('Codex managed merge preserves manual text and replaces only its marked sec
     /unbalanced/
   );
 });
+
+// A single-token root wildcard covers every argument, so the two automatic
+// allow-lists only hold read-only roots. That left roots the starter pack
+// already grants for the other shell with no route at all: the learner refused
+// to propose what the seed it ships had granted. A reviewer may now grant them,
+// and only a reviewer.
+test('a reviewable root is grantable by hand and never automatically', () => {
+  for (const permission of ['PowerShell(ctest *)', 'PowerShell(magick *)', 'Bash(magick *)']) {
+    assert.deepEqual(renderClaudePermissions([permission], { includeReviewed: true }), [permission],
+      `${permission} should be grantable under review`);
+    assert.deepEqual(renderClaudePermissions([permission], {}), [],
+      `${permission} must not be automatically applicable`);
+  }
+
+  // The read-only roots keep both routes, so the split did not demote them.
+  // `whoami` is suffix-closed as well as read-only, which is what the
+  // automatic path requires; `stat` is read-only but not suffix-closed, so it
+  // was already review-only before this change and stays that way.
+  assert.deepEqual(renderClaudePermissions(['Bash(whoami *)'], {}), ['Bash(whoami *)']);
+  assert.deepEqual(renderClaudePermissions(['Bash(stat *)'], { includeReviewed: true }), ['Bash(stat *)']);
+  assert.deepEqual(renderClaudePermissions(['Bash(stat *)'], {}), []);
+
+  // Not a blanket opening: a root on neither list stays refused either way.
+  for (const permission of ['Bash(ffmpeg *)', 'PowerShell(Invoke-Build *)']) {
+    assert.deepEqual(renderClaudePermissions([permission], { includeReviewed: true }), [],
+      `${permission} is on no list and must stay refused`);
+  }
+
+  // A wrapper or install root is refused even under review, so the reviewable
+  // list cannot be used to reach arbitrary execution.
+  for (const permission of ['Bash(python *)', 'Bash(npm *)', 'PowerShell(& *)']) {
+    assert.deepEqual(renderClaudePermissions([permission], { includeReviewed: true }), [],
+      `${permission} must stay refused under review`);
+  }
+});

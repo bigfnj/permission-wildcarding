@@ -10,9 +10,11 @@ const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 
-const { aggregateObservations, isAutoSafeCandidate } = require('./auto-learn');
+const { aggregateObservations, isAutoSafeCandidate, COMPLEX_REASONS } = require('./auto-learn');
 const { scanHistoryFiles } = require('./history-adapters');
 const { createPolicyLock } = require('./policy-lock');
+const { commandLaunch } = require('./exec-resolve');
+const { readPolicy, assessPermission } = require('./managed-policy');
 const {
   renderCodexRules, validateCodexRulesText, renderClaudePermissions, mergeClaudeAllow,
   mergeGeneratedCodexRules,
@@ -147,15 +149,21 @@ function candidate(value, threshold) {
   const key = clean(value.key, 512);
   const prefix = validPrefix(value.prefix);
   if (!key || !prefix) return null;
+  const reasons = [...new Set((Array.isArray(value.reasons) ? value.reasons : [])
+    .map((item) => clean(item, 80)).filter(Boolean))].sort();
   return refresh({
     key, tool: clean(value.tool, 64), shell: clean(value.shell, 32),
     kind: value.kind === 'tool' ? 'tool' : 'shell',
     root: clean(value.root, 256) || prefix[0], prefix,
     claudePermission: clean(value.claudePermission, 768) || null,
     risk: RISK_RANK.has(value.risk) ? value.risk : 'unknown',
-    baseAutoSafe: value.baseAutoSafe === true, complex: value.complex === true,
-    reasons: [...new Set((Array.isArray(value.reasons) ? value.reasons : [])
-      .map((item) => clean(item, 80)).filter(Boolean))].sort(),
+    baseAutoSafe: value.baseAutoSafe === true,
+    // Re-derived, not read back. The flag is OR-merged across observations and
+    // so can only ever ratchet on; a state written while a chained link counted
+    // as complexity holds it for families whose reasons never justified it, and
+    // no amount of later clean evidence would clear it.
+    complex: reasons.some((reason) => COMPLEX_REASONS.has(reason)),
+    reasons,
     sources: [...new Set((Array.isArray(value.sources) ? value.sources : [])
       .map((item) => clean(item, 32)).filter(Boolean))].sort(),
     counts: counts(value.counts),
@@ -436,9 +444,23 @@ function defaultCodexValidator(text, context) {
   try {
     const command = Array.isArray(context.command) && context.command.length
       ? context.command.map(String) : ['__claude_wildcarding_validation__'];
-    const result = spawnSync(context.codexExecutable || 'codex',
-      ['execpolicy', 'check', '--rules', temp, '--', ...command],
-      { encoding: 'utf8', windowsHide: true, timeout: 30000 });
+    // Fails closed on purpose: no reachable codex means no validation, and an
+    // unvalidated rules file must never be written.
+    const executable = context.codexExecutable || 'codex';
+    const launch = commandLaunch(executable,
+      ['execpolicy', 'check', '--rules', temp, '--', ...command]);
+    // Name the way out. This surfaces in the dashboard's Auto Learn card, where
+    // an error with no remedy reads as the feature being broken; the setting has
+    // existed all along and nothing said so. An explicit path is honoured
+    // directly, batch shim included.
+    if (process.platform === 'win32' && !launch.resolved) throw new Error(
+      `codex executable not found: ${executable}. Looked on PATH and in the standard ` +
+      'npm locations. Point at it with the permissionWildcarding.autoLearn.codexExecutable ' +
+      'setting, or --codex-executable on the CLI, e.g. ' +
+      'C:/Users/<you>/AppData/Roaming/npm/codex.cmd',
+    );
+    const result = spawnSync(launch.file, launch.args,
+      { encoding: 'utf8', windowsHide: true, timeout: 30000, ...launch.options });
     if (result.error) throw result.error;
     if (result.status !== 0) throw new Error(
       `codex execpolicy check rejected generated rules: ${clean(result.stderr || result.stdout || `exit ${result.status}`, 500)}`,
@@ -502,6 +524,17 @@ function createAutoLearnManager(options = {}) {
   const lockStaleMs = Number.isFinite(options.lockStaleMs) ? Math.max(0, options.lockStaleMs) : 10 * 60 * 1000;
   const observationHashLimit = Number.isFinite(options.observationHashLimit)
     ? Math.max(0, Math.floor(options.observationHashLimit)) : 20000;
+  // Read once per manager and cached: the policy is a client-refreshed cache,
+  // so re-reading it per candidate would only add I/O to a listing.
+  let policyCache;
+  const managedPolicy = () => {
+    if (policyCache === undefined) {
+      policyCache = options.managedPolicy !== undefined
+        ? options.managedPolicy
+        : readPolicy({ home, policyPath: options.managedPolicyPath });
+    }
+    return policyCache;
+  };
   const clock = typeof options.now === 'function' ? options.now : () => new Date();
   const now = () => {
     const value = clock();
@@ -541,14 +574,21 @@ function createAutoLearnManager(options = {}) {
       ...(known.claude.has(item.key) ? ['claude'] : []),
       ...(known.codex.has(item.key) ? ['codex'] : []),
     ];
+    // Managed settings outrank user settings and evaluate ask before allow, so
+    // a family a managed ask covers cannot be granted here: writing the rule
+    // changes nothing and the prompt survives. Withhold the proposal rather
+    // than offer work that cannot pay off. Policy is never consulted to WIDEN
+    // eligibility, only to withhold it.
+    const policyVerdict = assessPermission(managedPolicy(), item.claudePermission);
     const eligibleTargets = [
-      ...(claudeSettingsPath && claudeEligible(item, true) ? ['claude'] : []),
+      ...(claudeSettingsPath && policyVerdict !== 'inert' && claudeEligible(item, true) ? ['claude'] : []),
       ...(codexRulesPath && codexEligible(item, true) ? ['codex'] : []),
     ];
     return {
       ...item, prefix: item.prefix.slice(), reasons: item.reasons.slice(),
       sources: item.sources.slice(), counts: { ...item.counts },
       fingerprint: candidateFingerprint(item), eligibleTargets,
+      policy: policyVerdict,
       pendingTargets: eligibleTargets.filter((target) => !to.includes(target)),
       applied: to.length > 0, appliedTo: to,
     };
@@ -632,8 +672,16 @@ function createAutoLearnManager(options = {}) {
   }
   const claudeEligible = (item, reviewed) =>
     renderClaudePermissions([item], { includeReviewed: reviewed }).length > 0;
-  const codexEligible = (item, reviewed) =>
-    /\bprefix_rule\s*\(/.test(renderCodexRules([item], { includeReviewed: reviewed }));
+  // Rendering a prefix_rule is not the same as being allowed to write one. The
+  // merge step refuses text this validator rejects (a bare `curl`, `python` or
+  // `git` prefix, a broad PowerShell form), and an application is atomic, so
+  // offering such a candidate as eligible meant one unwritable row failed the
+  // whole batch and applied nothing. Eligibility asks the writer's question.
+  const codexEligible = (item, reviewed) => {
+    const text = renderCodexRules([item], { includeReviewed: reviewed });
+    if (!/\bprefix_rule\s*\(/.test(text)) return false;
+    return validateCodexRulesText(text).valid === true;
+  };
   function backup(kind, target, before, time) {
     const backupPath = path.join(backupDir,
       `${time.replace(/[:.]/g, '-')}-${kind}-${crypto.randomBytes(4).toString('hex')}.bak`);

@@ -115,3 +115,60 @@ test('Claude and Codex history jointly learn one safe family and apply/undo sepa
   assert.equal(fs.readFileSync(settings, 'utf8'), originalSettings);
   assert.equal(fs.readFileSync(rules, 'utf8'), originalRules);
 });
+
+function bashCall(id, command) {
+  return {
+    type: 'assistant',
+    message: {
+      role: 'assistant',
+      content: [{ type: 'tool_use', id, name: 'Bash', input: { command } }],
+    },
+  };
+}
+
+// Regression: every observation of this family is one link of an all-&& chain,
+// which is the ordinary shape of real work. Chain attribution already proves
+// each link there, so the family has to be able to reach policy. It could not,
+// because being part of a chain also marked the family complex, and complex
+// nulled the rendered permission for good.
+test('a family proven only inside an all-&& chain still reaches policy', (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'permission-wildcarding-chain-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  const history = path.join(home, '.claude', 'projects', 'project-chain', 'session.jsonl');
+  const settings = path.join(home, '.claude', 'settings.json');
+  fs.mkdirSync(path.dirname(history), { recursive: true });
+  fs.mkdirSync(path.dirname(settings), { recursive: true });
+  fs.writeFileSync(settings, `${JSON.stringify({ permissions: { allow: [] } }, null, 2)}\n`);
+  fs.writeFileSync(history, jsonl(
+    { type: 'session_meta', payload: { id: 'chain', cwd: 'D:\work' } },
+    bashCall('chain-one', 'git status --short && git log --oneline -1'),
+    claudeResult('chain-one'),
+    bashCall('chain-two', 'git status --short && git log --oneline -2'),
+    claudeResult('chain-two'),
+    bashCall('chain-three', 'git status --short && git log --oneline -3'),
+    claudeResult('chain-three'),
+  ));
+
+  const manager = createAutoLearnManager({ home, threshold: 3, codexRulesPath: null });
+  manager.scan({ platform: 'win32' });
+
+  const candidate = manager.listCandidates().find((item) => item.key === 'bash:git status');
+  assert.ok(candidate, 'the chained family should be learned');
+  assert.equal(candidate.counts.success, 3);
+  assert.equal(candidate.counts.failed, 0);
+  // The chain is still recorded as evidence, it just no longer disqualifies.
+  assert.ok(candidate.reasons.includes('compound-command'));
+  assert.equal(candidate.complex, false);
+  assert.equal(candidate.autoSafe, true);
+  assert.deepEqual(candidate.eligibleTargets, ['claude']);
+
+  const applied = manager.apply();
+  assert.equal(applied.appliedCount, 1);
+  assert.ok(JSON.parse(fs.readFileSync(settings, 'utf8')).permissions.allow
+    .includes('Bash(git status *)'));
+
+  // The accepted family has to stop asking to be reviewed.
+  const after = manager.listCandidates().find((item) => item.key === 'bash:git status');
+  assert.deepEqual(after.pendingTargets, []);
+});

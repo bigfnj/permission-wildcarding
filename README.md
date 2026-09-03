@@ -50,6 +50,21 @@ subcommand. The safety boundary for the legacy hook is still your
   extension uses to decide whether re-embedding is needed at all.
 - **`patterns/starter-pack.json`** / **`patterns/starter-pack.md`** — a curated
   seed of common, safe wildcard patterns (documented in the `.md`).
+- **`scripts/mirror-pack.js`** — keeps the starter pack's PowerShell half in step with
+  its Bash half, since Bash sits under a built-in read-only set and (in an enterprise) a
+  managed allow list while PowerShell has neither. Run it bare to report, `--write` to
+  apply; a test asserts the pack stays closed under the rule.
+- **`scripts/auto-mode-audit.js`** — reports which of your allow entries Claude Code
+  actually loads, because auto mode discards the ones that would bypass its classifier.
+  Free and sandboxed: it points `CLAUDE_CONFIG_DIR` at an empty directory, writes only a
+  copy of your allow array there, and stops before any API call.
+- **`docs/claude-code-permissions.md`** — how Claude Code actually matches permission
+  rules, cited to the official docs and cross-checked against a real enterprise-managed
+  policy: rule syntax and the bare-command rule, per-subcommand matching, which wrappers
+  are stripped, redirection targets, precedence, every friction lever that is not bypass
+  mode, and a list of beliefs about matching that turned out to be wrong. **Read it before
+  changing anything about the shape of an emitted permission**, and before assuming a grant
+  will stop a prompt.
 - **`vscode-extension/`** — optional VS Code extension. Watches `settings.json` live
   and wildcards on change, and adds an **Activity Bar dashboard** (asterisk icon):
   an "Active" status card, live tallies (approved / wildcards / specific), a
@@ -512,12 +527,28 @@ The two MAX switches are siblings, not one setting — different agents, differe
 different floors. The status bar shows both at once (`Claude MAX · Codex prompts`), so an
 active "skip everything" is never ambiguous about which agent it covers.
 
-## Claude — MAX mode (recommended) or bypass mode
+## Claude — MAX mode or bypass mode
 
 Wildcarding whittles the prompts down; these toggles remove them entirely. There are
 two mechanisms, because they fail in different ways.
 
-### MAX mode (recommended)
+### MAX mode
+
+> **Read this before turning it on.** Measured 2026-09-03 against Claude Code
+> 2.1.258: MAX and Claude Code's **auto** mode are mutually exclusive, so the
+> toggle moves you to `manual`. Auto mode refuses to load any allow entry that
+> would bypass its classifier, which on one real ~300-entry list was 19 of them,
+> all interpreter and shell-wrapper grants (`Bash(bash *)`, `Bash(python *)`,
+> `PowerShell(cmd *)` and the like). Manual loads all of them. So switching MAX
+> on removes the classifier and activates every arbitrary-execution grant in your
+> allow list in the same action.
+>
+> If you run auto mode, that is very likely both **safer and lower friction**
+> than MAX, because the classifier approves a large surface no allow list
+> enumerates. Check what your own list actually loads first:
+> `node scripts/auto-mode-audit.js` (free, sandboxed, writes nothing). MAX still
+> earns its place where auto mode is unavailable, or where you want a rule file
+> rather than a classifier deciding.
 
 `MAX` skips every prompt using **two independent layers**, and never needs bypass mode
 — so it keeps working even where corporate policy blocks Claude Code's own

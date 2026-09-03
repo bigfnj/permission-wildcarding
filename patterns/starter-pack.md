@@ -13,6 +13,32 @@ note at the bottom on removing them. Machine-specific entries
 out so the seed stays portable. All entries are already in wildcarded final form;
 `processAllowList` passes them through and prunes redundancies against your allow list.
 
+## Both halves, and why PowerShell carries more entries
+
+Bash sits under two layers nobody configures: Claude Code's built-in read-only
+command set (`ls`, `cat`, `echo`, `pwd`, `head`, `tail`, `grep`, `find`, `wc`,
+`which`, `diff`, `stat`, `du`, `cd`, read-only `git`) and, on an
+enterprise-managed machine, a managed allow list that typically covers coreutils
+plus the common test and build tools. PowerShell has neither, so a user rule is
+the only layer that decides there.
+
+A pack weighted toward Bash therefore spends most of its entries on the half
+where they matter least. `scripts/mirror-pack.js` keeps the two in step: it adds
+the PowerShell spelling of a decision the pack has already made for Bash, and it
+refuses to carry across an interpreter or shell wrapper, a POSIX-only tool or
+shell builtin, a path or repo-relative script, or anything the project's own
+classifier calls destructive, admin, credential-sensitive, network or shell, or
+flags as a bare family prefix. Run it with no arguments to see what is missing,
+`--write` to apply. A test asserts the pack stays closed under the rule, so a
+new Bash entry cannot quietly leave its twin behind.
+
+Roughly a dozen Bash entries (`Bash(ls *)`, `Bash(cat *)`, `Bash(head *)` and
+friends) duplicate the built-in read-only set and can never prevent a prompt.
+They are kept rather than deleted: the cost of keeping a redundant entry is one
+line of noise, while the cost of deleting one the built-in set turns out not to
+cover is a prompt on every install. See `docs/claude-code-permissions.md` for
+the citation and the measured redundancy.
+
 The category tables below are readable highlights, not the full list — see the JSON
 for everything.
 

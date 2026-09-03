@@ -54,6 +54,22 @@ const CLAUDE_SAFE_POWERSHELL_ROOTS = new Set([
   'test-path',
 ]);
 
+// Roots a reviewer may wildcard by hand, kept separate from the two sets above
+// because those state a stronger property: every argument is read-only, which
+// is what lets the automatic path use them. These are not read-only. `ctest`
+// runs whatever the project defines and `magick` writes files, so neither can
+// ever be auto-applied; `isAutoSafeCandidate` requires read-only risk, and a
+// selection here is named in the confirmation prompt before it lands.
+//
+// The list is evidence-driven rather than aspirational: each root is one the
+// starter pack already grants for the other shell, so refusing to propose it
+// meant the learner disagreed with the seed it ships. A single-token root
+// belongs here only when a human granting it wholesale is a decision the
+// project has already made.
+const CLAUDE_REVIEWABLE_ROOTS = new Set([
+  'cmake', 'cmake.exe', 'ctest', 'ctest.exe', 'magick', 'magick.exe',
+]);
+
 const SAFE_GIT_READ_SUBCOMMANDS = new Set([
   'blame', 'cat-file', 'count-objects', 'describe', 'diff', 'for-each-ref',
   'grep', 'log', 'ls-files', 'ls-tree', 'name-rev', 'rev-parse', 'shortlog',
@@ -68,13 +84,27 @@ const AUTO_SAFE_GIT_SUBCOMMANDS = new Set([
 ]);
 const STATE_MUTATING_ROOTS = new Set(['date', 'date.exe', 'hostname', 'hostname.exe']);
 // This gate is deliberately a second, independent copy of the learner's list in
-// src/auto-learn.js — a bug in one should not propagate to the other. The
-// membership rule is the same: an auto-applied `Bash(<root> *)` also matches
-// `<root> ... > <path>`, because redirection is shell syntax rather than an
-// argument and no Claude Code allow pattern can exclude it. So a root qualifies
-// only when no argument can reach its stdout. Roots whose argument *is* the
-// output (echo, printf, Write-*, basename, dirname, Get-Date -Format) would turn
-// one grant into an arbitrary-content file write and are excluded.
+// src/auto-learn.js — a bug in one should not propagate to the other. A root
+// qualifies only when no argument can reach its stdout, so roots whose argument
+// *is* the output (echo, printf, Write-*, basename, dirname, Get-Date -Format)
+// are excluded: one grant would otherwise become an arbitrary-content file write.
+//
+// The rationale used to say no Claude Code allow pattern can exclude a
+// redirection. That is wrong, and the gate survives the correction. MEASURED
+// 2026-09-03 against Claude Code 2.1.258: the redirect target IS intercepted
+// independently of the command rule, `Bash(echo *)` allowed, five probes. In a
+// non-interactive `-p` run every redirect was refused ("Output redirection to
+// '<path>' was blocked"), including one inside the session's own working
+// directory that the refusal itself listed as allowed. In an interactive session
+// the identical redirect SUCCEEDED silently and wrote the file, because a
+// tool-wide `Write` grant covers the write, and patterns/starter-pack.json seeds
+// exactly that grant.
+//
+// So the guard is real but it is not protection we get for free: with `Write`
+// allowed, an auto-applied `Bash(echo *)` does write arbitrary content to an
+// arbitrary path. What the guard changes is blast radius, from anywhere on disk
+// to anywhere inside the session's working directories. Still worth excluding.
+// See docs/claude-code-permissions.md section 4.
 const AUTO_SUFFIX_CLOSED_ROOTS = new Set([
   'false', 'get-alias', 'get-computerinfo', 'get-culture', 'get-host',
   'get-location', 'get-member', 'get-psprovider', 'get-timezone', 'pwd',
@@ -556,9 +586,10 @@ function claudePermissionIsSafe(parsed, options) {
       STATE_MUTATING_ROOTS.has(root) || SHELL_WRAPPERS.has(root)) return false;
   if (!reviewed && !prefixIsAutoSuffixClosed(parsed.tokens)) return false;
   if (parsed.tokens.length === 1) {
-    return parsed.tool === 'PowerShell'
-      ? CLAUDE_SAFE_POWERSHELL_ROOTS.has(root)
-      : CLAUDE_SAFE_BASH_ROOTS.has(root);
+    const automatic = parsed.tool === 'PowerShell'
+      ? CLAUDE_SAFE_POWERSHELL_ROOTS : CLAUDE_SAFE_BASH_ROOTS;
+    if (automatic.has(root)) return true;
+    return reviewed && CLAUDE_REVIEWABLE_ROOTS.has(root);
   }
   if (root === 'git' || root === 'git.exe') {
     return SAFE_GIT_READ_SUBCOMMANDS.has(parsed.tokens[1].toLowerCase());

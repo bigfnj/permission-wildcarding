@@ -122,6 +122,24 @@ const AUTO_SUFFIX_CLOSED_ROOTS = new Set([
   'true', 'uname', 'whoami',
 ]);
 
+// Complexity is a property of the invocation's own shape, and every trigger
+// records a reason, so the flag is always derivable from the reasons. Keeping
+// one list is what lets a stored candidate be re-derived rather than trusted:
+// the flag used to be OR-merged across observations and could never clear.
+//
+// 'compound-command' is deliberately absent. Being one link of a chain says
+// nothing about the link itself; whether its exit status can be trusted is
+// already decided by segmentAttribution, which withholds success credit from
+// any segment it cannot attribute. Counting the chain as complexity too
+// disqualified the family a second time, permanently, for evidence the
+// counters had already discounted.
+const COMPLEX_REASONS = new Set([
+  'dynamic-executable', 'family-subcommand-unknown', 'missing-command-root',
+  'path-executable', 'powershell-call-operator', 'prefix-conflict',
+  'quoted-executable', 'reserved-keyword', 'script-syntax', 'shell-structure',
+  'write-redirection',
+]);
+
 const SAFE_RG_MODES = new Set(['--files', '--type-list', '--help', '--version', '-h', '-V']);
 const NETWORK_GIT = new Set(['clone', 'fetch', 'ls-remote', 'pull', 'push', 'send-email', 'submodule']);
 const DESTRUCTIVE_GIT = new Set(['checkout', 'clean', 'reset', 'restore']);
@@ -448,15 +466,52 @@ function permissionFor(shell, prefix, blocked) {
   return `${tool}(${prefix.join(' ')} *)`;
 }
 
+// `timeout [OPTION] DURATION COMMAND` is stripped by Claude Code's matcher, so
+// the family is the inner command. Returns the index of that command, or null
+// when the shape is not the documented one, in which case nothing is stripped
+// rather than guessed.
+const TIMEOUT_VALUE_OPTIONS = new Set(['-s', '-k', '--signal', '--kill-after']);
+const TIMEOUT_DURATION = /^[0-9]+(?:\.[0-9]+)?[smhd]?$/;
+function skipTimeoutPreamble(details, start) {
+  let index = start;
+  while (details[index] && details[index].value.startsWith('-')) {
+    const option = details[index].value;
+    index += 1;
+    if (TIMEOUT_VALUE_OPTIONS.has(option) && details[index]) index += 1;
+  }
+  if (!details[index] || !TIMEOUT_DURATION.test(details[index].value)) return null;
+  index += 1;
+  return details[index] ? index : null;
+}
+
 function deriveBaseInvocation(tool, command, metadata, totalSegments) {
   const shell = normalizeShell(metadata && metadata.shell, tool);
   const details = tokenizeDetailed(command, shell)
     .filter((token) => !token.operator || (shell === 'powershell' && token.value === '&'));
   let index = 0;
   const environment = [];
+  const strippedWrappers = [];
+  // Claude Code strips a leading env assignment, `command`, `builtin` and a
+  // `timeout` preamble before matching, so a rule for the inner command covers
+  // the wrapped invocation. Learning the wrapper instead would propose
+  // `Bash(timeout *)`, which grants every command it can run.
   if (shell === 'bash') {
-    while (details[index] && isEnvironmentAssignment(details[index].value)) {
-      environment.push(details[index].value.split('=', 1)[0]); index++;
+    for (let guard = 0; guard < 8; guard += 1) {
+      const token = details[index];
+      if (!token) break;
+      if (isEnvironmentAssignment(token.value)) {
+        environment.push(token.value.split('=', 1)[0]); index += 1; continue;
+      }
+      const name = normalizeRoot(token.value);
+      if (name === 'command' || name === 'builtin') {
+        strippedWrappers.push(name); index += 1; continue;
+      }
+      if (name === 'timeout') {
+        const inner = skipTimeoutPreamble(details, index + 1);
+        if (inner === null) break;
+        strippedWrappers.push('timeout'); index = inner; continue;
+      }
+      break;
     }
   }
   let callOperator = false;
@@ -474,6 +529,7 @@ function deriveBaseInvocation(tool, command, metadata, totalSegments) {
   const prefix = prefixFor(root, argv.slice(1));
   const reasons = [];
   if (environment.length) reasons.push('environment-prefix');
+  if (strippedWrappers.length) reasons.push('stripped-wrapper');
   if (totalSegments > 1) reasons.push('compound-command');
   if (callOperator) reasons.push('powershell-call-operator');
   if (executable && executable.quoted) reasons.push('quoted-executable');
@@ -485,8 +541,14 @@ function deriveBaseInvocation(tool, command, metadata, totalSegments) {
   if (unknownFamily) reasons.push('family-subcommand-unknown');
   if (hasWriteRedirection(command, shell)) reasons.push('write-redirection');
   if (containsScriptSyntax(command, shell)) reasons.push('script-syntax');
+  // An env assignment is deliberately absent. Claude Code strips a leading
+  // `VAR=value` before matching, so `Bash(cat *)` already covers
+  // `LD_PRELOAD=x cat f`: refusing to propose the rule denies the grant without
+  // denying the injection. The reason is kept, and it still bars auto-safe
+  // (isAutoSafeCandidate and AUTO_UNSAFE_REASONS both list it), so evidence
+  // carrying an injection vector can only ever reach policy through a review.
   const permissionBlocked = pathExecutable || dynamicExecutable || callOperator || reserved ||
-    unknownFamily || environment.length > 0 || Boolean(executable && executable.quoted);
+    unknownFamily || Boolean(executable && executable.quoted);
 
   return {
     ...(metadata && typeof metadata === 'object' ? metadata : {}),
@@ -494,11 +556,7 @@ function deriveBaseInvocation(tool, command, metadata, totalSegments) {
     command: String(command || '').trim(), argv, root, prefix,
     claudePermission: permissionFor(shell, prefix, permissionBlocked),
     risk: 'unknown', autoSafe: false, reasons,
-    complex: reasons.some((reason) => [
-      'compound-command', 'powershell-call-operator', 'quoted-executable',
-      'path-executable', 'dynamic-executable', 'reserved-keyword',
-      'write-redirection', 'script-syntax', 'family-subcommand-unknown',
-    ].includes(reason)),
+    complex: reasons.some((reason) => COMPLEX_REASONS.has(reason)),
     executable: executableValue || null, environment, callOperator,
     pathExecutable, quotedExecutable: Boolean(executable && executable.quoted),
     dynamicExecutable, reserved,
@@ -542,8 +600,11 @@ function classifyInvocation(invocation) {
   const environmentPrefix = reasons.has('environment-prefix') ||
     (Array.isArray(result.environment) && result.environment.length > 0);
   if (environmentPrefix) reasons.add('environment-prefix');
+  // environmentPrefix is not structure: the matcher strips it, so the command
+  // Claude Code sees is the one we derived. It stays out of auto-safe through
+  // the reason lists instead.
   const shellStructure = !root || reserved || result.callOperator || result.pathExecutable ||
-    result.quotedExecutable || result.dynamicExecutable || scriptSyntax || environmentPrefix;
+    result.quotedExecutable || result.dynamicExecutable || scriptSyntax;
   let risk = shellStructure ? 'shell' : 'unknown';
   let knownReadOnly = false;
   if (shellStructure) reasons.add(!root ? 'missing-command-root' : 'shell-structure');
@@ -593,7 +654,7 @@ function classifyInvocation(invocation) {
     claudePermission: result.claudePermission == null ? null : result.claudePermission,
     risk, autoSafe: risk === 'read-only' && knownReadOnly && !structuralBlock,
     reasons: [...reasons].sort(),
-    complex: Boolean(result.complex || shellStructure || writeRedirection || reasons.has('compound-command')),
+    complex: [...reasons].some((reason) => COMPLEX_REASONS.has(reason)),
   };
 }
 
@@ -783,4 +844,7 @@ module.exports = {
   // independent copy still describe the same set.
   AUTO_SUFFIX_CLOSED_ROOTS,
   AUTO_SAFE_GIT,
+  // Exported so a stored candidate's flag can be re-derived from its reasons
+  // rather than carried forward.
+  COMPLEX_REASONS,
 };

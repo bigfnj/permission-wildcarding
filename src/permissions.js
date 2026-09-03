@@ -4,6 +4,9 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+const { ruleMatches, sameRule } = require('./permission-match');
+const { readPolicy, hookEventAllowed } = require('./managed-policy');
+
 // Rename codes that are transient on Windows: another process (Claude Code
 // writing settings.json, Defender/Search indexer scanning the temp file, or a
 // second wildcarding writer) held a handle at the instant of the atomic swap.
@@ -190,17 +193,11 @@ function mineWildcard(tool, command) {
 
 // Returns true if `specific` is fully matched by `wildcard` (glob: * = anything).
 function isCoveredBy(specific, wildcard) {
-  if (specific === wildcard) return false; // identity — not "covered by" itself
-
-  const pattern = wildcard
-    .replace(/[.+?^${}()|[\]\\]/g, '\\$&')
-    .replace(/\*/g, '.*');
-
-  try {
-    return new RegExp(`^${pattern}$`).test(specific);
-  } catch {
-    return false;
-  }
+  // Identity is not coverage, and `Tool(cmd:*)` is the same rule as
+  // `Tool(cmd *)`, so the two spellings are identity too rather than one
+  // covering the other.
+  if (sameRule(specific, wildcard)) return false;
+  return ruleMatches(wildcard, specific);
 }
 
 // Remove entries that are fully covered by a broader entry in the same list.
@@ -500,8 +497,28 @@ function isMaxOn(settings) {
   return isApproveHookOn(settings) || isMaxAllowOn(settings);
 }
 
-function maxLayers(settings) {
-  return { allow: isMaxAllowOn(settings), hook: isApproveHookOn(settings) };
+// MAX mode has two layers, and the hook layer can be registered yet never run:
+// with `allowManagedHooksOnly` set, a user hook fires only on an event the
+// managed policy itself defines, and a policy that defines only PostToolUse
+// silently drops a PreToolUse hook. Reporting `hook: true` in that case would
+// claim a control that is not running, so the state is named instead.
+//
+// `hookBlocked` is a policy declaration rather than an observation. Enforcement
+// has changed across policy versions, so confirm with a canary before relying
+// on it in either direction.
+function maxLayers(settings, options = {}) {
+  const policy = options.managedPolicy !== undefined
+    ? options.managedPolicy
+    : readPolicy({ home: options.home, policyPath: options.managedPolicyPath });
+  const hook = isApproveHookOn(settings);
+  const permitted = hookEventAllowed(policy, 'PreToolUse');
+  return {
+    allow: isMaxAllowOn(settings),
+    hook,
+    hookBlocked: hook && !permitted,
+    hookEventPermitted: permitted,
+    policyPresent: Boolean(policy && policy.present),
+  };
 }
 
 // Turn both layers on/off in a single settings transform.

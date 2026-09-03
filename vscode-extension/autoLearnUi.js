@@ -1,5 +1,7 @@
 'use strict';
 
+const { ruleMatches } = require('./src/permission-match');
+
 const TARGETS = new Set(['claude', 'codex']);
 
 function uniqueTargets(value) {
@@ -86,12 +88,12 @@ function codexRestartSuffix(value) {
     ? ' Restart Codex to load the changed rules.' : '';
 }
 
+// Delegates to the shared matcher so the dashboard reads policy the same way
+// the wildcarding pass does. See docs/claude-code-permissions.md: the `:*` and
+// ` *` spellings are one rule, and a lone trailing ` *` also matches the bare
+// command.
 function permissionMatches(permission, rule) {
-  if (typeof permission !== 'string' || typeof rule !== 'string') return false;
-  if (permission === rule) return true;
-  const pattern = rule.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
-  try { return new RegExp(`^${pattern}$`).test(permission); }
-  catch { return false; }
+  return ruleMatches(rule, permission);
 }
 
 function claudePermissionDecision(settings, permissions) {
@@ -181,8 +183,18 @@ function reviewableCandidates(candidates, status = {}, requiredTargets = ['claud
   //
   // Only user settings are visible here, so this hides redundancy, never risk:
   // the worst case is a family staying in the list that did not need to.
-  const isCovered = (candidate) => Boolean(candidate.claudePermission) &&
+  const claudeCovered = (candidate) => Boolean(candidate.claudePermission) &&
     claudePermissionDecision(settings, candidate.claudePermission).decision === 'allow';
+  // Coverage is per target, and the Claude allow list only answers for Claude.
+  // A family already allowed there can still owe Codex a rule, and hiding it on
+  // the strength of the Claude entry alone meant the Codex grant could never be
+  // made: the picker was the only route to it. Nothing here can read Codex
+  // policy, so a pending Codex target is never assumed to be covered.
+  const isCovered = (candidate) => {
+    const pending = candidatePendingTargets(candidate, status, requiredTargets);
+    return pending.length > 0 &&
+      pending.every((target) => target === 'claude' && claudeCovered(candidate));
+  };
   const covered = ready.filter(isCovered);
   return { ready, covered, candidates: ready.filter((candidate) => !isCovered(candidate)) };
 }

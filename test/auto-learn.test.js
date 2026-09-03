@@ -12,6 +12,7 @@ const {
   isAutoSafeCandidate,
   AUTO_SUFFIX_CLOSED_ROOTS,
 } = require('../src/auto-learn');
+const { renderClaudePermissions } = require('../src/policy-exporters');
 
 // One auto-safe grant is a pattern, not a replay of what was seen: `Bash(echo *)`
 // also matches `echo <anything> > <anywhere>`, because a trailing `*` admits
@@ -114,7 +115,11 @@ test('extracts later roots in compound commands and classifies each independentl
     source: 'claude', outcome: 'success',
   });
   assert.deepEqual(found.map((item) => item.root), ['git', 'npm', 'rg']);
-  assert.ok(found.every((item) => item.complex));
+  // Independently means the chain itself decides nothing. Each link records
+  // that it was part of a compound command, and none is marked complex for
+  // that alone; what blocks a link is its own classification, asserted below.
+  assert.ok(found.every((item) => item.reasons.includes('compound-command')));
+  assert.deepEqual(found.map((item) => item.complex), [false, false, false]);
   assert.deepEqual(found[0].prefix, ['git', 'status']);
   assert.equal(found[0].claudePermission, 'Bash(git status *)');
   assert.equal(found[0].risk, 'read-only');
@@ -123,6 +128,13 @@ test('extracts later roots in compound commands and classifies each independentl
   assert.equal(found[1].autoSafe, false);
   assert.equal(found[2].risk, 'unknown');
   assert.equal(found[2].autoSafe, false);
+  // No longer being complex must not widen the automatic path. The wrapper
+  // renders nothing at all, and rg stays review-only because `rg --pre` can
+  // run a preprocessor; a chained observation now agrees with a standalone
+  // one instead of being blocked until the root is next seen on its own.
+  assert.deepEqual(renderClaudePermissions([found[1]], { includeReviewed: true }), []);
+  assert.deepEqual(renderClaudePermissions([found[2]], {}), []);
+  assert.deepEqual(renderClaudePermissions([found[2]], { includeReviewed: true }), ['Bash(rg *)']);
 });
 
 test('strips direct env assignments but keeps them out of automatic policy', () => {
@@ -130,15 +142,20 @@ test('strips direct env assignments but keeps them out of automatic policy', () 
   assert.deepEqual(item.argv, ['git', 'status']);
   assert.deepEqual(item.environment, ['FOO', 'BAR']);
   assert.equal(item.root, 'git');
-  assert.equal(item.claudePermission, null);
   assert.ok(item.reasons.includes('environment-prefix'));
-  assert.equal(item.risk, 'shell');
-  assert.equal(item.autoSafe, false);
+  // The assignment is stripped by Claude Code's matcher too, so the command it
+  // sees is the one derived here and the family classifies on its own merits.
+  assert.equal(item.risk, 'read-only');
+  assert.equal(item.claudePermission, 'Bash(git status *)');
+  // "Out of automatic policy" is the part that matters, and it is enforced by
+  // the exporter rather than by refusing to name the family.
+  assert.deepEqual(renderClaudePermissions([item], {}), []);
+  assert.deepEqual(renderClaudePermissions([item], { includeReviewed: true }), ['Bash(git status *)']);
 
   const [preloaded] = extractInvocations('Bash', 'LD_PRELOAD=/tmp/evil.so cat README.md');
   assert.deepEqual(preloaded.environment, ['LD_PRELOAD']);
-  assert.equal(preloaded.claudePermission, null);
   assert.equal(preloaded.autoSafe, false);
+  assert.deepEqual(renderClaudePermissions([preloaded], {}), []);
 });
 
 test('quoted executable paths never become malformed wildcard roots', () => {
@@ -494,4 +511,50 @@ test('one exit status is only credited to the segments it provably covers', () =
   const either = counts('make build || echo fallback', 'success');
   assert.equal(either.make.unknown, 1);
   assert.equal(either.echo.unknown, 1);
+});
+
+// Claude Code strips a leading env assignment, `command`, `builtin` and a
+// `timeout` preamble before matching, so a rule for the inner command already
+// covers the wrapped invocation. Rooting on the wrapper instead learned
+// nothing useful, and would have proposed `Bash(timeout *)`: a grant for
+// every command timeout can run.
+test('documented stripped wrappers resolve to the inner command', () => {
+  const rootOf = (command) => extractInvocations('Bash', command, { outcome: 'success' })
+    .map((item) => item.root);
+
+  assert.deepEqual(rootOf('timeout 30 npm test'), ['npm']);
+  assert.deepEqual(rootOf('timeout -k 5 30s git status'), ['git']);
+  assert.deepEqual(rootOf('command git status'), ['git']);
+  assert.deepEqual(rootOf('builtin cd /tmp'), ['cd']);
+  assert.deepEqual(rootOf('NODE_ENV=test timeout 30 git status'), ['git']);
+
+  const [stripped] = extractInvocations('Bash', 'timeout 30 git status', {});
+  assert.ok(stripped.reasons.includes('stripped-wrapper'));
+  assert.deepEqual(renderClaudePermissions([stripped], {}), ['Bash(git status *)']);
+
+  // An undocumented shape is left alone rather than guessed at: no duration,
+  // or a duration with no command, means nothing is stripped.
+  assert.deepEqual(rootOf('timeout npm test'), ['timeout']);
+  assert.deepEqual(rootOf('timeout 30'), ['timeout']);
+});
+
+// An env prefix is stripped by the matcher, so `Bash(cat *)` covers
+// `LD_PRELOAD=x cat f` whether or not we propose it. Refusing to propose denied
+// the grant without denying the injection. It stays barred from the automatic
+// path, where minting a rule from that evidence would be wrong.
+test('an env-prefixed observation is reviewable but never automatic', () => {
+  const [item] = extractInvocations('Bash', 'LD_PRELOAD=/tmp/evil.so cat README.md', {});
+  assert.deepEqual(item.environment, ['LD_PRELOAD']);
+  assert.ok(item.reasons.includes('environment-prefix'));
+
+  assert.deepEqual(renderClaudePermissions([item], {}), []);
+  assert.deepEqual(renderClaudePermissions([item], { includeReviewed: true }), ['Bash(cat *)']);
+
+  // And the candidate-level gate agrees: the reason bars auto-safe outright.
+  const [candidate] = aggregateObservations([{
+    source: 'claude', tool: 'Bash', outcome: 'success',
+    command: 'LD_PRELOAD=/tmp/evil.so cat README.md',
+  }], { threshold: 1 });
+  assert.equal(candidate.autoSafe, false);
+  assert.ok(candidate.reasons.includes('environment-prefix'));
 });

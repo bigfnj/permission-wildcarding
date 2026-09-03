@@ -511,3 +511,92 @@ test('overview answers status and candidates from a single state read', (t) => {
   assert.deepEqual(view.candidates.map((item) => item.key), ['bash:git status']);
   assert.equal(view.status.lastScanAt, learn.status().lastScanAt);
 });
+
+// A state file written while a chained link counted as complexity holds
+// complex:true for families whose reasons never justified it. The flag is
+// OR-merged across observations, so it could never clear on its own and the
+// family stayed unable to render a rule forever. Loading re-derives it.
+test('a stored complex flag is re-derived from the reasons that justify it', (t) => {
+  const home = tempHome(t);
+  const statePath = path.join(home, '.claude', 'wildcarding', 'auto-learn-state.json');
+  fs.mkdirSync(path.dirname(statePath), { recursive: true });
+  fs.writeFileSync(statePath, `${JSON.stringify({
+    version: 1, mode: 'recommend', threshold: 3,
+    candidates: {
+      'bash:git status': {
+        key: 'bash:git status', tool: 'Bash', kind: 'shell', shell: 'bash',
+        root: 'git', prefix: ['git', 'status'], claudePermission: 'Bash(git status *)',
+        risk: 'read-only', baseAutoSafe: true, complex: true,
+        reasons: ['compound-command', 'known-read-only-git-operation'],
+        sources: ['claude'], counts: { success: 5, failed: 0, unknown: 0, total: 5 },
+      },
+      'bash:eval': {
+        key: 'bash:eval', tool: 'Bash', kind: 'shell', shell: 'bash',
+        root: 'eval', prefix: ['eval'], claudePermission: null,
+        risk: 'shell', baseAutoSafe: false, complex: true,
+        reasons: ['reserved-keyword', 'shell-structure'],
+        sources: ['claude'], counts: { success: 5, failed: 0, unknown: 0, total: 5 },
+      },
+    },
+    observationHashes: {}, cursors: {},
+    applied: { claude: [], codex: [] }, reviewed: { claude: [], codex: [] },
+    codexTargets: {}, managedClaude: {}, lastScanAt: null, lastScanStats: null,
+    lastApplication: null,
+  }, null, 2)}\n`);
+
+  const manager = createAutoLearnManager({ home, threshold: 3, codexRulesPath: null });
+  const listed = manager.listCandidates();
+
+  // A chain is not the family's own complexity, so the flag is dropped and the
+  // family can render again.
+  const healed = listed.find((item) => item.key === 'bash:git status');
+  assert.equal(healed.complex, false);
+  assert.deepEqual(healed.eligibleTargets, ['claude']);
+
+  // A reason that does justify it keeps the flag, so healing is not blanket
+  // forgiveness.
+  const kept = listed.find((item) => item.key === 'bash:eval');
+  assert.equal(kept.complex, true);
+  assert.deepEqual(kept.eligibleTargets, []);
+});
+
+// Regression: eligibility asked whether a prefix_rule could be rendered, while
+// the merge step refuses text its own validator rejects. A bare `curl` prefix
+// renders fine and is unwritable, so offering it failed the whole atomic
+// application and applied nothing, including the rows that were valid.
+test('a candidate the Codex writer would refuse is never offered as eligible', (t) => {
+  const home = tempHome(t);
+  const statePath = path.join(home, '.claude', 'wildcarding', 'auto-learn-state.json');
+  fs.mkdirSync(path.dirname(statePath), { recursive: true });
+  const family = (key, root, permission) => ({
+    key, tool: 'Bash', kind: 'shell', shell: 'bash', root, prefix: [root],
+    claudePermission: permission, risk: 'read-only', baseAutoSafe: true, complex: false,
+    reasons: ['known-read-only-command'], sources: ['claude'],
+    counts: { success: 5, failed: 0, unknown: 0, total: 5 },
+  });
+  fs.writeFileSync(statePath, `${JSON.stringify({
+    version: 1, mode: 'recommend', threshold: 3,
+    candidates: {
+      'bash:curl': family('bash:curl', 'curl', 'Bash(curl *)'),
+      'bash:wc': family('bash:wc', 'wc', 'Bash(wc *)'),
+    },
+    observationHashes: {}, cursors: {},
+    applied: { claude: [], codex: [] }, reviewed: { claude: [], codex: [] },
+    codexTargets: {}, managedClaude: {}, lastScanAt: null, lastScanStats: null,
+    lastApplication: null,
+  }, null, 2)}\n`);
+
+  const rules = path.join(home, '.codex', 'rules', 'permission-wildcarding.rules');
+  const manager = createAutoLearnManager({ home, threshold: 3, codexRulesPath: rules });
+  const listed = manager.listCandidates();
+
+  // The renderer is not the gate: it does emit a rule for curl. The writer's
+  // own validator is, which is why eligibility has to consult it.
+  const { renderCodexRules, validateCodexRulesText } = require('../src/policy-exporters');
+  const curlText = renderCodexRules([listed.find((i) => i.key === 'bash:curl')], { includeReviewed: true });
+  assert.match(curlText, /prefix_rule\(/);
+  assert.equal(validateCodexRulesText(curlText).valid, false);
+
+  assert.deepEqual(listed.find((i) => i.key === 'bash:curl').eligibleTargets, []);
+  assert.ok(listed.find((i) => i.key === 'bash:wc').eligibleTargets.includes('codex'));
+});
