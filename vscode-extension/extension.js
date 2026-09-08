@@ -856,10 +856,24 @@ function invalidateAutoLearnManager() {
   autoLearnCardCache = null;
 }
 
+// The worker is spawned by PATH, so the Module._load redirect a test installs
+// cannot reach it: `./src/` exists only in a packaged extension, where
+// scripts/package.mjs copies repo-root src/ next to this file, and is generated
+// and gitignored in the repository. Same split requireShared() handles in
+// autoLearnUi.js. Without the fallback a scan dies with MODULE_NOT_FOUND on any
+// fresh checkout, which is CI (npm test runs before packaging) and anyone
+// debugging the extension from source.
+function autoLearnWorkerPath() {
+  const packaged = path.join(__dirname, 'src', 'auto-learn-worker.js');
+  if (fs.existsSync(packaged)) return packaged;
+  const repository = path.join(__dirname, '..', 'src', 'auto-learn-worker.js');
+  return fs.existsSync(repository) ? repository : packaged;
+}
+
 function getAutoLearnWorkerRunner() {
   if (!autoLearnWorkerRunner) {
     autoLearnWorkerRunner = createAutoLearnWorkerRunner({
-      workerPath: path.join(__dirname, 'src', 'auto-learn-worker.js'),
+      workerPath: autoLearnWorkerPath(),
       optionsProvider: () => autoLearnManagerOptions(),
       onMutation: () => invalidateAutoLearnManager(),
     });
