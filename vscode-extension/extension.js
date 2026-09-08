@@ -35,7 +35,7 @@ const { gatesStatusAll, setGatesAll, readCompiled, compiledPath } = require('./s
 const {
   applicationSummary, candidatePendingTargets, claudeDecisionExplanation,
   claudePermissionDecision, codexCheckVariants, codexExecpolicyArgs, codexRestartSuffix,
-  isCandidateComplete, managedBlockedDetail, managedBlockedNote,
+  isCandidateComplete, managedBlockedDetail, managedBlockedNote, managedPromptExplanation,
   policyTargetLabel, reviewableCandidates, selectionsNeedingConfirmation,
   uniqueTargets,
 } = require('./autoLearnUi');
@@ -1307,6 +1307,33 @@ function windowsPowerShellExecutable() {
   return fs.existsSync(executable) ? executable : null;
 }
 
+// Reachable whatever Review is showing. The detail used to hang off the
+// "no candidates" toast, which is the one situation where nobody is being
+// prompted: a busy list is exactly when you want to know which prompts cannot be
+// fixed, and that was the case with no route to the answer.
+function showAutoLearnBlocked() {
+  let managed;
+  try { managed = managerStatus(getAutoLearnManager()).managed; }
+  catch (error) {
+    vscode.window.showErrorMessage(`Auto Learn could not read its state: ${error.message}`);
+    return;
+  }
+  const blocked = (managed && managed.inertFamilies) || [];
+  if (!managed || (managed.policy === 'absent' && !blocked.length)) {
+    vscode.window.showInformationMessage(
+      'Auto Learn: no managed policy is present, so nothing is blocked by one.');
+    return;
+  }
+  if (!managed.degraded && !blocked.length && !(managed.deadAllowEntries || []).length) {
+    vscode.window.showInformationMessage(
+      'Auto Learn: no command family is blocked by your managed policy.');
+    return;
+  }
+  const channel = vscode.window.createOutputChannel('Permission Wildcarding');
+  for (const line of managedBlockedDetail(managed)) channel.appendLine(line);
+  channel.show(true);
+}
+
 async function explainAutoLearnPrompt() {
   const agentPick = await vscode.window.showQuickPick([
     { label: 'Claude Code', value: 'claude', description: 'Evaluate deny, ask, and allow precedence' },
@@ -1345,7 +1372,16 @@ async function explainAutoLearnPrompt() {
       const learned = candidates.get(candidateKey(invocation));
       const assessment = claudePermissionDecision(settings, exact);
       let explanation = claudeDecisionExplanation(assessment);
-      if (assessment.decision === 'allow') {
+      // Name the managed rule rather than gesturing at "org policy". A managed
+      // ask is the single most likely reason a command whose allow entry matches
+      // is still prompting, and it is knowable from the cached policy, so
+      // pointing at the server-side capability list below was naming the wrong
+      // cause: those restrictions have nothing to do with a command prompt.
+      let managedNote = null;
+      try { managedNote = managedPromptExplanation(getAutoLearnManager().explainManaged(exact)); }
+      catch { /* Policy analysis is best-effort; the precedence answer still stands. */ }
+      if (managedNote) explanation += `\n${managedNote}`;
+      else if (assessment.decision === 'allow') {
         explanation += ' If Claude still prompted, org policy is the remaining explanation — see below.';
       }
       return `${exact}\n${explanation}\nLearner: ${learnedCandidateExplanation(
@@ -1626,7 +1662,8 @@ function activate(context) {
     vscode.commands.registerCommand('permission-wildcarding.autoLearnApplySafe', () => applyAutoLearnSafe()),
     vscode.commands.registerCommand('permission-wildcarding.autoLearnUndo', () => undoAutoLearn()),
     vscode.commands.registerCommand('permission-wildcarding.autoLearnCycleMode', () => cycleAutoLearnMode()),
-    vscode.commands.registerCommand('permission-wildcarding.autoLearnWhy', () => explainAutoLearnPrompt())
+    vscode.commands.registerCommand('permission-wildcarding.autoLearnWhy', () => explainAutoLearnPrompt()),
+    vscode.commands.registerCommand('permission-wildcarding.autoLearnShowBlocked', () => showAutoLearnBlocked())
   );
 
   // Rebuild the recall (CPU bge-small) vector cache from the Memory card.

@@ -667,6 +667,20 @@ function createAutoLearnManager(options = {}) {
       verdicts, inertFamilies, deadAllowEntries: deadAllowEntries(policy),
     };
   }
+  // Why a single pasted command is still prompting. "Your allow rule matches, so
+  // this should not have prompted" is the wrong answer whenever a managed ask
+  // covers the command, and it is the answer the caller would otherwise give,
+  // because a user allow entry really does match. Reading the policy is the only
+  // way to name the actual cause.
+  function explainManaged(permission) {
+    const policy = managedPolicy();
+    return {
+      policy: policy.unreadable ? 'unreadable' : (policy.present ? 'present' : 'absent'),
+      degraded: Boolean(policy.unreadable),
+      verdict: assessPermission(policy, permission),
+      override: overridingRule(policy, permission),
+    };
+  }
   function status() {
     return statusFrom(load());
   }
@@ -1146,7 +1160,7 @@ function createAutoLearnManager(options = {}) {
       claudeSettings: claudeSettingsPath, claudeClaims: claudeClaimsPath,
       codexRules: codexRulesPath,
     },
-    scan, status, getStatus: status, overview,
+    scan, status, getStatus: status, overview, explainManaged,
     listCandidates, list: listCandidates, getCandidates: listCandidates,
     setMode, apply: applyPolicy, applyClaude, applyCodex, undo,
   };

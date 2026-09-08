@@ -52,7 +52,8 @@ test('the Review command names families a managed rule blocks, and offers the de
     version: 1, mode: 'recommend', threshold: 3,
     candidates: {
       'bash:curl': family('bash:curl', ['curl'], 'Bash(curl *)', 55),
-      'bash:git push': family('bash:git push', ['git', 'push'], 'Bash(git push *)', 16),
+      // One run, so the singular is exercised through the real command too.
+      'bash:git push': family('bash:git push', ['git', 'push'], 'Bash(git push *)', 1),
     },
     observationHashes: {}, cursors: {},
     applied: { claude: [], codex: [] }, reviewed: { claude: [], codex: [] },
@@ -146,7 +147,6 @@ test('the Review command names families a managed rule blocks, and offers the de
     const last = infos.at(-1);
     assert.ok(last, 'the Review command reported something');
     assert.match(last.message, /2 blocked by managed policy/);
-    assert.match(last.message, /no rule written here can stop those prompts/);
     assert.deepEqual(last.actions, ['Show blocked'],
       'the detail has to be reachable, not just counted');
 
@@ -155,7 +155,8 @@ test('the Review command names families a managed rule blocks, and offers the de
     assert.equal(shown, true, 'the channel is revealed, not written to in silence');
     const detail = channelLines.join('\n');
     assert.match(detail, /Bash\(curl \*\) — 55 successful runs — managed ask: Bash\(curl:\*\)/);
-    assert.match(detail, /Bash\(git push \*\) — 16 successful runs — managed ask: Bash\(git push:\*\)/);
+    assert.match(detail, /Bash\(git push \*\) — 1 successful run — managed ask: Bash\(git push:\*\)/);
+    assert.doesNotMatch(detail, /1 successful runs/);
     // And the dead grant already sitting in settings.json.
     assert.match(detail, /Allow entries already in your settings/);
     assert.match(detail, /Bash\(curl \*\) — managed ask: Bash\(curl:\*\)/);
@@ -163,6 +164,20 @@ test('the Review command names families a managed rule blocks, and offers the de
     // Reporting is not deleting: the entry is still in the user's file.
     const settings = JSON.parse(fs.readFileSync(path.join(tempHome, '.claude', 'settings.json'), 'utf8'));
     assert.deepEqual(settings.permissions.allow, ['Bash(curl *)']);
+
+    // The standalone command is the real fix. Hanging the detail off the
+    // "no candidates" toast made it unreachable in the only situation that
+    // matters: a busy review list on a machine that keeps getting prompted.
+    // It must produce the same detail with no dependence on Review's state.
+    channelLines.length = 0;
+    shown = false;
+    assert.equal(commands.has('permission-wildcarding.autoLearnShowBlocked'), true,
+      'the command is registered, or the picker title names something unrunnable');
+    await commands.get('permission-wildcarding.autoLearnShowBlocked')();
+    assert.equal(shown, true);
+    const direct = channelLines.join('\n');
+    assert.match(direct, /Bash\(curl \*\) — 55 successful runs — managed ask: Bash\(curl:\*\)/);
+    assert.match(direct, /Bash\(git push \*\) — 1 successful run — managed ask: Bash\(git push:\*\)/);
   } finally {
     // deactivate() has to run even when an assertion above throws. activate()
     // starts interval timers, and leaving them alive keeps the test process up

@@ -227,7 +227,10 @@ function managedBlockedNote(managed) {
   if (summary.degraded) return ' (managed policy unreadable — the blocked-family check did not run)';
   const blocked = Array.isArray(summary.inertFamilies) ? summary.inertFamilies : [];
   if (!blocked.length) return '';
-  return ` (${blocked.length} blocked by managed policy — no rule written here can stop those prompts)`;
+  // A count with no route to the list is a dead end, and a quick-pick title
+  // cannot be clicked, so name the command that shows it.
+  return ` (${blocked.length} blocked by managed policy — run "Auto Learn - Show families blocked` +
+    ' by managed policy")';
 }
 
 // The detail behind that note. Names the managed rule, because a verdict alone
@@ -261,11 +264,36 @@ function managedBlockedDetail(managed) {
   return lines;
 }
 
+// The managed half of "why did this prompt?". A user allow entry really does
+// match, so the precedence answer alone reads as "this should not have
+// prompted", which is worse than saying nothing: it sends the reader looking for
+// a bug in their own settings. Name the managed rule instead. Returns null when
+// the policy has nothing to say, so the caller adds no paragraph.
+function managedPromptExplanation(explanation) {
+  const managed = explanation || {};
+  if (managed.degraded) return 'Your managed policy file could not be parsed, so it could not be ' +
+    'checked. A managed rule may still be the cause.';
+  if (managed.policy !== 'present') return null;
+  if (!managed.override) {
+    return managed.verdict === 'redundant'
+      ? 'A managed allow rule already covers this command, so the local grant was never needed.'
+      : null;
+  }
+  const { decision, rule } = managed.override;
+  return `Your managed policy ${decision === 'deny' ? 'DENIES' : 'ASKS on'} this command: ${rule}\n` +
+    'Managed settings outrank user settings and evaluate deny, then ask, then allow, so this ' +
+    'wins no matter what your allow list says.' +
+    (decision === 'deny'
+      ? ' No rule you can write will permit it.'
+      : ' No rule you can write will stop the prompt, and "don\'t ask again" cannot either.');
+}
+
 module.exports = {
   applicationSummary,
   candidateAppliedTargets,
   managedBlockedNote,
   managedBlockedDetail,
+  managedPromptExplanation,
   reviewableCandidates,
   candidateEligibleTargets,
   candidatePendingTargets,

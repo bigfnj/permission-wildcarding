@@ -421,6 +421,15 @@ Bash(<root> *) — 12 successful runs — managed ask: Bash(<root>:*)
 (Illustrative. As elsewhere in this repository, a real managed policy's rules are an employer's
 internal security configuration and are not reproduced here.)
 
+That list is a palette command, **Auto Learn - Show families blocked by managed policy**, so it is
+reachable whatever Review is showing. It first hung off the "no candidates" notification, which is
+the one moment nobody is being prompted; a busy review list is exactly when you want to know which
+prompts cannot be fixed.
+
+**Auto Learn - Why did this prompt?** names the managed rule too. Before, a command whose allow
+entry matched was reported as `ALLOW` with a vague pointer at org policy, which is the wrong cause
+and implies a fix (write a rule) that cannot work.
+
 The same report lists allow entries already in your `settings.json` that those rules outrank.
 They are reported and **never removed**: the managed file is a client-refreshed cache, and
 deleting a live grant because a stale copy calls it dead is the worse failure. `--learn status`

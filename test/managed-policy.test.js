@@ -242,6 +242,29 @@ test('status reports which families a managed rule blocks, and which grants are 
   assert.deepEqual(after.permissions.allow, startingAllow);
 });
 
+test('explainManaged answers for one pasted command, not just learned families', (t) => {
+  const { home } = reportHome(t, MANAGED, []);
+  const manager = createAutoLearnManager({ home, threshold: 3, codexRulesPath: null });
+
+  // The command need not be a learned family: "why did this prompt?" is asked
+  // about whatever the user just pasted.
+  assert.deepEqual(manager.explainManaged('Bash(docker compose up *)'), {
+    policy: 'present', degraded: false, verdict: 'inert',
+    override: { decision: 'ask', rule: 'Bash(docker:*)' },
+  });
+  assert.deepEqual(manager.explainManaged('Bash(rg *)'), {
+    policy: 'present', degraded: false, verdict: 'effective', override: null,
+  });
+  assert.equal(manager.explainManaged('Bash(head *)').verdict, 'redundant');
+
+  const broken = reportHome(t, '{ not json', []);
+  const degraded = createAutoLearnManager({ home: broken.home, threshold: 3, codexRulesPath: null })
+    .explainManaged('Bash(docker exec *)');
+  assert.equal(degraded.degraded, true);
+  assert.equal(degraded.policy, 'unreadable');
+  assert.equal(degraded.override, null, 'a policy that could not be read overrides nothing');
+});
+
 test('an unreadable managed policy reports degraded, not an all-clear', (t) => {
   const { home } = reportHome(t, '{ not json', ['Bash(docker *)']);
   const manager = createAutoLearnManager({

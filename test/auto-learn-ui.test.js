@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const {
   applicationSummary, candidatePendingTargets, claudeDecisionExplanation,
   claudePermissionDecision, codexCheckVariants, codexExecpolicyArgs, codexRestartSuffix,
-  isCandidateComplete, managedBlockedDetail, managedBlockedNote,
+  isCandidateComplete, managedBlockedDetail, managedBlockedNote, managedPromptExplanation,
   policyTargetLabel, reviewableCandidates,
 } = require('../vscode-extension/autoLearnUi');
 
@@ -246,6 +246,55 @@ test('Review names the families a managed rule blocks, and the rule that blocks 
   assert.match(detail, /Allow entries already in your settings/);
   assert.match(detail, /cache/);
   assert.match(detail, /deleting a live grant/);
+});
+
+test('the blocked note names a command that can actually show the list', () => {
+  // A quick-pick title cannot be clicked, so a bare count is a dead end. The
+  // title has to name the command, and that command has to exist: this string
+  // is checked against package.json by the contribution test below.
+  const note = managedBlockedNote(BLOCKED);
+  assert.match(note, /Auto Learn - Show families blocked by managed policy/);
+
+  const pkg = require('../vscode-extension/package.json');
+  const titles = pkg.contributes.commands.map((entry) => entry.title);
+  assert.ok(titles.includes('Permission Wildcarding: Auto Learn - Show families blocked by managed policy'),
+    'the note points at a command the palette does not contribute');
+});
+
+test('"why did this prompt" names the managed rule instead of gesturing at org policy', () => {
+  // The reason this matters: the user's allow entry genuinely matches, so the
+  // precedence answer alone reads as "this should not have prompted".
+  const asked = managedPromptExplanation({
+    policy: 'present', degraded: false, verdict: 'inert',
+    override: { decision: 'ask', rule: 'Bash(curl:*)' },
+  });
+  assert.match(asked, /Bash\(curl:\*\)/);
+  assert.match(asked, /ASKS on this command/);
+  assert.match(asked, /don't ask again/, 'the useless remedy has to be ruled out by name');
+
+  const denied = managedPromptExplanation({
+    policy: 'present', degraded: false, verdict: 'inert',
+    override: { decision: 'deny', rule: 'Bash(rm -rf /:*)' },
+  });
+  assert.match(denied, /DENIES this command/);
+  assert.match(denied, /No rule you can write will permit it/);
+
+  // Nothing to say means no paragraph, so an ordinary prompt is not padded with
+  // a managed-policy theory that does not apply.
+  assert.equal(managedPromptExplanation({
+    policy: 'present', degraded: false, verdict: 'effective', override: null,
+  }), null);
+  assert.equal(managedPromptExplanation({ policy: 'absent', degraded: false, override: null }), null);
+  assert.equal(managedPromptExplanation(null), null);
+
+  // Redundant is worth saying: the grant was never needed.
+  assert.match(managedPromptExplanation({
+    policy: 'present', degraded: false, verdict: 'redundant', override: null,
+  }), /already covers this command/);
+
+  // Degraded cannot pass as "no managed rule applies".
+  assert.match(managedPromptExplanation({ policy: 'unreadable', degraded: true, override: null }),
+    /could not be parsed/);
 });
 
 test('nothing blocked says nothing, and an unreadable policy refuses to say all-clear', () => {
