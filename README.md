@@ -408,6 +408,26 @@ none reaches Codex, whose policy is an argv prefix for a program it executes.
 Because a deny or ask rule beats a user allow entry, and managed policy can supply either,
 the review list marks a candidate whose grant the current policy would override.
 
+A family a managed rule overrides *entirely* is withheld from the list, because writing that
+rule cannot stop its prompt. Withholding it silently was a defect: the prompts kept arriving
+with nothing in Review to explain them, and an allow entry the user had already written looked
+like it had simply failed. Review now reports the count and, behind **Show blocked**, names each
+family, its observed run count, and the managed rule that outranks it:
+
+```
+Bash(<root> *) — 12 successful runs — managed ask: Bash(<root>:*)
+```
+
+(Illustrative. As elsewhere in this repository, a real managed policy's rules are an employer's
+internal security configuration and are not reproduced here.)
+
+The same report lists allow entries already in your `settings.json` that those rules outrank.
+They are reported and **never removed**: the managed file is a client-refreshed cache, and
+deleting a live grant because a stale copy calls it dead is the worse failure. `--learn status`
+carries all of it under `managed`, with per-verdict counts. When the policy file cannot be
+parsed the report says so and returns null counts rather than a confident zero, so "could not
+check" never reads as "nothing is blocked".
+
 The extension scans at startup, watches both agents' JSONL directories, and reconciles every
 five minutes by default (`autoLearn.intervalMinutes`). A watcher-driven scan is debounced so a
 burst of transcript writes coalesces into one scan once activity settles — `autoLearn.debounceSeconds`

@@ -11,7 +11,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { readPolicy, assessPermission, hookEventAllowed } = require('../src/managed-policy');
+const { readPolicy, assessPermission, overridingRule, hookEventAllowed } = require('../src/managed-policy');
 const { maxLayers } = require('../src/permissions');
 const { createAutoLearnManager } = require('../src/auto-learn-manager');
 
@@ -127,4 +127,143 @@ test('MAX mode reports a hook the managed policy will drop', (t) => {
 
   // An unregistered hook is not "blocked", it is simply off.
   assert.equal(maxLayers({}, { home: policyHome(t, MANAGED) }).hookBlocked, false);
+});
+
+test('the rule that outranks a permission is named, with deny before ask', (t) => {
+  const policy = readPolicy({ home: policyHome(t, MANAGED) });
+
+  // The colon spelling is what the report has to print: it is the string the
+  // reader will search the managed file for.
+  assert.deepEqual(overridingRule(policy, 'Bash(docker exec *)'),
+    { decision: 'ask', rule: 'Bash(docker:*)' });
+  assert.deepEqual(overridingRule(policy, 'Bash(rm -rf / *)'),
+    { decision: 'deny', rule: 'Bash(rm -rf /:*)' });
+
+  // Nothing to report is null, not an empty object: a grant that works must
+  // not show up in a list of grants that cannot.
+  assert.equal(overridingRule(policy, 'Bash(rg *)'), null);
+  assert.equal(overridingRule(policy, 'Bash(head *)'), null, 'a managed allow does not outrank');
+  assert.equal(overridingRule(policy, 'PowerShell(docker exec *)'), null, 'managed rules name Bash');
+  // Broader than the rule, so the rule does not cover every command it matches.
+  assert.equal(overridingRule(policy, 'Bash(git remote *)'), null);
+
+  // Not a command rule at all. deadAllowEntries walks the entire allow list,
+  // which carries Read, Edit, WebFetch and mcp__ entries, so anything truthy
+  // here would report every one of them as a dead grant. Note the managed ask
+  // does contain Read(**/.env*): the answer is still null, because a rule this
+  // module cannot model is one it must not claim to have assessed.
+  assert.equal(overridingRule(policy, 'Read(**/.env*)'), null);
+  assert.equal(overridingRule(policy, 'WebFetch(domain:example.com)'), null);
+  assert.equal(overridingRule(policy, 'mcp__context7__query-docs'), null);
+  assert.equal(overridingRule(policy, 'not a rule at all'), null);
+
+  // Precedence is deny, then ask, and a policy can carry both for one command.
+  const both = readPolicy({
+    home: policyHome(t, { permissions: { deny: ['Bash(docker:*)'], ask: ['Bash(docker:*)'] } }),
+  });
+  assert.deepEqual(overridingRule(both, 'Bash(docker exec *)'),
+    { decision: 'deny', rule: 'Bash(docker:*)' });
+
+  const absent = readPolicy({ home: policyHome(t, undefined) });
+  assert.equal(overridingRule(absent, 'Bash(docker *)'), null);
+});
+
+// The verdict was already computed for every candidate and read by nothing, so
+// a blocked family left Review silently while its prompts kept arriving. These
+// two tests are the report that replaces the silence.
+function reportHome(t, policy, allow) {
+  const home = policyHome(t, policy);
+  const statePath = path.join(home, '.claude', 'wildcarding', 'auto-learn-state.json');
+  fs.mkdirSync(path.dirname(statePath), { recursive: true });
+  fs.writeFileSync(path.join(home, '.claude', 'settings.json'),
+    `${JSON.stringify({ permissions: { allow } }, null, 2)}\n`);
+  const family = (key, tokens, permission, runs) => ({
+    key, tool: 'Bash', kind: 'shell', shell: 'bash', root: tokens[0], prefix: tokens,
+    claudePermission: permission, risk: 'read-only', baseAutoSafe: false, complex: false,
+    reasons: ['known-read-only-command'], sources: ['claude'],
+    counts: { success: runs, failed: 0, unknown: 0, total: runs },
+  });
+  fs.writeFileSync(statePath, `${JSON.stringify({
+    version: 1, mode: 'recommend', threshold: 3,
+    candidates: {
+      // Run counts deliberately disagree with alphabetical order, so an
+      // assertion on the ordering cannot be satisfied by sorting on the key.
+      'bash:git push': family('bash:git push', ['git', 'push'], 'Bash(git push *)', 9),
+      'bash:docker exec': family('bash:docker exec', ['docker', 'exec'], 'Bash(docker exec *)', 4),
+      'bash:head': family('bash:head', ['head'], 'Bash(head *)', 5),
+    },
+    observationHashes: {}, cursors: {},
+    applied: { claude: [], codex: [] }, reviewed: { claude: [], codex: [] },
+    codexTargets: {}, managedClaude: {}, lastScanAt: null, lastScanStats: null, lastApplication: null,
+  }, null, 2)}\n`);
+  return { home, settingsPath: path.join(home, '.claude', 'settings.json') };
+}
+
+test('status reports which families a managed rule blocks, and which grants are already dead', (t) => {
+  // Controls, so the report is shown to be selective: one live command grant,
+  // and two non-command rules of the kind every real allow list carries. The
+  // Read entry is covered by the managed ask and must still not be reported,
+  // because this module does not model non-command specifier grammars.
+  const startingAllow = [
+    'Bash(docker *)', 'Bash(rg *)', 'Bash(git push *)',
+    'Read(**/.env*)', 'WebFetch(domain:example.com)',
+  ];
+  const { home, settingsPath } = reportHome(t, MANAGED, startingAllow);
+  const manager = createAutoLearnManager({
+    home, threshold: 3,
+    codexRulesPath: path.join(home, '.codex', 'rules', 'permission-wildcarding.rules'),
+  });
+  const { managed } = manager.status();
+
+  assert.equal(managed.policy, 'present');
+  assert.equal(managed.degraded, false);
+  assert.deepEqual(managed.verdicts,
+    { inert: 2, partial: 0, redundant: 1, effective: 0, unknown: 0 });
+
+  // Ordered by observed runs: the family costing the most prompts is the one
+  // worth explaining first.
+  assert.deepEqual(managed.inertFamilies.map((entry) => entry.key),
+    ['bash:git push', 'bash:docker exec']);
+  assert.deepEqual(managed.inertFamilies[0], {
+    key: 'bash:git push', permission: 'Bash(git push *)', runs: 9,
+    decision: 'ask', rule: 'Bash(git push:*)',
+  });
+
+  // Entries the user already wrote that the same rules outrank. `Bash(rg *)` is
+  // live and must not appear.
+  assert.deepEqual(managed.deadAllowEntries, [
+    { permission: 'Bash(docker *)', decision: 'ask', rule: 'Bash(docker:*)' },
+    { permission: 'Bash(git push *)', decision: 'ask', rule: 'Bash(git push:*)' },
+  ]);
+
+  // Reported, never removed. The policy file is a client-refreshed cache, so
+  // deleting a grant because a stale copy calls it dead is the worse failure.
+  const after = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+  assert.deepEqual(after.permissions.allow, startingAllow);
+});
+
+test('an unreadable managed policy reports degraded, not an all-clear', (t) => {
+  const { home } = reportHome(t, '{ not json', ['Bash(docker *)']);
+  const manager = createAutoLearnManager({
+    home, threshold: 3,
+    codexRulesPath: path.join(home, '.codex', 'rules', 'permission-wildcarding.rules'),
+  });
+  const { managed } = manager.status();
+
+  assert.equal(managed.policy, 'unreadable');
+  assert.equal(managed.degraded, true);
+  assert.ok(managed.error, 'the parse failure is carried, not swallowed');
+  // A zero here would read as "nothing is blocked" when the truth is "the check
+  // could not run", which is the one confusion this block exists to prevent.
+  assert.equal(managed.verdicts, null);
+  assert.deepEqual(managed.inertFamilies, []);
+  assert.deepEqual(managed.deadAllowEntries, []);
+
+  // Absent is a third state, and it is not degraded: a machine with no managed
+  // policy simply has no file.
+  const clean = reportHome(t, undefined, ['Bash(docker *)']);
+  const absent = createAutoLearnManager({ home: clean.home, threshold: 3 }).status().managed;
+  assert.equal(absent.policy, 'absent');
+  assert.equal(absent.degraded, false);
+  assert.equal(absent.verdicts, null);
 });

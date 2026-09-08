@@ -39,7 +39,10 @@ function rulePrefix(rule) {
   if (!COMMAND_TOOLS.has(tool)) return null;
   const specifier = inner.endsWith(' *') ? inner.slice(0, -2) : inner;
   const tokens = specifier.trim().split(/\s+/).filter(Boolean);
-  return tokens.length ? { tool, tokens } : null;
+  // `text` is kept so a report can name the rule it lost to. A bare verdict
+  // sends the reader hunting through a few hundred managed entries for the one
+  // that beat them.
+  return tokens.length ? { tool, tokens, text: String(rule) } : null;
 }
 
 function coversPrefix(commandTokens, ruleTokens) {
@@ -93,6 +96,23 @@ function assessPermission(policy, permission) {
   return 'effective';
 }
 
+// The specific managed rule that outranks this permission, or null when none
+// does. Same shape and vocabulary as `shadowedByManaged` in policy-guard.js,
+// which answers the question reactively for the wildcarding pass off the raw
+// settings object; this answers it for the learner off the normalized policy,
+// so neither has to adopt the other's reader.
+function overridingRule(policy, permission) {
+  if (!policy || !policy.present) return null;
+  const mine = rulePrefix(permission);
+  if (!mine) return null;
+  const find = (rules) => rules.find((rule) =>
+    rule.tool === mine.tool && coversPrefix(mine.tokens, rule.tokens)) || null;
+  const deny = find(policy.deny);
+  if (deny) return { decision: 'deny', rule: deny.text };
+  const ask = find(policy.ask);
+  return ask ? { decision: 'ask', rule: ask.text } : null;
+}
+
 // True when a user hook on this event is silently dropped, which is how a
 // PreToolUse auto-approve hook can be registered and never run.
 function hookEventAllowed(policy, event) {
@@ -102,5 +122,5 @@ function hookEventAllowed(policy, event) {
 
 module.exports = {
   defaultPolicyPath, readPolicy, rulePrefix, coversPrefix,
-  assessPermission, hookEventAllowed,
+  assessPermission, overridingRule, hookEventAllowed,
 };

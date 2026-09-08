@@ -35,7 +35,8 @@ const { gatesStatusAll, setGatesAll, readCompiled, compiledPath } = require('./s
 const {
   applicationSummary, candidatePendingTargets, claudeDecisionExplanation,
   claudePermissionDecision, codexCheckVariants, codexExecpolicyArgs, codexRestartSuffix,
-  isCandidateComplete, policyTargetLabel, reviewableCandidates, selectionsNeedingConfirmation,
+  isCandidateComplete, managedBlockedDetail, managedBlockedNote,
+  policyTargetLabel, reviewableCandidates, selectionsNeedingConfirmation,
   uniqueTargets,
 } = require('./autoLearnUi');
 
@@ -1082,9 +1083,27 @@ async function reviewAutoLearnCandidates() {
   const coveredNote = covered.length
     ? ` (${covered.length} already covered by existing allow rules — hidden)`
     : '';
+  // A family a managed ask covers is withheld from this list, because no rule
+  // written from here can stop its prompt. Withholding it silently was the
+  // whole problem: the prompts kept arriving with nothing in Review to explain
+  // them, and a grant already in settings.json looked like it had just failed.
+  // The wording lives in autoLearnUi.js, where it is under test.
+  const managed = status.managed || {};
+  const blockedCount = (managed.inertFamilies || []).length;
+  const blockedNote = managedBlockedNote(managed);
+  const showBlockedDetail = () => {
+    const channel = vscode.window.createOutputChannel('Permission Wildcarding');
+    for (const line of managedBlockedDetail(managed)) channel.appendLine(line);
+    channel.show(true);
+  };
   if (!candidates.length) {
     if (scanSummary.appliedCount || scanSummary.changedTargets.length) notifyScanApplication();
-    else {
+    else if (blockedCount || managed.degraded) {
+      vscode.window.showInformationMessage(
+        `Auto Learn: no candidates are ready for review${coveredNote}${blockedNote}.`,
+        'Show blocked'
+      ).then((choice) => { if (choice === 'Show blocked') showBlockedDetail(); });
+    } else {
       vscode.window.showInformationMessage(
         `Auto Learn: no candidates are ready for review${coveredNote}.`
       );
@@ -1109,7 +1128,7 @@ async function reviewAutoLearnCandidates() {
   })), {
     canPickMany: true,
     ignoreFocusOut: true,
-    title: `Auto Learn candidates${coveredNote}`,
+    title: `Auto Learn candidates${coveredNote}${blockedNote}`,
     placeHolder: 'Select command families to add to Claude permissions and validated Codex rules',
   });
   if (!picks?.length) { notifyScanApplication(); return; }

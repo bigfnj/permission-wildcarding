@@ -5,7 +5,8 @@ const assert = require('node:assert/strict');
 const {
   applicationSummary, candidatePendingTargets, claudeDecisionExplanation,
   claudePermissionDecision, codexCheckVariants, codexExecpolicyArgs, codexRestartSuffix,
-  isCandidateComplete, policyTargetLabel, reviewableCandidates,
+  isCandidateComplete, managedBlockedDetail, managedBlockedNote,
+  policyTargetLabel, reviewableCandidates,
 } = require('../vscode-extension/autoLearnUi');
 
 // Regression: the Review badge counted every candidate with a 'review'
@@ -198,4 +199,73 @@ test('coverage is judged per target, so a pending Codex grant is never hidden', 
   }], {}, both, settings);
   assert.equal(noRule.covered.length, 0);
   assert.equal(noRule.candidates.length, 1);
+});
+
+// A managed ask outranks any grant written from here, so those families are
+// withheld from the picker. Withholding them silently was the defect: the
+// prompts keep arriving and Review shows nothing that explains them.
+const BLOCKED = {
+  policy: 'present',
+  path: 'C:\\Users\\x\\.claude\\remote-settings.json',
+  degraded: false,
+  error: null,
+  verdicts: { inert: 2, partial: 0, redundant: 3, effective: 40, unknown: 1 },
+  inertFamilies: [
+    { key: 'bash:curl', permission: 'Bash(curl *)', runs: 55, decision: 'ask', rule: 'Bash(curl:*)' },
+    { key: 'bash:git push', permission: 'Bash(git push *)', runs: 16, decision: 'ask', rule: 'Bash(git push:*)' },
+  ],
+  deadAllowEntries: [
+    { permission: 'Bash(curl *)', decision: 'ask', rule: 'Bash(curl:*)' },
+  ],
+};
+
+test('Review names the families a managed rule blocks, and the rule that blocks them', () => {
+  const note = managedBlockedNote(BLOCKED);
+  assert.match(note, /2 blocked by managed policy/);
+
+  const detail = managedBlockedDetail(BLOCKED).join('\n');
+  // The rule string is the point: a bare verdict leaves the reader hunting
+  // through a few hundred managed entries for the one that beat them.
+  assert.match(detail, /Bash\(curl \*\) — 55 successful runs — managed ask: Bash\(curl:\*\)/);
+  assert.match(detail, /Bash\(git push \*\) — 16 successful runs — managed ask: Bash\(git push:\*\)/);
+
+  // A family with exactly one run is common on this list, and "1 successful
+  // runs" is the kind of thing that makes a report look unmaintained.
+  const single = managedBlockedDetail({
+    policy: 'present', degraded: false,
+    inertFamilies: [
+      { key: 'bash:git merge', permission: 'Bash(git merge *)', runs: 1, decision: 'ask', rule: 'Bash(git merge:*)' },
+    ],
+    deadAllowEntries: [],
+  }).join('\n');
+  assert.match(single, /Bash\(git merge \*\) — 1 successful run — managed ask/);
+  assert.doesNotMatch(single, /1 successful runs/);
+
+  // The dead grant is reported and the text says why it was left alone, so
+  // nobody reads the report as a deletion that failed.
+  assert.match(detail, /Allow entries already in your settings/);
+  assert.match(detail, /cache/);
+  assert.match(detail, /deleting a live grant/);
+});
+
+test('nothing blocked says nothing, and an unreadable policy refuses to say all-clear', () => {
+  const clean = { policy: 'present', degraded: false, inertFamilies: [], deadAllowEntries: [] };
+  assert.equal(managedBlockedNote(clean), '', 'no note when there is nothing to report');
+  assert.equal(managedBlockedNote({}), '');
+  assert.equal(managedBlockedNote(null), '');
+
+  // Degraded and clean must never look alike: "could not check" is not "found
+  // nothing". The note has to fire even though inertFamilies is empty.
+  const broken = {
+    policy: 'unreadable', degraded: true, error: 'Unexpected token n',
+    verdicts: null, inertFamilies: [], deadAllowEntries: [],
+  };
+  const note = managedBlockedNote(broken);
+  assert.match(note, /unreadable/);
+  assert.doesNotMatch(note, /0 blocked/);
+  const detail = managedBlockedDetail(broken).join('\n');
+  assert.match(detail, /nothing below was checked/);
+  assert.match(detail, /Unexpected token n/, 'the parse error is carried, not swallowed');
+  assert.doesNotMatch(detail, /Blocked command families/,
+    'a heading over an empty list would read as a clean bill');
 });

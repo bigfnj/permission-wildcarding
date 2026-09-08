@@ -215,9 +215,57 @@ function reviewableCandidates(candidates, status = {}, requiredTargets = ['claud
   return { ready, covered, candidates: ready.filter((candidate) => !isCovered(candidate)) };
 }
 
+// What Review has to say about the families it cannot offer at all. A managed
+// ask outranks any grant written from here, so such a family is withheld from
+// the picker; withholding it *silently* was the defect. The prompts keep
+// arriving, Review shows nothing, and an allow entry the user already wrote
+// looks like it simply failed.
+function managedBlockedNote(managed) {
+  const summary = managed || {};
+  // Degraded must announce itself. Unreadable means the check did not run,
+  // which is not the same answer as nothing being blocked.
+  if (summary.degraded) return ' (managed policy unreadable — the blocked-family check did not run)';
+  const blocked = Array.isArray(summary.inertFamilies) ? summary.inertFamilies : [];
+  if (!blocked.length) return '';
+  return ` (${blocked.length} blocked by managed policy — no rule written here can stop those prompts)`;
+}
+
+// The detail behind that note. Names the managed rule, because a verdict alone
+// leaves the reader hunting through a few hundred entries for the one that beat
+// them.
+function managedBlockedDetail(managed) {
+  const summary = managed || {};
+  const lines = [`Managed policy: ${summary.path || 'none on disk'}`, ''];
+  if (summary.degraded) {
+    lines.push(`Could not parse this file, so nothing below was checked: ${summary.error || 'unknown error'}`);
+    return lines;
+  }
+  const blocked = Array.isArray(summary.inertFamilies) ? summary.inertFamilies : [];
+  lines.push('Blocked command families (a managed rule outranks any grant written here):');
+  if (!blocked.length) lines.push('  none');
+  for (const family of blocked) {
+    const runs = `${family.runs} successful ${family.runs === 1 ? 'run' : 'runs'}`;
+    lines.push(`  ${family.permission} — ${runs} — managed ${family.decision}: ${family.rule}`);
+  }
+  const dead = Array.isArray(summary.deadAllowEntries) ? summary.deadAllowEntries : [];
+  if (dead.length) {
+    lines.push('');
+    lines.push('Allow entries already in your settings that the same rules outrank.');
+    lines.push('Left in place deliberately: this policy file is a client-refreshed cache,');
+    lines.push('and deleting a live grant because a stale copy calls it dead is the worse');
+    lines.push('failure. Remove them yourself if you want the list shorter.');
+    for (const entry of dead) {
+      lines.push(`  ${entry.permission} — managed ${entry.decision}: ${entry.rule}`);
+    }
+  }
+  return lines;
+}
+
 module.exports = {
   applicationSummary,
   candidateAppliedTargets,
+  managedBlockedNote,
+  managedBlockedDetail,
   reviewableCandidates,
   candidateEligibleTargets,
   candidatePendingTargets,

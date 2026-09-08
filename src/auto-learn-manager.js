@@ -14,7 +14,7 @@ const { aggregateObservations, isAutoSafeCandidate, COMPLEX_REASONS } = require(
 const { scanHistoryFiles } = require('./history-adapters');
 const { createPolicyLock } = require('./policy-lock');
 const { commandLaunch } = require('./exec-resolve');
-const { readPolicy, assessPermission } = require('./managed-policy');
+const { readPolicy, assessPermission, overridingRule } = require('./managed-policy');
 const {
   renderCodexRules, validateCodexRulesText, renderClaudePermissions, mergeClaudeAllow,
   mergeGeneratedCodexRules,
@@ -612,6 +612,61 @@ function createAutoLearnManager(options = {}) {
     }
     return result.sort((a, b) => a.key.localeCompare(b.key));
   }
+  // Entries already sitting in the user's allow list that a managed rule
+  // overrides. Reported, never removed: this policy file is a client-refreshed
+  // CACHE, and deleting a live grant because a stale copy calls it dead is the
+  // same error with the sign flipped. The module may withhold a proposal, never
+  // widen or revoke one.
+  function deadAllowEntries(policy) {
+    if (!claudeSettingsPath) return [];
+    const now = snapshot(claudeSettingsPath);
+    if (!now.exists) return [];
+    let settings;
+    try { settings = JSON.parse(now.content.toString('utf8').replace(/^\uFEFF/, '')); }
+    catch { return []; }
+    if (!object(settings)) return [];
+    const allow = Array.isArray(settings.permissions?.allow) ? settings.permissions.allow : [];
+    const seen = new Set();
+    const dead = [];
+    for (const entry of allow) {
+      if (typeof entry !== 'string' || seen.has(entry)) continue;
+      seen.add(entry);
+      const override = overridingRule(policy, entry);
+      if (override) dead.push({ permission: entry, ...override });
+    }
+    return dead.sort((a, b) => a.permission.localeCompare(b.permission));
+  }
+  // The verdict was computed for every candidate and read by nothing, so a
+  // family a managed ask blocks just vanished from Review while its prompts
+  // kept arriving, and a grant already written into settings looked like it had
+  // simply failed. Naming the rule that cannot be beaten is the only useful
+  // thing left to say about such a family, so say it.
+  function managedSummary(all) {
+    const policy = managedPolicy();
+    const state = policy.unreadable ? 'unreadable' : (policy.present ? 'present' : 'absent');
+    // Degraded must never read as clean. With no usable policy there is no
+    // verdict to report, so the counts are null rather than a confident zero.
+    if (state !== 'present') return {
+      policy: state, path: policy.path, degraded: state === 'unreadable',
+      error: policy.error || null, verdicts: null, inertFamilies: [], deadAllowEntries: [],
+    };
+    const verdicts = { inert: 0, partial: 0, redundant: 0, effective: 0, unknown: 0 };
+    const inertFamilies = [];
+    for (const item of all) {
+      if (!item.claudePermission) continue;
+      const verdict = assessPermission(policy, item.claudePermission);
+      verdicts[verdict] = (verdicts[verdict] || 0) + 1;
+      if (verdict === 'inert') inertFamilies.push({
+        key: item.key, permission: item.claudePermission, runs: item.counts?.success ?? 0,
+        ...(overridingRule(policy, item.claudePermission) || {}),
+      });
+    }
+    inertFamilies.sort((a, b) => b.runs - a.runs || a.key.localeCompare(b.key));
+    return {
+      policy: state, path: policy.path, degraded: false, error: null,
+      verdicts, inertFamilies, deadAllowEntries: deadAllowEntries(policy),
+    };
+  }
   function status() {
     return statusFrom(load());
   }
@@ -631,6 +686,7 @@ function createAutoLearnManager(options = {}) {
         observe: all.filter((item) => item.disposition === 'observe').length,
       },
       applied: applied(state.applied), appliedKeys,
+      managed: managedSummary(all),
       paths: {
         state: statePath, claudeSettings: claudeSettingsPath,
         claudeClaims: claudeClaimsPath, codexRules: codexRulesPath,
