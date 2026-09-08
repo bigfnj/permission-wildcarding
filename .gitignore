@@ -17,6 +17,11 @@ __pycache__/
 
 CLAUDE.md
 AGENTS.md
+# personal per-repo standing orders, and the agent's local settings. A global
+# ignore covers the latter on one machine only, which protects nobody else on a
+# public repository.
+CLAUDE.local.md
+.claude/settings.local.json
 .codex/
 .cursorrules
 .windsurfrules
