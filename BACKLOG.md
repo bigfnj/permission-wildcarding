@@ -65,6 +65,30 @@ serialize, so this is not urgent. Cursors are the only uncapped structure; they
 accumulate one entry per transcript file ever seen and never shrink when a
 transcript is deleted. Revisit if the file passes roughly 20 MB.
 
+### An older copy of the tool silently drops new state fields
+
+Found 2026-09-09 while smoke-testing `managedHits` on a real machine: the table
+was populated by `--learn hits`, then emptied twice within minutes.
+
+Cause is `persistentState`, which serializes a whitelist of known keys. That is
+the right shape for rejecting junk, but it means any copy of the tool older than
+a field round-trips the state and writes it back without that field. This machine
+had **three** extension versions installed at once (1.2.6, 1.2.7, 1.2.8), each
+activating its own watcher and periodic scan against the same state file, so an
+older bundled copy kept clobbering the newer field. The advisory lock does not
+help: each writer is individually correct and takes the lock properly.
+
+Severity is low because the field is derived, not authoritative, and one
+`--learn hits` rebuilds it. It matters for anything that is NOT reconstructible,
+so a future field that records a human decision (`derivedGuidance.accepted` is
+already one) would be lost the same way with no way back. Two candidate fixes:
+carry unknown top-level keys through `persistentState` untouched, or refuse to
+save when the on-disk `version` is newer than the running code. The second is
+stricter and would have surfaced the multi-install problem immediately.
+
+Worth noting separately that multiple installed extension versions is itself
+worth guarding against, since each one scans on its own timer.
+
 ### Inert bookkeeping candidates
 
 Around a quarter of candidates are complex with no permission, so they can never

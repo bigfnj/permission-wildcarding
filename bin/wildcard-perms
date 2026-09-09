@@ -27,7 +27,9 @@ const LEARN_USAGE = 'usage: wildcard-perms --learn scan|status|apply|undo|hits '
   '[--codex-scope user|workspace|off] [--threshold <count>] ' +
   '[--codex-executable <path>]\n';
 const DRAIN_USAGE = 'usage: wildcard-perms --drain [--workspace <path>] [--dry-run]\n';
-const GUIDANCE_USAGE = 'usage: wildcard-perms --guidance on|off|status\n';
+const GUIDANCE_USAGE = 'usage: wildcard-perms --guidance on|off|status\n' +
+  '       wildcard-perms --guidance derived\n' +
+  '       wildcard-perms --guidance accept|decline|reset <id>\n';
 const GATES_USAGE = 'usage: wildcard-perms --gates on|off|status|refresh\n';
 
 const argv = process.argv.slice(2);
@@ -302,6 +304,37 @@ function guidance(args) {
         `${state.on && !state.current ? ' (older wording — run --guidance on to refresh)' : ''} ` +
         `(${state.readable ? state.path : `unreadable: ${state.path}`})\n`
       );
+    }
+    return;
+  }
+
+  // The derived half. Kept behind its own verbs because it is a different kind
+  // of thing: `on`/`off` install a fixed paragraph, while these three install
+  // advice earned from measured evidence, one item at a time, and nothing is
+  // written until a human names the item.
+  if (cmd === 'derived' || cmd === 'accept' || cmd === 'decline' || cmd === 'reset') {
+    const { createAutoLearnManager } = require('../src/auto-learn-manager');
+    try {
+      // `--workspace` is not cosmetic here: the learner's state is partitioned
+      // per workspace, so defaulting to cwd reads a DIFFERENT state file and
+      // reports an empty review on a machine that has plenty to show.
+      const manager = createAutoLearnManager({
+        workspaceRoot: path.resolve(learnOption(args, '--workspace', process.cwd())),
+      });
+      if (cmd === 'derived') {
+        process.stdout.write(JSON.stringify(manager.derivedReview(), null, 2) + '\n');
+        return;
+      }
+      const id = args[args.indexOf('--guidance') + 2];
+      if (!id) {
+        process.stderr.write(`wildcard-perms --guidance ${cmd}: an id is required. ` +
+          'Run --guidance derived to list them.\n');
+        process.exit(1);
+      }
+      process.stdout.write(JSON.stringify(manager.decideDerived(id, cmd), null, 2) + '\n');
+    } catch (error) {
+      process.stderr.write(`wildcard-perms --guidance ${cmd}: ${error.message}\n`);
+      process.exitCode = 1;
     }
     return;
   }

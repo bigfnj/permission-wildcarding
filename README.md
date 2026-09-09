@@ -20,8 +20,9 @@ subcommand. The safety boundary for the legacy hook is still your
 ## What's here
 
 - **`bin/wildcard-perms`** — the hook executable and CLI (Node); also supports
-  `--learn scan|status|apply|undo`, `--seed`, `--drain [--dry-run]` (project-local
+  `--learn scan|status|apply|undo|hits`, `--seed`, `--drain [--dry-run]` (project-local
   approvals), `--guidance on|off|status` (agent shell style),
+  `--guidance derived|accept|decline|reset` (mitigations earned from measured cost),
   `--gates on|off|status|refresh` (memory gates), `--max on|off|status`
   (MAX mode), and `--bypass on|off|status` (see below).
 - **`src/permissions.js`** — the live Claude allow-list generalization logic, a
@@ -436,6 +437,70 @@ deleting a live grant because a stale copy calls it dead is the worse failure. `
 carries all of it under `managed`, with per-verdict counts. When the policy file cannot be
 parsed the report says so and returns null counts rather than a confident zero, so "could not
 check" never reads as "nothing is blocked".
+
+### Which rules actually cost you prompts
+
+Naming a blocked family is not the same as knowing what it costs, and the report used to be able
+to name only the command half. `rulePrefix` models command tokens, which only `Bash` and
+`PowerShell` have, so every `Read`, `Edit`, `WebFetch` or `mcp__` rule assessed as `unknown` and
+went unreported. Measured on one real ~300-entry allow list, that was 30 of 176 permissions, and it
+hid the single largest prompt source on the machine: a managed `Edit(**/*.ps1)` glob, on a Windows
+box where `.ps1` is application source rather than deploy tooling.
+
+Those now fall through to a whole-string match, the same one `policy-guard.js` always used, plus the
+case no regex expresses: a bare `Edit` rule with no specifier governs every Edit call, so it reads
+`partial` against a managed glob rather than effective.
+
+Cost needs evidence, and the two halves carry it differently. A shell family has its own run count.
+A file tool renders no permission at all, on purpose: inferring a path glob from the paths you
+happened to touch would propose a rule wider than the evidence and would mean keeping those paths.
+So the scan tests each observed path against managed policy while the path is still in hand and
+keeps only the **rule** it matched, which is org policy rather than your data. No path reaches an
+observation or the state file, and one test asserts exactly that.
+
+`managed.costliestRules` ranks both halves together, highest cost first:
+
+```bash
+bin/wildcard-perms --learn hits      # derive the table from the whole corpus, once
+bin/wildcard-perms --learn status    # managed.costliestRules
+```
+
+`--learn hits` exists because cursors mean a normal scan on an established machine sees almost
+nothing new, so the table would start empty and the number worth acting on would take weeks to
+reappear. It reads with empty cursors and discards the ones it produces, so it neither advances nor
+rewinds a scan, and it replaces rather than accumulates.
+
+### Derived guidance: the prompt no rule can stop
+
+A managed `ask` outranks every user allow, so for those rules the wildcard this project writes is
+inert and the prompt is permanent. What is left is behaviour, and behaviour is what an instruction
+file changes. Derived guidance turns a measured cost into the one sentence that reduces it: batch
+the edits, batch the fetches, script the multi-step work, read the gated file once.
+
+```bash
+bin/wildcard-perms --guidance derived              # what the evidence implies, and why
+bin/wildcard-perms --guidance accept <id>          # write that one, in its own marker pair
+bin/wildcard-perms --guidance decline <id>         # never offer it again
+bin/wildcard-perms --guidance reset <id>           # back to pending
+```
+
+Four limits, because this writes into a file you own:
+
+- **Nothing is installed that you did not accept by id.** Deriving is separate from installing.
+- **Nothing derives at install time.** The evidence that justifies a permanent line does not exist
+  until a corpus has been scanned, so a static paragraph shipped at install is the thing this
+  replaces, not the thing it extends.
+- **A rule shape with no known mitigation produces nothing, never filler.** Advice that does not
+  change what the agent does is pure context cost, and it teaches you to skim the block that
+  carries the real rules.
+- **A threshold (50 prompts) and a cap (3 items).** An allow entry is paid for once; a line in an
+  instruction file is paid for on every session forever, so the bar is far higher than the one a
+  single grant has to clear.
+
+Each accepted mitigation lands in its own marker pair, so declining one later removes exactly that
+one. The measured count is written into the text on purpose: it is the justification, so when the
+cost falls below the threshold the block is swept rather than left asserting a number that has
+stopped being true.
 
 The extension scans at startup, watches both agents' JSONL directories, and reconciles every
 five minutes by default (`autoLearn.intervalMinutes`). A watcher-driven scan is debounced so a

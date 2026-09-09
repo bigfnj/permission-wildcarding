@@ -18,6 +18,10 @@ const {
   readPolicy, assessPermission, overridingRule, coversPermission,
 } = require('./managed-policy');
 const {
+  deriveMitigations, derivedStatus, setDerivedGuidance,
+  DEFAULT_THRESHOLD, DEFAULT_LIMIT,
+} = require('./derived-guidance');
+const {
   renderCodexRules, validateCodexRulesText, renderClaudePermissions, mergeClaudeAllow,
   mergeGeneratedCodexRules,
 } = require('./policy-exporters');
@@ -284,6 +288,21 @@ function restoreGrants(state, grants) {
 // Capped because this is a new dimension in a long-lived file. A managed policy
 // carries a few dozen rules, so the limit is generous and hitting it means a
 // bug rather than a workload.
+// Which derived mitigations a human has ruled on. `declined` is not the absence
+// of `accepted`: without it a rejected mitigation would be re-offered on every
+// scan forever, which is how a review list trains its reader to ignore it.
+const DERIVED_ID = /^[a-z0-9-]{1,64}$/;
+function derivedGuidance(value) {
+  const list = (input) => [...new Set((Array.isArray(input) ? input : [])
+    .map((item) => clean(item, 64))
+    .filter((item) => item && DERIVED_ID.test(item)))].sort();
+  const accepted = list(object(value) ? value.accepted : []);
+  const declined = list(object(value) ? value.declined : [])
+    // One decision per id. Accept wins, because it is the state that has already
+    // been written into a file and a contradiction must not silently un-write it.
+    .filter((item) => !accepted.includes(item));
+  return { accepted, declined };
+}
 const MANAGED_HITS_LIMIT = 200;
 function managedHits(value) {
   if (!object(value)) return {};
@@ -321,6 +340,7 @@ function emptyState(mode, threshold) {
     version: VERSION, mode, threshold, candidates: {}, observationHashes: {}, cursors: {},
     applied: { claude: [], codex: [] }, reviewed: { claude: [], codex: [] },
     codexTargets: {}, managedClaude: {}, managedHits: {},
+    derivedGuidance: { accepted: [], declined: [] },
     lastScanAt: null, lastScanStats: null,
     lastApplication: null,
   };
@@ -381,6 +401,7 @@ function sanitizeState(raw, mode, threshold) {
   state.codexTargets = codexTargets(raw.codexTargets);
   state.managedClaude = managedClaude(raw.managedClaude);
   state.managedHits = managedHits(raw.managedHits);
+  state.derivedGuidance = derivedGuidance(raw.derivedGuidance);
   state.lastScanAt = clean(raw.lastScanAt, 64) || null;
   if (object(raw.lastScanStats)) state.lastScanStats = {
     files: Math.max(0, Number(raw.lastScanStats.files) || 0),
@@ -408,6 +429,7 @@ function persistentState(state) {
     applied: applied(state.applied), reviewed: applied(state.reviewed),
     codexTargets: codexTargets(state.codexTargets), managedClaude: managedClaude(state.managedClaude),
     managedHits: managedHits(state.managedHits),
+    derivedGuidance: derivedGuidance(state.derivedGuidance),
     lastScanAt: state.lastScanAt, lastScanStats: state.lastScanStats,
     lastApplication: state.lastApplication,
   };
@@ -764,6 +786,62 @@ function createAutoLearnManager(options = {}) {
       verdict: assessPermission(policy, permission),
       override: overridingRule(policy, permission),
     };
+  }
+  // What the managed report implies the agent should do differently, plus what a
+  // human has already ruled on. Read-only: deriving is separate from installing
+  // so a mitigation can be shown and refused.
+  function derivedReview(request = {}) {
+    const state = load();
+    const current = statusFrom(state);
+    const mitigations = deriveMitigations(current.managed.costliestRules, request);
+    const decided = new Set([...state.derivedGuidance.accepted, ...state.derivedGuidance.declined]);
+    return {
+      threshold: Number.isFinite(request.threshold) ? request.threshold : DEFAULT_THRESHOLD,
+      limit: Number.isFinite(request.limit) ? request.limit : DEFAULT_LIMIT,
+      policy: current.managed.policy, degraded: Boolean(current.managed.degraded),
+      mitigations,
+      pending: mitigations.filter((item) => !decided.has(item.id)),
+      accepted: state.derivedGuidance.accepted.slice(),
+      declined: state.derivedGuidance.declined.slice(),
+      targets: derivedStatus({ home }),
+    };
+  }
+
+  // Record one decision and bring the instruction files in line with it. The
+  // write is a full reconcile rather than an append, so declining something
+  // previously accepted removes it, and a mitigation whose evidence has since
+  // fallen below the threshold is removed even if it is still accepted.
+  function decideDerived(id, decision, request = {}) {
+    return locked(() => {
+      // Validated before any truncation. `clean` would cut an over-long id down
+      // to a legal length and accept it, recording a decision for an id that
+      // cannot exist instead of telling the caller they got it wrong.
+      const key = typeof id === 'string' ? id.trim() : '';
+      if (!DERIVED_ID.test(key)) throw new Error(`Invalid derived mitigation id: ${id}`);
+      if (!['accept', 'decline', 'reset'].includes(decision)) {
+        throw new Error(`Invalid decision: ${decision}`);
+      }
+      const state = load();
+      const accepted = new Set(state.derivedGuidance.accepted);
+      const declined = new Set(state.derivedGuidance.declined);
+      accepted.delete(key);
+      declined.delete(key);
+      if (decision === 'accept') accepted.add(key);
+      if (decision === 'decline') declined.add(key);
+      state.derivedGuidance = derivedGuidance({
+        accepted: [...accepted], declined: [...declined],
+      });
+      save(state);
+      const mitigations = deriveMitigations(statusFrom(state).managed.costliestRules, request);
+      const targets = setDerivedGuidance(mitigations, state.derivedGuidance.accepted,
+        { home, backupDir });
+      return {
+        id: key, decision,
+        accepted: state.derivedGuidance.accepted.slice(),
+        declined: state.derivedGuidance.declined.slice(),
+        targets,
+      };
+    });
   }
   function status() {
     return statusFrom(load());
@@ -1311,6 +1389,7 @@ function createAutoLearnManager(options = {}) {
       codexRules: codexRulesPath,
     },
     scan, status, getStatus: status, overview, explainManaged, rebuildManagedHits,
+    derivedReview, decideDerived,
     listCandidates, list: listCandidates, getCandidates: listCandidates,
     setMode, apply: applyPolicy, applyClaude, applyCodex, undo,
   };
