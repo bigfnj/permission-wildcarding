@@ -318,3 +318,62 @@ test('nothing blocked says nothing, and an unreadable policy refuses to say all-
   assert.doesNotMatch(detail, /Blocked command families/,
     'a heading over an empty list would read as a clean bill');
 });
+
+// The derived-guidance card. An empty derivation is the GOOD outcome (no
+// managed rule has cost enough to earn a standing instruction), and reading it
+// as "nothing here" would tell the user the feature is broken.
+const {
+  derivedGuidanceItems, derivedGuidanceSummary,
+} = require('../vscode-extension/autoLearnUi');
+
+test('the derived card distinguishes nothing-to-do from could-not-check', () => {
+  assert.equal(derivedGuidanceSummary({ policy: 'present', threshold: 50, pending: [], accepted: [] }),
+    'no managed rule has cost 50 prompts, so there is nothing worth a standing instruction');
+  assert.equal(derivedGuidanceSummary({ policy: 'unreadable', degraded: true }),
+    'managed policy unreadable, so nothing could be derived');
+  assert.equal(derivedGuidanceSummary({ policy: 'absent' }),
+    'no managed policy, so there is nothing to mitigate');
+  assert.equal(derivedGuidanceSummary({}), 'no managed policy, so there is nothing to mitigate');
+  assert.equal(derivedGuidanceSummary(undefined), 'no managed policy, so there is nothing to mitigate');
+
+  // Degraded outranks a present policy: the check did not run, so any count
+  // would be a guess.
+  assert.equal(derivedGuidanceSummary({ policy: 'present', degraded: true, pending: [{ id: 'x' }] }),
+    'managed policy unreadable, so nothing could be derived');
+});
+
+test('the derived card counts what is waiting and what is already installed', () => {
+  const review = {
+    policy: 'present', threshold: 50,
+    mitigations: [
+      { id: 'batch-file-edits', title: 'Editing a gated path', prompts: 254, rule: 'Edit(**/*.ps1)', body: 'B1' },
+      { id: 'batch-network-fetches', title: 'Fetching', prompts: 56, rule: 'Bash(curl:*)', body: 'B2' },
+      { id: 'script-multi-step-work', title: 'Running', prompts: 51, rule: 'Bash(cmake:*)', body: 'B3' },
+    ],
+    pending: [{ id: 'script-multi-step-work' }],
+    accepted: ['batch-file-edits'],
+    declined: ['batch-network-fetches'],
+  };
+  assert.equal(derivedGuidanceSummary(review), '1 to review, 1 installed');
+
+  const items = derivedGuidanceItems(review);
+  assert.deepEqual(items.map((item) => item.state),
+    ['installed', 'declined', 'not yet decided']);
+  // The measured count is the fact the decision turns on, so it belongs in the
+  // description, which is not the first thing a narrow picker truncates.
+  assert.equal(items[0].description, '254 prompts — installed');
+  assert.equal(items[2].description, '51 prompts — not yet decided');
+  assert.equal(items[0].label, 'Editing a gated path');
+  assert.equal(items[0].detail, 'B1');
+  assert.equal(items[0].rule, 'Edit(**/*.ps1)');
+});
+
+test('the derived card survives junk instead of rendering a broken row', () => {
+  assert.deepEqual(derivedGuidanceItems(undefined), []);
+  assert.deepEqual(derivedGuidanceItems({ mitigations: 'nope' }), []);
+  assert.deepEqual(derivedGuidanceItems({ mitigations: [null, {}, { id: 7 }] }), []);
+  const bare = derivedGuidanceItems({ mitigations: [{ id: 'x' }] });
+  assert.equal(bare.length, 1);
+  assert.equal(bare[0].label, 'x', 'an id is a usable label when a title is missing');
+  assert.equal(bare[0].detail, '');
+});

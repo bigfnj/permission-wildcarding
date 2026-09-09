@@ -264,6 +264,50 @@ function managedBlockedDetail(managed) {
   return lines;
 }
 
+// The derived-guidance card. Two states worth distinguishing and one worth
+// refusing to invent: pending items are a decision waiting on a human, accepted
+// items are lines already living in that human's instruction file, and an empty
+// derivation is NOT "nothing is wrong" — it usually means no managed rule has
+// cost enough prompts yet, which is the good outcome and should read that way.
+function derivedGuidanceSummary(review) {
+  const value = review || {};
+  if (value.degraded) return 'managed policy unreadable, so nothing could be derived';
+  if (value.policy !== 'present') return 'no managed policy, so there is nothing to mitigate';
+  const pending = Array.isArray(value.pending) ? value.pending : [];
+  const accepted = Array.isArray(value.accepted) ? value.accepted : [];
+  if (!pending.length && !accepted.length) {
+    const threshold = Number.isFinite(value.threshold) ? value.threshold : 50;
+    return `no managed rule has cost ${threshold} prompts, so there is nothing worth a standing instruction`;
+  }
+  const parts = [];
+  if (pending.length) parts.push(`${pending.length} to review`);
+  if (accepted.length) parts.push(`${accepted.length} installed`);
+  return parts.join(', ');
+}
+
+// Quick-pick rows. The measured count goes in the description rather than the
+// detail, because it is the single fact the decision turns on and a detail line
+// is truncated first.
+function derivedGuidanceItems(review) {
+  const value = review || {};
+  const accepted = new Set(Array.isArray(value.accepted) ? value.accepted : []);
+  const declined = new Set(Array.isArray(value.declined) ? value.declined : []);
+  return (Array.isArray(value.mitigations) ? value.mitigations : [])
+    .filter((item) => item && typeof item.id === 'string')
+    .map((item) => {
+      const state = accepted.has(item.id) ? 'installed'
+        : declined.has(item.id) ? 'declined' : 'not yet decided';
+      return {
+        id: item.id,
+        label: item.title || item.id,
+        description: `${item.prompts} prompts — ${state}`,
+        detail: item.body || '',
+        rule: item.rule,
+        state,
+      };
+    });
+}
+
 // The managed half of "why did this prompt?". A user allow entry really does
 // match, so the precedence answer alone reads as "this should not have
 // prompted", which is worse than saying nothing: it sends the reader looking for
@@ -302,6 +346,8 @@ module.exports = {
   codexCheckVariants,
   codexExecpolicyArgs,
   codexRestartSuffix,
+  derivedGuidanceItems,
+  derivedGuidanceSummary,
   isCandidateComplete,
   permissionMatches,
   policyTargetLabel,

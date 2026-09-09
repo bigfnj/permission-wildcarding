@@ -35,6 +35,7 @@ const { gatesStatusAll, setGatesAll, readCompiled, compiledPath } = require('./s
 const {
   applicationSummary, candidatePendingTargets, claudeDecisionExplanation,
   claudePermissionDecision, codexCheckVariants, codexExecpolicyArgs, codexRestartSuffix,
+  derivedGuidanceItems, derivedGuidanceSummary,
   isCandidateComplete, managedBlockedDetail, managedBlockedNote, managedPromptExplanation,
   policyTargetLabel, reviewableCandidates, selectionsNeedingConfirmation,
   uniqueTargets,
@@ -1334,6 +1335,59 @@ function showAutoLearnBlocked() {
   channel.show(true);
 }
 
+// The one lever left for a managed rule no grant can beat. Deliberately a
+// per-item decision rather than a single "apply all" button: this writes a
+// standing instruction into the user's own CLAUDE.md, and a bulk write leaves
+// every line in that file indistinguishable from every other, which is the
+// state a hand-maintained gates block is already in.
+async function showDerivedGuidance() {
+  let review;
+  try { review = getAutoLearnManager().derivedReview(); }
+  catch (error) {
+    vscode.window.showErrorMessage(`Derived guidance could not be computed: ${error.message}`);
+    return;
+  }
+  const items = derivedGuidanceItems(review);
+  if (!items.length) {
+    // Not an error, and usually the good outcome. Say which it is.
+    vscode.window.showInformationMessage(`Derived guidance: ${derivedGuidanceSummary(review)}`);
+    return;
+  }
+  const pick = await vscode.window.showQuickPick(items, {
+    title: `Derived guidance — ${derivedGuidanceSummary(review)}`,
+    placeHolder: 'Behaviour that reduces a prompt no allow rule can stop',
+    matchOnDetail: true,
+  });
+  if (!pick) return;
+
+  const choices = [
+    { label: 'Accept', value: 'accept', description: `Write this into your instruction file (${pick.rule})` },
+    { label: 'Decline', value: 'decline', description: 'Never offer this one again' },
+    { label: 'Reset', value: 'reset', description: 'Back to undecided, and remove it if installed' },
+  ];
+  const decision = await vscode.window.showQuickPick(choices, {
+    title: pick.label, placeHolder: `Currently ${pick.state}`,
+  });
+  if (!decision) return;
+
+  try {
+    const result = getAutoLearnManager().decideDerived(pick.id, decision.value);
+    const wrote = (result.targets || []).filter((target) => target.changed);
+    const failed = (result.targets || []).filter((target) => target.error);
+    if (failed.length) {
+      vscode.window.showWarningMessage(
+        `Derived guidance ${decision.value}: ${failed.map((t) => t.error).join('; ')}`);
+      return;
+    }
+    vscode.window.showInformationMessage(wrote.length
+      ? `Derived guidance ${decision.value}: updated ${wrote.map((t) => t.agent).join(', ')}. ` +
+        'Loaded from the next session on.'
+      : `Derived guidance ${decision.value}: recorded, no instruction file needed changing.`);
+  } catch (error) {
+    vscode.window.showErrorMessage(`Derived guidance ${decision.value} failed: ${error.message}`);
+  }
+}
+
 async function explainAutoLearnPrompt() {
   const agentPick = await vscode.window.showQuickPick([
     { label: 'Claude Code', value: 'claude', description: 'Evaluate deny, ask, and allow precedence' },
@@ -1663,7 +1717,8 @@ function activate(context) {
     vscode.commands.registerCommand('permission-wildcarding.autoLearnUndo', () => undoAutoLearn()),
     vscode.commands.registerCommand('permission-wildcarding.autoLearnCycleMode', () => cycleAutoLearnMode()),
     vscode.commands.registerCommand('permission-wildcarding.autoLearnWhy', () => explainAutoLearnPrompt()),
-    vscode.commands.registerCommand('permission-wildcarding.autoLearnShowBlocked', () => showAutoLearnBlocked())
+    vscode.commands.registerCommand('permission-wildcarding.autoLearnShowBlocked', () => showAutoLearnBlocked()),
+    vscode.commands.registerCommand('permission-wildcarding.derivedGuidance', () => showDerivedGuidance())
   );
 
   // Rebuild the recall (CPU bge-small) vector cache from the Memory card.

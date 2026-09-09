@@ -87,6 +87,11 @@
         "icon": "$(shield)"
       },
       {
+        "command": "permission-wildcarding.derivedGuidance",
+        "title": "Permission Wildcarding: Derived guidance - review mitigations for prompts no rule can stop",
+        "icon": "$(lightbulb)"
+      },
+      {
         "command": "permission-wildcarding.toggleMax",
         "title": "Permission Wildcarding: Toggle Claude MAX (skip all Claude prompts — allow-wildcards + approve hook)",
         "icon": "$(zap)"
