@@ -1,6 +1,6 @@
 {
   "name": "permission-wildcarding",
-  "version": "1.2.8",
+  "version": "1.3.0",
   "description": "Reduces Claude Code and Codex approval friction: generalizes approved permissions into command-family wildcards, learns from cross-agent history, makes deterministic safe recommendations, and promotes project-local approvals to user scope, teaches the agent a wildcardable shell style, and writes separately validated policy for each agent.",
   "license": "MIT",
   "scripts": {

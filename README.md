@@ -500,7 +500,15 @@ Four limits, because this writes into a file you own:
 Each accepted mitigation lands in its own marker pair, so declining one later removes exactly that
 one. The measured count is written into the text on purpose: it is the justification, so when the
 cost falls below the threshold the block is swept rather than left asserting a number that has
-stopped being true.
+stopped being true. If the managed policy cannot be read, the decision is recorded and the write is
+withheld rather than reconciled against an empty derivation, because a policy this tool cannot read
+is not a policy with no rules.
+
+The same review is a palette command, **Derived guidance - review mitigations for prompts no rule
+can stop**, which lists each item with its measured count and current state and then asks for one
+decision. There is deliberately no "apply all" button: accepting a mitigation writes a standing
+instruction into a file you own, and a bulk write leaves every line in it indistinguishable from
+every other.
 
 The extension scans at startup, watches both agents' JSONL directories, and reconciles every
 five minutes by default (`autoLearn.intervalMinutes`). A watcher-driven scan is debounced so a
