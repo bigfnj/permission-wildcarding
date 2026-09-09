@@ -147,15 +147,31 @@ test('the rule that outranks a permission is named, with deny before ask', (t) =
   // Broader than the rule, so the rule does not cover every command it matches.
   assert.equal(overridingRule(policy, 'Bash(git remote *)'), null);
 
-  // Not a command rule at all. deadAllowEntries walks the entire allow list,
-  // which carries Read, Edit, WebFetch and mcp__ entries, so anything truthy
-  // here would report every one of them as a dead grant. Note the managed ask
-  // does contain Read(**/.env*): the answer is still null, because a rule this
-  // module cannot model is one it must not claim to have assessed.
-  assert.equal(overridingRule(policy, 'Read(**/.env*)'), null);
+  // Not a command rule, so `rulePrefix` cannot model it and the whole
+  // permission string is matched instead. The managed ask does carry
+  // Read(**/.env*), and naming it is the point: a policy that gates Read and
+  // Edit paths was previously assessed as `unknown` and reported as nothing.
+  assert.deepEqual(overridingRule(policy, 'Read(**/.env*)'),
+    { decision: 'ask', rule: 'Read(**/.env*)' });
+  // A concrete path the managed glob covers, which is the shape a scan probes.
+  assert.deepEqual(overridingRule(policy, 'Read(/srv/app/.env.local)'),
+    { decision: 'ask', rule: 'Read(**/.env*)' });
+
+  // Controls on the same path: matching nothing still reports nothing, and a
+  // tool-level rule is broader than the glob rather than covered by it, so it
+  // is not dead and must not be named.
   assert.equal(overridingRule(policy, 'WebFetch(domain:example.com)'), null);
   assert.equal(overridingRule(policy, 'mcp__context7__query-docs'), null);
+  assert.equal(overridingRule(policy, 'Read'), null, 'a bare tool rule is broader, not dead');
+  assert.equal(overridingRule(policy, 'Read(**/notes.md)'), null);
   assert.equal(overridingRule(policy, 'not a rule at all'), null);
+
+  // Direction matters, and the vocabulary matches the command path: covered is
+  // inert, covering is partial.
+  assert.equal(assessPermission(policy, 'Read(**/.env*)'), 'inert');
+  assert.equal(assessPermission(policy, 'Read'), 'partial');
+  assert.equal(assessPermission(policy, 'Write'), 'effective', 'no managed Write rule exists');
+  assert.equal(assessPermission(policy, 'not a rule at all'), 'unknown');
 
   // Precedence is deny, then ask, and a policy can carry both for one command.
   const both = readPolicy({
@@ -202,8 +218,10 @@ function reportHome(t, policy, allow) {
 test('status reports which families a managed rule blocks, and which grants are already dead', (t) => {
   // Controls, so the report is shown to be selective: one live command grant,
   // and two non-command rules of the kind every real allow list carries. The
-  // Read entry is covered by the managed ask and must still not be reported,
-  // because this module does not model non-command specifier grammars.
+  // Read entry IS covered by the managed ask and must be reported: a managed
+  // policy carries Read and Edit rules, and reporting only the command ones
+  // left the largest real prompt source unnamed. The WebFetch entry is the
+  // control for the same path, matching nothing and staying out of the list.
   const startingAllow = [
     'Bash(docker *)', 'Bash(rg *)', 'Bash(git push *)',
     'Read(**/.env*)', 'WebFetch(domain:example.com)',
@@ -230,10 +248,12 @@ test('status reports which families a managed rule blocks, and which grants are 
   });
 
   // Entries the user already wrote that the same rules outrank. `Bash(rg *)` is
-  // live and must not appear.
+  // live and must not appear, and neither must the WebFetch entry, which no
+  // managed rule covers.
   assert.deepEqual(managed.deadAllowEntries, [
     { permission: 'Bash(docker *)', decision: 'ask', rule: 'Bash(docker:*)' },
     { permission: 'Bash(git push *)', decision: 'ask', rule: 'Bash(git push:*)' },
+    { permission: 'Read(**/.env*)', decision: 'ask', rule: 'Read(**/.env*)' },
   ]);
 
   // Reported, never removed. The policy file is a client-refreshed cache, so

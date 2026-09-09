@@ -21,7 +21,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { normalizeRule } = require('./permission-match');
+const { normalizeRule, ruleMatches } = require('./permission-match');
 
 const COMMAND_TOOLS = new Set(['Bash', 'PowerShell']);
 const RULE_SHAPE = /^([A-Za-z_][A-Za-z0-9_]*)\(([\s\S]*)\)$/;
@@ -62,16 +62,27 @@ function readPolicy(options = {}) {
       path: target, present: false,
       unreadable: error.code !== 'ENOENT',
       error: error.code === 'ENOENT' ? null : error.message,
-      ask: [], allow: [], deny: [], hookEvents: [], managedHooksOnly: false,
+      ask: [], allow: [], deny: [], raw: { ask: [], allow: [], deny: [] },
+      hookEvents: [], managedHooksOnly: false,
     };
   }
   const permissions = raw && typeof raw.permissions === 'object' && raw.permissions ? raw.permissions : {};
   const prefixes = (list) => (Array.isArray(list) ? list : []).map(rulePrefix).filter(Boolean);
+  // `prefixes` drops every non-command rule, which is why a Read or Edit rule
+  // used to be invisible to every verdict below. The rule text is kept beside
+  // it so the other specifier grammars can be matched whole.
+  const texts = (list) => (Array.isArray(list) ? list : [])
+    .filter((rule) => typeof rule === 'string' && rule.trim());
   return {
     path: target, present: true, unreadable: false, error: null,
     ask: prefixes(permissions.ask),
     allow: prefixes(permissions.allow),
     deny: prefixes(permissions.deny),
+    raw: {
+      ask: texts(permissions.ask),
+      allow: texts(permissions.allow),
+      deny: texts(permissions.deny),
+    },
     hookEvents: raw && typeof raw.hooks === 'object' && raw.hooks ? Object.keys(raw.hooks) : [],
     managedHooksOnly: raw ? raw.allowManagedHooksOnly === true : false,
   };
@@ -84,10 +95,48 @@ function readPolicy(options = {}) {
 //   'partial'   the grant is broader than such a rule, so part of it works
 //   'redundant' a managed allow already covers it
 //   'effective' the policy has nothing to say
+// The tool a rule or permission belongs to. `Edit(**/*.ps1)` is `Edit`; a bare
+// `Edit` with no specifier is also `Edit`. An mcp permission is its own tool
+// name, so dots and hyphens are allowed in the bare form.
+function toolOf(value) {
+  const text = String(value == null ? '' : value).trim();
+  const parsed = RULE_SHAPE.exec(text);
+  if (parsed) return parsed[1];
+  return /^[A-Za-z_][A-Za-z0-9_.-]*$/.test(text) ? text : null;
+}
+
+// Does a managed rule govern this permission, for a tool whose specifier is not
+// a command prefix? `rulePrefix` models Bash and PowerShell only, on purpose,
+// so a `Read`, `Edit`, `WebFetch(domain:...)` or `mcp__server__tool` rule fell
+// out of every verdict as `unknown`. Matching the whole permission string
+// handles those grammars without teaching this module each one, which is what
+// `shadowedByManaged` in policy-guard.js already does reactively. The one case
+// a regex cannot express is the tool-level rule: a bare `Edit` carries no
+// specifier and therefore governs every Edit call.
+function coversPermission(rule, permission) {
+  const ruleTool = toolOf(rule);
+  if (!ruleTool || ruleTool !== toolOf(permission)) return false;
+  if (!RULE_SHAPE.test(String(rule).trim())) return true;
+  return ruleMatches(rule, permission);
+}
+
+// Same vocabulary as the command path below, decided on rule text instead of
+// command tokens. Order matters and mirrors it: covered is inert, covering is
+// partial, a managed allow is redundant.
+function assessByText(policy, permission) {
+  if (!toolOf(permission)) return 'unknown';
+  const raw = policy.raw || { ask: [], allow: [], deny: [] };
+  const blocking = [...raw.deny, ...raw.ask];
+  if (blocking.some((rule) => coversPermission(rule, permission))) return 'inert';
+  if (blocking.some((rule) => coversPermission(permission, rule))) return 'partial';
+  if (raw.allow.some((rule) => coversPermission(rule, permission))) return 'redundant';
+  return 'effective';
+}
+
 function assessPermission(policy, permission) {
   if (!policy || !policy.present) return 'unknown';
   const mine = rulePrefix(permission);
-  if (!mine) return 'unknown';
+  if (!mine) return assessByText(policy, permission);
   const applies = (rules, predicate) => rules.some((rule) =>
     rule.tool === mine.tool && predicate(rule));
   if (applies([...policy.deny, ...policy.ask], (rule) => coversPrefix(mine.tokens, rule.tokens))) return 'inert';
@@ -104,7 +153,14 @@ function assessPermission(policy, permission) {
 function overridingRule(policy, permission) {
   if (!policy || !policy.present) return null;
   const mine = rulePrefix(permission);
-  if (!mine) return null;
+  if (!mine) {
+    if (!toolOf(permission)) return null;
+    const raw = policy.raw || { ask: [], allow: [], deny: [] };
+    const deny = raw.deny.find((rule) => coversPermission(rule, permission));
+    if (deny) return { decision: 'deny', rule: deny };
+    const ask = raw.ask.find((rule) => coversPermission(rule, permission));
+    return ask ? { decision: 'ask', rule: ask } : null;
+  }
   const find = (rules) => rules.find((rule) =>
     rule.tool === mine.tool && coversPrefix(mine.tokens, rule.tokens)) || null;
   const deny = find(policy.deny);
@@ -123,4 +179,5 @@ function hookEventAllowed(policy, event) {
 module.exports = {
   defaultPolicyPath, readPolicy, rulePrefix, coversPrefix,
   assessPermission, overridingRule, hookEventAllowed,
+  coversPermission, toolOf,
 };

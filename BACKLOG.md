@@ -65,25 +65,6 @@ serialize, so this is not urgent. Cursors are the only uncapped structure; they
 accumulate one entry per transcript file ever seen and never shrink when a
 transcript is deleted. Revisit if the file passes roughly 20 MB.
 
-### The managed report is blind to non-command rules, and policy-guard is not
-
-`rulePrefix` in `src/managed-policy.js` deliberately models only `Bash` and
-`PowerShell`, because other tools have their own specifier grammar. So
-`assessPermission` and `overridingRule` answer `unknown` / `null` for a
-`Read(...)`, `Edit(...)`, `WebFetch(domain:...)` or `mcp__...` rule, and v1.2.7's
-`managed.deadAllowEntries` therefore cannot report a non-command allow entry that
-a managed ask shadows. Measured on a real ~300-entry list 2026-09-08: 30 of 176
-assessed permissions came back `unknown`, all of them non-command rules.
-
-This is a real gap, not just a limitation of the report: a managed policy can and
-does carry `Read` and `WebFetch` rules. `shadowedByManaged` in
-`src/policy-guard.js` already answers the same question for any tool, because it
-matches on the whole permission string rather than a command prefix, so the two
-modules disagree about the same allow list. Closing it means either teaching the
-managed reader the other grammars or having the manager borrow policy-guard's
-matcher. Not urgent: the unreported entries are inert either way, so the cost is
-a silent omission from a report, not a wrong grant.
-
 ### Inert bookkeeping candidates
 
 Around a quarter of candidates are complex with no permission, so they can never

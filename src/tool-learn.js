@@ -38,6 +38,25 @@ function isLearnableTool(name) {
     FILE_TOOLS.has(value) || MCP_TOOL.test(value);
 }
 
+// The raw path or URL behind a non-shell call, for matching against a managed
+// rule while the scan is in memory. This is NOT the same thing as inferring a
+// path rule, which `FILE_TOOLS` above still refuses to do: nothing here widens a
+// grant or reaches the exported policy. It exists so a report can answer "which
+// managed rule is costing me prompts", which needs the path only long enough to
+// test it. `target` stays opaque, so the candidate key, the observation identity
+// and the state file are all unchanged, and the matched RULE is what gets kept.
+// A rule is org policy rather than user data; the path never leaves the scan.
+// File tools only. A fetch already renders `WebFetch(domain:host)` as its
+// permission, so it is assessed through the normal candidate route and needs no
+// second path here; building a probe from a raw URL would only invent a shape
+// no managed rule is written in.
+function toolPath(name, input) {
+  if (!input || typeof input !== 'object') return undefined;
+  if (!FILE_TOOLS.has(String(name || ''))) return undefined;
+  const file = input.file_path ?? input.path ?? input.notebook_path;
+  return typeof file === 'string' && file ? file : undefined;
+}
+
 function fetchHost(value) {
   try {
     const url = new URL(String(value));
@@ -99,4 +118,4 @@ function toolInvocation(name, value, metadata = {}) {
   return null;
 }
 
-module.exports = { isLearnableTool, toolInvocation, toolTarget: target, MCP_TOOL };
+module.exports = { isLearnableTool, toolInvocation, toolTarget: target, toolPath, MCP_TOOL };

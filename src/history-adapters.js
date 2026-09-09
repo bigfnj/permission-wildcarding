@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 
 const SHELL_TOOLS = new Set(['Bash', 'PowerShell']);
-const { isLearnableTool, toolTarget } = require('./tool-learn');
+const { isLearnableTool, toolTarget, toolPath } = require('./tool-learn');
 const CODEX_ITEM_TYPES = new Set([
   'function_call', 'function_call_output', 'custom_tool_call', 'custom_tool_call_output',
 ]);
@@ -44,6 +44,23 @@ function defineParserOffsets(observation, callOffset, callEnd) {
   });
 }
 
+// A file or fetch path is tested against managed policy here and then dropped;
+// what survives is the RULE it matched, which is org policy rather than user
+// data. Putting the path on the observation instead would have downgraded the
+// invariant from "no path ever leaves the parser", which one assertion can
+// check, to "no path is ever persisted", which every future consumer has to
+// keep true. The matcher is injected so this module stays policy-ignorant, and
+// a throwing or absent matcher simply yields no rule.
+function matchManaged(options, tool, filePath) {
+  const matcher = options && typeof options.probeMatcher === 'function'
+    ? options.probeMatcher : null;
+  if (!matcher || !filePath) return undefined;
+  try {
+    const rule = matcher(String(tool), String(filePath));
+    return typeof rule === 'string' && rule ? rule : undefined;
+  } catch { return undefined; }
+}
+
 function createObservation(fields) {
   const { source, tool, command } = fields;
   // A non-shell tool carries an opaque target rather than a command string.
@@ -67,6 +84,10 @@ function createObservation(fields) {
     callId: effectiveCallId,
   };
   if (kind === 'tool') observation.kind = kind;
+  // The managed RULE a non-shell call matched, never the path that matched it.
+  // Deliberately absent from `identityParts` above so existing observation
+  // hashes do not move: adding this must not re-observe a counted corpus.
+  if (fields.managedRule !== undefined) observation.managedRule = fields.managedRule;
   if (fields.timestamp !== undefined) observation.timestamp = fields.timestamp;
   if (fields.cwd !== undefined) observation.cwd = fields.cwd;
   if (fields.session !== undefined) observation.session = fields.session;
@@ -245,6 +266,8 @@ function parseClaudeJsonl(text, options = {}) {
           tool: block.name,
           command: shell ? (block.input && block.input.command)
             : toolTarget(block.name, block.input),
+          managedRule: shell ? undefined
+            : matchManaged(options, block.name, toolPath(block.name, block.input)),
           callId: firstDefined(block.id, block.tool_use_id, block.toolUseId, block.call_id, block.callId),
           timestamp: metadata.timestamp,
           cwd: metadata.cwd,
@@ -931,6 +954,7 @@ function scanHistoryFiles(options = {}) {
     try {
       let parsed = parseHistorySlice(entry.source, buffer, {
         file, baseOffset: start, platform: options.platform, defaultTool: options.defaultTool,
+        probeMatcher: options.probeMatcher,
       });
       if (mode === 'append') {
         const appendedStart = Math.max(0, prior.size - start);
@@ -943,6 +967,7 @@ function scanHistoryFiles(options = {}) {
           buffer = readRange(file, 0, stat.size);
           parsed = parseHistorySlice(entry.source, buffer, {
             file, baseOffset: 0, platform: options.platform, defaultTool: options.defaultTool,
+        probeMatcher: options.probeMatcher,
           });
         }
       }

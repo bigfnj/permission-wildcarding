@@ -14,7 +14,9 @@ const { aggregateObservations, isAutoSafeCandidate, COMPLEX_REASONS } = require(
 const { scanHistoryFiles } = require('./history-adapters');
 const { createPolicyLock } = require('./policy-lock');
 const { commandLaunch } = require('./exec-resolve');
-const { readPolicy, assessPermission, overridingRule } = require('./managed-policy');
+const {
+  readPolicy, assessPermission, overridingRule, coversPermission,
+} = require('./managed-policy');
 const {
   renderCodexRules, validateCodexRulesText, renderClaudePermissions, mergeClaudeAllow,
   mergeGeneratedCodexRules,
@@ -272,6 +274,35 @@ function restoreGrants(state, grants) {
   state.codexTargets = codexTargets(grants?.codexTargets);
   state.managedClaude = managedClaude(grants?.managedClaude);
 }
+// How many times each managed rule actually cost a prompt. The KEY is a managed
+// rule string, which is org policy: no path, argument or prompt text is
+// involved, which is what lets this be persisted at all. The decision (ask vs
+// deny) is deliberately NOT stored, because the policy is a client-refreshed
+// cache and a decision cached here could contradict the live file; it is
+// resolved at report time instead.
+//
+// Capped because this is a new dimension in a long-lived file. A managed policy
+// carries a few dozen rules, so the limit is generous and hitting it means a
+// bug rather than a workload.
+const MANAGED_HITS_LIMIT = 200;
+function managedHits(value) {
+  if (!object(value)) return {};
+  const entries = [];
+  for (const [rule, record] of Object.entries(value)) {
+    const text = clean(rule, 200);
+    if (!text || !object(record)) continue;
+    const hits = Math.max(0, Math.floor(Number(record.hits) || 0));
+    if (!hits) continue;
+    const tools = Array.isArray(record.tools)
+      ? [...new Set(record.tools.map((item) => clean(item, 48)).filter(Boolean))].sort().slice(0, 12)
+      : [];
+    entries.push([text, { hits, tools }]);
+  }
+  entries.sort((a, b) => b[1].hits - a[1].hits || a[0].localeCompare(b[0]));
+  const result = {};
+  for (const [rule, record] of entries.slice(0, MANAGED_HITS_LIMIT)) result[rule] = record;
+  return result;
+}
 function cursor(value) {
   if (!object(value)) return null;
   const result = {};
@@ -289,7 +320,8 @@ function emptyState(mode, threshold) {
   return {
     version: VERSION, mode, threshold, candidates: {}, observationHashes: {}, cursors: {},
     applied: { claude: [], codex: [] }, reviewed: { claude: [], codex: [] },
-    codexTargets: {}, managedClaude: {}, lastScanAt: null, lastScanStats: null,
+    codexTargets: {}, managedClaude: {}, managedHits: {},
+    lastScanAt: null, lastScanStats: null,
     lastApplication: null,
   };
 }
@@ -348,6 +380,7 @@ function sanitizeState(raw, mode, threshold) {
   state.reviewed = applied(raw.reviewed);
   state.codexTargets = codexTargets(raw.codexTargets);
   state.managedClaude = managedClaude(raw.managedClaude);
+  state.managedHits = managedHits(raw.managedHits);
   state.lastScanAt = clean(raw.lastScanAt, 64) || null;
   if (object(raw.lastScanStats)) state.lastScanStats = {
     files: Math.max(0, Number(raw.lastScanStats.files) || 0),
@@ -374,6 +407,7 @@ function persistentState(state) {
     observationHashes: state.observationHashes, cursors: state.cursors,
     applied: applied(state.applied), reviewed: applied(state.reviewed),
     codexTargets: codexTargets(state.codexTargets), managedClaude: managedClaude(state.managedClaude),
+    managedHits: managedHits(state.managedHits),
     lastScanAt: state.lastScanAt, lastScanStats: state.lastScanStats,
     lastApplication: state.lastApplication,
   };
@@ -541,6 +575,24 @@ function createAutoLearnManager(options = {}) {
     }
     return policyCache;
   };
+  // Turns a file path into the managed rule that governs it, for the scanner to
+  // record. The scanner calls this while the path is still in hand and keeps
+  // only the returned rule, so no path reaches an observation or the state file.
+  // Paths are normalized to forward slashes because a managed glob is written
+  // that way and a Windows path would never match one.
+  const probeMatcher = () => {
+    const policy = managedPolicy();
+    if (!policy || !policy.present) return undefined;
+    const deny = Array.isArray(policy.raw?.deny) ? policy.raw.deny : [];
+    const ask = Array.isArray(policy.raw?.ask) ? policy.raw.ask : [];
+    if (!deny.length && !ask.length) return undefined;
+    return (tool, filePath) => {
+      const probe = `${tool}(${String(filePath).replace(/\\/g, '/')})`;
+      return deny.find((rule) => coversPermission(rule, probe))
+        || ask.find((rule) => coversPermission(rule, probe))
+        || null;
+    };
+  };
   const clock = typeof options.now === 'function' ? options.now : () => new Date();
   const now = () => {
     const value = clock();
@@ -641,7 +693,7 @@ function createAutoLearnManager(options = {}) {
   // kept arriving, and a grant already written into settings looked like it had
   // simply failed. Naming the rule that cannot be beaten is the only useful
   // thing left to say about such a family, so say it.
-  function managedSummary(all) {
+  function managedSummary(all, hits) {
     const policy = managedPolicy();
     const state = policy.unreadable ? 'unreadable' : (policy.present ? 'present' : 'absent');
     // Degraded must never read as clean. With no usable policy there is no
@@ -649,6 +701,7 @@ function createAutoLearnManager(options = {}) {
     if (state !== 'present') return {
       policy: state, path: policy.path, degraded: state === 'unreadable',
       error: policy.error || null, verdicts: null, inertFamilies: [], deadAllowEntries: [],
+      costliestRules: [],
     };
     const verdicts = { inert: 0, partial: 0, redundant: 0, effective: 0, unknown: 0 };
     const inertFamilies = [];
@@ -662,9 +715,40 @@ function createAutoLearnManager(options = {}) {
       });
     }
     inertFamilies.sort((a, b) => b.runs - a.runs || a.key.localeCompare(b.key));
+    // What the prompts actually cost, ranked by managed rule. Two sources,
+    // because the two halves of the friction surface are shaped differently: a
+    // shell family renders a permission that can be assessed, so its evidence
+    // is the family's own run count, while a file tool renders no permission by
+    // design and its evidence arrives as a per-rule hit count from the scan.
+    // Without this the report could name a blocked family but never say which
+    // rule was expensive, which is the only question a policy owner can act on.
+    const costs = new Map();
+    const addCost = (rule, runs, tools) => {
+      const text = typeof rule === 'string' ? rule : '';
+      if (!text || !(runs > 0)) return;
+      const entry = costs.get(text) || { rule: text, prompts: 0, tools: [] };
+      entry.prompts += runs;
+      for (const tool of (Array.isArray(tools) ? tools : [tools])) {
+        if (tool && !entry.tools.includes(tool)) entry.tools.push(tool);
+      }
+      costs.set(text, entry);
+    };
+    for (const family of inertFamilies) {
+      addCost(family.rule, family.runs, family.permission?.split('(')[0]);
+    }
+    for (const [rule, record] of Object.entries(object(hits) ? hits : {})) {
+      addCost(rule, record.hits, record.tools);
+    }
+    const costliestRules = [...costs.values()]
+      .map((entry) => ({
+        ...entry, tools: entry.tools.filter(Boolean).sort(),
+        decision: policy.raw?.deny?.some((item) => item === entry.rule) ? 'deny' : 'ask',
+      }))
+      .sort((a, b) => b.prompts - a.prompts || a.rule.localeCompare(b.rule));
     return {
       policy: state, path: policy.path, degraded: false, error: null,
       verdicts, inertFamilies, deadAllowEntries: deadAllowEntries(policy),
+      costliestRules,
     };
   }
   // Why a single pasted command is still prompting. "Your allow rule matches, so
@@ -700,7 +784,7 @@ function createAutoLearnManager(options = {}) {
         observe: all.filter((item) => item.disposition === 'observe').length,
       },
       applied: applied(state.applied), appliedKeys,
-      managed: managedSummary(all),
+      managed: managedSummary(all, state.managedHits),
       paths: {
         state: statePath, claudeSettings: claudeSettingsPath,
         claudeClaims: claudeClaimsPath, codexRules: codexRulesPath,
@@ -976,6 +1060,56 @@ function createAutoLearnManager(options = {}) {
     return locked(() => applyUnlocked(load(), request));
   }
 
+  // Derives the whole hit table from the whole corpus in one pass.
+  //
+  // A normal scan only sees what its cursors have not already consumed, so on
+  // any machine that has been running a while the table would start empty and
+  // the number actually worth acting on would take weeks to reappear. That is
+  // the same "no evidence at install time" problem that makes a static block
+  // the wrong answer, so the fix is an explicit one-time pass rather than
+  // waiting. Cursors are passed empty to force a full read and the returned
+  // ones are DISCARDED, so this neither advances nor rewinds a scan; candidates
+  // and observation hashes are untouched for the same reason. Dedupe is per
+  // pass, by observation id, which makes repeated runs idempotent.
+  function rebuildManagedHits() {
+    return locked(() => {
+      const state = load();
+      const matcher = probeMatcher();
+      const policy = managedPolicy();
+      if (!matcher) {
+        state.managedHits = {};
+        save(state);
+        return {
+          policy: policy.unreadable ? 'unreadable' : (policy.present ? 'present' : 'absent'),
+          degraded: Boolean(policy.unreadable), rules: 0, prompts: 0, files: 0,
+        };
+      }
+      const result = historyScanner({
+        cursors: {}, claudeRoots, codexRoots, probeMatcher: matcher,
+      });
+      const seen = new Set();
+      const hits = {};
+      for (const observation of result.observations || []) {
+        if (workspaceRoot && !within(workspaceRoot, observation.cwd)) continue;
+        const rule = clean(observation.managedRule, 200);
+        if (!rule || seen.has(observation.id)) continue;
+        seen.add(observation.id);
+        const record = hits[rule] || { hits: 0, tools: [] };
+        record.hits += 1;
+        const tool = clean(observation.tool, 48);
+        if (tool && !record.tools.includes(tool)) record.tools.push(tool);
+        hits[rule] = record;
+      }
+      state.managedHits = managedHits(hits);
+      save(state);
+      return {
+        policy: 'present', degraded: false,
+        rules: Object.keys(state.managedHits).length,
+        prompts: Object.values(state.managedHits).reduce((total, item) => total + item.hits, 0),
+        files: Array.isArray(result.files) ? result.files.length : 0,
+      };
+    });
+  }
   function scan(request = {}) {
     return locked(() => {
       const state = load();
@@ -991,6 +1125,7 @@ function createAutoLearnManager(options = {}) {
       const result = historyScanner({
         cursors: state.cursors, claudeRoots, codexRoots,
         overlapBytes: request.overlapBytes, platform: request.platform,
+        probeMatcher: probeMatcher(),
       });
       if (!result || !Array.isArray(result.observations) || !object(result.cursors)) {
         throw new Error('History scanner returned an invalid result');
@@ -1016,6 +1151,18 @@ function createAutoLearnManager(options = {}) {
             changeOutcome(item, null, next);
             state.observationHashes[id] = { key: fresh.key, outcome: next, source };
             newObservations += 1;
+            // Counted once, on first sight, keyed off the same hash that stops
+            // a re-scan from double-counting the candidate itself.
+            if (observation.managedRule) {
+              const rule = clean(observation.managedRule, 200);
+              if (rule) {
+                const record = state.managedHits[rule] || { hits: 0, tools: [] };
+                record.hits += 1;
+                const tool = clean(observation.tool, 48);
+                if (tool && !record.tools.includes(tool)) record.tools.push(tool);
+                state.managedHits[rule] = record;
+              }
+            }
           } else if (previous.key === fresh.key && previous.outcome !== next &&
               changeOutcome(item, previous.outcome, next)) {
             state.observationHashes[id] = { key: fresh.key, outcome: next, source };
@@ -1037,6 +1184,9 @@ function createAutoLearnManager(options = {}) {
           ? file : `path-sha256:${hash(Buffer.from(normalizedPath(file), 'utf8')).slice(0, 24)}`;
         if (safe) state.cursors[id] = safe;
       }
+      // Enforce the cap on the way out, so one scan cannot leave the file
+      // holding more rules than the normalizer would accept reading it back.
+      state.managedHits = managedHits(state.managedHits);
       state.lastScanAt = now();
       state.lastScanStats = {
         files: Array.isArray(result.files) ? result.files.length : Object.keys(state.cursors).length,
@@ -1160,7 +1310,7 @@ function createAutoLearnManager(options = {}) {
       claudeSettings: claudeSettingsPath, claudeClaims: claudeClaimsPath,
       codexRules: codexRulesPath,
     },
-    scan, status, getStatus: status, overview, explainManaged,
+    scan, status, getStatus: status, overview, explainManaged, rebuildManagedHits,
     listCandidates, list: listCandidates, getCandidates: listCandidates,
     setMode, apply: applyPolicy, applyClaude, applyCodex, undo,
   };

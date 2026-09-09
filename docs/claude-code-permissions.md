@@ -277,6 +277,26 @@ writing that rule cannot stop the prompt. `hookEventAllowed` answers the hook
 question, and `maxLayers` now returns `hookBlocked` so MAX mode names a layer
 that cannot run instead of reporting itself as on.
 
+`rulePrefix` models command tokens, which only `Bash` and `PowerShell` have, so
+a `Read`, `Edit`, `WebFetch(domain:...)` or `mcp__server__tool` rule used to
+assess as `unknown` and go unreported. Those now fall through to
+`coversPermission`, which matches the whole permission string the way
+`shadowedByManaged` in `src/policy-guard.js` always has, plus the one case no
+regex expresses: a bare `Edit` with no specifier governs every Edit call, so it
+reads as `partial` against a managed `Edit(**/*.ps1)` rather than as effective.
+Measured on this workstation's ~300-entry list, `unknown` went from 30 of 176 to
+zero, and the largest single prompt source on the machine turned out to be a
+managed `Edit` glob that no earlier version could name.
+
+Two verdicts is not the same as knowing the cost. A shell family carries its own
+run count, but a file tool renders no permission by design, so `Edit(**/*.ps1)`
+had evidence nowhere. The scan now tests each observed path against managed
+policy while the path is still in hand and keeps only the RULE it matched, which
+is org policy rather than user data; `managed.costliestRules` ranks both halves
+together. `--learn hits` derives the same table from the whole corpus in one
+pass, because cursors mean a normal scan on an established machine sees almost
+nothing and the number worth acting on would otherwise take weeks to reappear.
+
 Three deliberate limits. The file is a client-refreshed CACHE, so it is advisory:
 it can withhold a proposal, never widen one. Absence is not an empty policy, and
 an unreadable file reports `unreadable` rather than passing as unmanaged. And

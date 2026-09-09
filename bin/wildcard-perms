@@ -22,7 +22,7 @@ const { gatesStatusAll, setGatesAll } = require('../src/agent-gates');
 
 const SETTINGS  = path.join(os.homedir(), '.claude', 'settings.json');
 const PACK_PATH = path.join(__dirname, '..', 'patterns', 'starter-pack.json');
-const LEARN_USAGE = 'usage: wildcard-perms --learn scan|status|apply|undo ' +
+const LEARN_USAGE = 'usage: wildcard-perms --learn scan|status|apply|undo|hits ' +
   '[--mode observe|recommend|auto-safe] [--workspace <path>] ' +
   '[--codex-scope user|workspace|off] [--threshold <count>] ' +
   '[--codex-executable <path>]\n';
@@ -113,6 +113,7 @@ function learn(args) {
     else if (action === 'status') result = manager.status();
     else if (action === 'apply') result = manager.apply({ includeReviewed: false });
     else if (action === 'undo') result = manager.undo();
+    else if (action === 'hits') result = manager.rebuildManagedHits();
     else {
       process.stderr.write(LEARN_USAGE);
       process.exitCode = 1;
