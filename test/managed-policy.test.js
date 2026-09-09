@@ -310,3 +310,68 @@ test('an unreadable managed policy reports degraded, not an all-clear', (t) => {
   assert.equal(absent.degraded, false);
   assert.equal(absent.verdicts, null);
 });
+
+// `rulePrefix` and `coversPrefix` had no direct test at all, and no fixture
+// anywhere in the suite built a blanket managed rule, which is why three
+// separate spellings of "govern this whole tool" were broken in three different
+// ways without anything noticing.
+test('a blanket managed rule governs its whole tool, in all three spellings', (t) => {
+  const { rulePrefix, coversPrefix } = require('../src/managed-policy');
+
+  // No fixed tokens is the honest representation. `Bash(*)` used to yield the
+  // literal token `['*']`, matching only a command named `*`; the other two
+  // yielded null and were dropped from the policy by readPolicy's filter.
+  for (const spelling of ['Bash(*)', 'Bash( *)', 'Bash(:*)']) {
+    const parsed = rulePrefix(spelling);
+    assert.ok(parsed, `${spelling} must not be dropped`);
+    assert.equal(parsed.tool, 'Bash', spelling);
+    assert.deepEqual(parsed.tokens, [], `${spelling} fixes no tokens`);
+    assert.equal(parsed.text, spelling, 'the report needs the rule as written');
+  }
+
+  // A rule that fixes no tokens covers every command, which is what
+  // coversPrefix already meant by an empty rule list. Asserted directly
+  // because nothing else in the suite touches this function.
+  assert.equal(coversPrefix(['git', 'status'], []), true);
+  assert.equal(coversPrefix([], []), true);
+  assert.equal(coversPrefix(['git', 'status'], ['git']), true);
+  assert.equal(coversPrefix(['git'], ['git', 'status']), false, 'a longer rule cannot cover');
+  assert.equal(coversPrefix(['GIT', 'STATUS'], ['git']), true, 'matching is case-insensitive');
+  assert.equal(coversPrefix(['git', 'status'], ['*']), false,
+    'a literal star is not a wildcard here, which is why the blanket case is normalized away');
+
+  // Still unmodellable, and deliberately so: an empty specifier fixes an empty
+  // command rather than any command.
+  assert.equal(rulePrefix('Bash()'), null);
+  assert.equal(rulePrefix('Read(**/*.ps1)'), null, 'not a command tool');
+  assert.equal(rulePrefix('not a rule'), null);
+
+  // End to end through a real policy file: the deny is now visible.
+  const home = policyHome(t, {
+    permissions: { deny: ['Bash(*)'], ask: [], allow: ['Bash(git status:*)'] },
+  });
+  const policy = readPolicy({ home });
+  assert.equal(policy.deny.length, 1, 'the blanket deny survives readPolicy');
+  assert.equal(assessPermission(policy, 'Bash(git status *)'), 'inert');
+  assert.deepEqual(overridingRule(policy, 'Bash(git status *)'),
+    { decision: 'deny', rule: 'Bash(*)' });
+  assert.equal(assessPermission(policy, 'PowerShell(git status *)'), 'effective',
+    'a Bash blanket says nothing about PowerShell');
+
+  // The user's own grant being blanket is the mirror case: only a blanket rule
+  // covers it, and it is broader than any narrower rule.
+  const narrow = readPolicy({
+    home: policyHome(t, { permissions: { ask: ['Bash(docker:*)'], allow: [], deny: [] } }),
+  });
+  assert.equal(assessPermission(narrow, 'Bash(*)'), 'partial');
+  assert.equal(assessPermission(policy, 'Bash(*)'), 'inert', 'blanket against blanket');
+
+  // A blanket managed ALLOW makes any grant for that tool redundant rather
+  // than inert, since precedence puts allow last.
+  const permissive = readPolicy({
+    home: policyHome(t, { permissions: { allow: ['Bash( *)'], ask: [], deny: [] } }),
+  });
+  assert.equal(assessPermission(permissive, 'Bash(docker exec *)'), 'redundant');
+  assert.equal(overridingRule(permissive, 'Bash(docker exec *)'), null,
+    'an allow does not outrank, so there is nothing to name');
+});

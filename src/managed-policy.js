@@ -32,19 +32,38 @@ function defaultPolicyPath(home) {
 
 // A rule becomes a tool plus the command tokens it fixes. `Bash(docker:*)` is
 // the prefix ['docker'], so it governs every command starting with it.
+//
+// A blanket rule fixes NO tokens, and the three spellings of it were all wrong
+// in different ways. `Bash(*)` produced the literal token `['*']`, so it matched
+// only a command actually named `*`; `Bash( *)` and `Bash(:*)` produced `null`
+// and were dropped from the policy entirely by the `.filter(Boolean)` in
+// `readPolicy`. On a "deny all Bash, allow specific" org policy that made the
+// deny invisible, and the learner would propose and write grants that can never
+// fire. An empty token list is the honest representation, and `coversPrefix`
+// already reads it correctly: no tokens to match means every command matches.
 function rulePrefix(rule) {
   const parsed = RULE_SHAPE.exec(normalizeRule(rule));
   if (!parsed) return null;
   const [, tool, inner] = parsed;
   if (!COMMAND_TOOLS.has(tool)) return null;
-  const specifier = inner.endsWith(' *') ? inner.slice(0, -2) : inner;
+  const trailing = inner.endsWith(' *');
+  const specifier = trailing ? inner.slice(0, -2) : inner;
   const tokens = specifier.trim().split(/\s+/).filter(Boolean);
   // `text` is kept so a report can name the rule it lost to. A bare verdict
   // sends the reader hunting through a few hundred managed entries for the one
   // that beat them.
-  return tokens.length ? { tool, tokens, text: String(rule) } : null;
+  const entry = { tool, tokens, text: String(rule) };
+  // `Bash(*)`, and `Bash( *)` / `Bash(:*)` once the trailing wildcard is
+  // stripped to nothing. Deliberately NOT `Bash()`, which fixes an empty
+  // command rather than any command, and stays unmodellable.
+  if (tokens.length === 1 && tokens[0] === '*') return { ...entry, tokens: [] };
+  if (!tokens.length) return trailing ? { ...entry, tokens: [] } : null;
+  return entry;
 }
 
+// Do the rule's fixed tokens prefix the command's? A rule that fixes no tokens
+// covers everything, which falls out of this without a special case: the length
+// test passes and `every` on an empty list is true.
 function coversPrefix(commandTokens, ruleTokens) {
   return ruleTokens.length <= commandTokens.length &&
     ruleTokens.every((token, index) => token.toLowerCase() === commandTokens[index].toLowerCase());
