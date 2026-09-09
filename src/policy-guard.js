@@ -27,6 +27,7 @@ const path = require('path');
 // it does to the pass that writes the list. Sharing it is what keeps a broader
 // live wildcard (Bash(*), or a generalized Bash(git *)) from reading as a loss.
 const { isCoveredBy } = require('./permissions');
+const { ruleMatches } = require('./permission-match');
 
 // Server-delivered org policy. This is the one that actually exists on a
 // console-managed machine: restrictions are configured in the organization's
@@ -72,15 +73,23 @@ function managedSettingsPaths(platform = process.platform, home = os.homedir()) 
   return [path.join('/etc', 'claude-code', 'managed-settings.json'), path.join(home, '.claude', 'managed-settings.json')];
 }
 
-// Deliberately a second, independent copy of the matcher in autoLearnUi.js: a
-// bug in one should not silently propagate into the other, and a drift test
-// asserts the two still agree. A rule is a glob over the permission string.
+// Delegates to the shared matcher, like the adapter in autoLearnUi.js. This was
+// a hand-inlined second copy, justified as "a bug in one should not silently
+// propagate into the other". It propagated the other way: the copy was missing
+// two documented rules, so it disagreed with the canonical matcher on exactly
+// the inputs a managed policy contains, and the drift test could not see it
+// because it only asserted that two implementations agreed.
+//
+// What the copy got wrong: no `:*` to ` *` normalization, which is the spelling
+// the managed file uses exclusively, and no bare-command allowance for a lone
+// trailing ` *`. So `Bash(docker ps)` did not match `Bash(docker:*)`.
+//
+// That is not cosmetic. `planPromotions` in local-settings.js withholds a write
+// on this answer, so a false negative promotes a permanently dead allow entry
+// to user scope, and the extension never reads the `denied` list that would
+// have said so. Argument order is kept for every existing caller.
 function permissionMatches(permission, rule) {
-  if (typeof permission !== 'string' || typeof rule !== 'string') return false;
-  if (permission === rule) return true;
-  const pattern = rule.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
-  try { return new RegExp(`^${pattern}$`).test(permission); }
-  catch { return false; }
+  return ruleMatches(rule, permission);
 }
 
 function list(value) {

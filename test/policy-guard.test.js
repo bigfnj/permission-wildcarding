@@ -181,25 +181,45 @@ test('managed settings are looked for where an administrator would put them', ()
   assert.equal(policySignalPaths('win32').length, 3);
 });
 
-// The matcher here is a deliberate second copy of the one in autoLearnUi.js, so
-// a bug in one cannot silently propagate. Duplication only helps while both
-// agree — same rule the two auto-safe gates follow.
-test('the guard matcher does not drift from the review matcher', () => {
+// This test used to be unable to fail, which is worse than not existing: it
+// named the exact drift it could not detect. It asserted only that two
+// implementations AGREE, so any input where both were wrong passed, and none of
+// its eight cases could separate them. The two shapes that can are the ones the
+// managed policy actually uses: the `:*` spelling, which the managed file uses
+// exclusively (see src/managed-policy.js), and a bare command against a lone
+// trailing ` *`. Both are now here, and every case carries the ABSOLUTE
+// expected answer, so agreement on a wrong answer is a failure.
+test('the guard matcher agrees with the review matcher, and both are right', () => {
   const other = require('../vscode-extension/autoLearnUi').permissionMatches;
   const cases = [
-    ['Bash(git status *)', 'Bash(git *)'],
-    ['Bash(rg --files *)', 'Bash(rg *)'],
-    ['Bash(rm *)', 'Bash(rm *)'],
-    ['Bash(whoami *)', 'Bash(git *)'],
-    ['WebFetch(domain:example.com)', 'WebFetch(*)'],
-    ['mcp__figma__get_file', 'mcp__figma__*'],
-    ['Bash(a+b)', 'Bash(a+b)'],
-    ['Bash(x)', '['],
+    ['Bash(git status *)', 'Bash(git *)', true],
+    ['Bash(rg --files *)', 'Bash(rg *)', true],
+    ['Bash(rm *)', 'Bash(rm *)', true],
+    ['Bash(whoami *)', 'Bash(git *)', false],
+    ['WebFetch(domain:example.com)', 'WebFetch(*)', true],
+    ['mcp__figma__get_file', 'mcp__figma__*', true],
+    ['Bash(a+b)', 'Bash(a+b)', true],
+    ['Bash(x)', '[', false],
+    // The colon spelling. A managed `ask` is written this way, and a matcher
+    // blind to it reports a shadowed grant as healthy.
+    ['Bash(docker ps)', 'Bash(docker:*)', true],
+    ['Bash(head -n 5 x)', 'Bash(head:*)', true],
+    ['Bash(git push origin main)', 'Bash(git push:*)', true],
+    ['Bash(gitk)', 'Bash(git:*)', false],
+    // The bare-command allowance: a lone trailing ` *` also matches the prefix
+    // alone, and only while it is the rule's ONLY wildcard.
+    ['Bash(git)', 'Bash(git *)', true],
+    ['Bash(ls)', 'Bash(ls *)', true],
+    ['Bash(git)', 'Bash(git * --x *)', false],
   ];
-  for (const [permission, rule] of cases) {
+  for (const [permission, rule, expected] of cases) {
     assert.equal(
-      permissionMatches(permission, rule), other(permission, rule),
-      `matchers disagree on ${permission} vs ${rule}`,
+      permissionMatches(permission, rule), expected,
+      `guard matcher wrong on ${permission} vs ${rule}`,
+    );
+    assert.equal(
+      other(permission, rule), expected,
+      `review matcher wrong on ${permission} vs ${rule}`,
     );
   }
 });
