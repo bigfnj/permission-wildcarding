@@ -55,6 +55,14 @@ const CODEX_SESSIONS_DIR = path.join(os.homedir(), '.codex', 'sessions');
 // in src/policy-lock.js) so none can land between another's writes.
 
 let debounceTimer = null;
+// One channel for the extension's lifetime, disposed with it. Three sites used
+// to create one PER INVOCATION and never dispose it, and one of those is a
+// palette command with no call limit, so the Output dropdown filled with
+// duplicate "Permission Wildcarding" entries and each retained its backing
+// document. memoryLint.js already had the right pattern: create in activate,
+// register as a subscription.
+let outputChannel = null;
+let recallSyncTimer = null;  // the deferred staleness check, so deactivate can cancel it
 let policyLock = null;      // shared with Auto Learn; created on first write
 let lockedRetries = 0;      // consecutive deferrals while Auto Learn holds it
 let dashboard = null;        // WildcardingViewProvider instance
@@ -343,7 +351,7 @@ function onManagedPolicyChanged() {
     'Show detail'
   ).then((choice) => {
     if (choice !== 'Show detail') return;
-    const channel = vscode.window.createOutputChannel('Permission Wildcarding');
+    const channel = sharedChannel();
     // Name the source honestly. On a console-managed org there is often no
     // managed-settings.json at all, and saying "managed policy: undefined" would
     // be worse than saying where the signal actually came from.
@@ -1107,7 +1115,7 @@ async function reviewAutoLearnCandidates() {
   const blockedCount = (managed.inertFamilies || []).length;
   const blockedNote = managedBlockedNote(managed);
   const showBlockedDetail = () => {
-    const channel = vscode.window.createOutputChannel('Permission Wildcarding');
+    const channel = sharedChannel();
     for (const line of managedBlockedDetail(managed)) channel.appendLine(line);
     channel.show(true);
   };
@@ -1330,7 +1338,7 @@ function showAutoLearnBlocked() {
       'Auto Learn: no command family is blocked by your managed policy.');
     return;
   }
-  const channel = vscode.window.createOutputChannel('Permission Wildcarding');
+  const channel = sharedChannel();
   for (const line of managedBlockedDetail(managed)) channel.appendLine(line);
   channel.show(true);
 }
@@ -1594,12 +1602,24 @@ function registerLocalWatchers(context) {
         watcher.onDidChange(() => scheduleLocalDrain());
         watcher.onDidCreate(() => scheduleLocalDrain());
         watchers.push(watcher);
-        context.subscriptions.push(watcher);
       } catch (error) {
         console.error('permission-wildcarding: local-settings watcher failed —', error);
       }
     }
   };
+  // ONE subscription that drains the live list, rather than one per watcher.
+  // Each watcher used to be pushed into both `watchers` and
+  // `context.subscriptions`, and `attach()` drains only the former. Since
+  // `attach()` re-runs on every workspace-folder change and
+  // `context.subscriptions` is append-only until deactivate, every folder
+  // change left another set of already-disposed watchers pinned there for the
+  // life of the window. memoryLint.js keeps its watchers in a Map it prunes
+  // itself and never hands them to `context.subscriptions`, for this reason.
+  context.subscriptions.push({
+    dispose: () => {
+      while (watchers.length) { try { watchers.pop().dispose(); } catch { /* already gone */ } }
+    },
+  });
   attach();
   // A folder added mid-session brings its own local approvals with it. Both
   // subscriptions are feature-tested rather than assumed: an unexpected host
@@ -1619,6 +1639,14 @@ function registerLocalWatchers(context) {
   context.subscriptions.push({
     dispose() { while (watchers.length) { try { watchers.pop().dispose(); } catch { /* already gone */ } } },
   });
+}
+
+// Created on first use and disposed with the extension. Lazy rather than built
+// in activate, because the mocked-vscode activation test does not stub every
+// window API and a channel nobody opened costs nothing.
+function sharedChannel() {
+  if (!outputChannel) outputChannel = vscode.window.createOutputChannel('Permission Wildcarding');
+  return outputChannel;
 }
 
 function activate(context) {
@@ -1764,7 +1792,7 @@ function activate(context) {
   startAutoLearn(context);
   // Sync the recall index on startup when the model is present and the cache is behind
   // the corpus. Deferred 10 s so the extension host settles first.
-  setTimeout(autoSyncRecallIfStale, 10000);
+  recallSyncTimer = setTimeout(autoSyncRecallIfStale, 10000);
 
   // Memory-index hygiene lint: status-bar bloat gauge + editor squiggles on over-budget
   // hook lines / broken index links. Isolated so a failure here never breaks wildcarding.
@@ -3113,6 +3141,13 @@ async function deactivate() {
   clearTimeout(memBounce);
   clearTimeout(autoLearnBounce);
   clearInterval(autoLearnTimer);
+  // These two were missed. `gatesBounce` spawns Python from its callback, and
+  // the recall timeout's handle was never captured at all, so both could fire
+  // against a torn-down extension after a reload or an upgrade.
+  clearTimeout(gatesBounce);
+  clearTimeout(recallSyncTimer);
+  if (outputChannel) { try { outputChannel.dispose(); } catch { /* already gone */ } }
+  outputChannel = null;
   if (autoLearnWorkerRunner) await autoLearnWorkerRunner.deactivate();
 }
 
