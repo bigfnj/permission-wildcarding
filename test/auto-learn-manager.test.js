@@ -600,3 +600,86 @@ test('a candidate the Codex writer would refuse is never offered as eligible', (
   assert.deepEqual(listed.find((i) => i.key === 'bash:curl').eligibleTargets, []);
   assert.ok(listed.find((i) => i.key === 'bash:wc').eligibleTargets.includes('codex'));
 });
+
+// The assertion no test made: what the apply path actually WRITES for a family
+// a managed rule outranks. `clone` withheld it from the review listing, and
+// docs/claude-code-permissions.md said it was withheld, but the write path
+// never consulted policy at all, and neither auto-safe `scan` nor
+// `--learn apply` goes through `clone`. So the listing said
+// `eligibleTargets: []` and settings.json got the entry regardless.
+test('a family a managed ask outranks is withheld from the write, with the rule named', (t) => {
+  const home = tempHome(t);
+  const settings = path.join(home, '.claude', 'settings.json');
+  writeJson(settings, { permissions: { allow: [] } });
+  // `rg` is beaten by a managed ask; `git status` is the control that nothing
+  // managed touches. Both are auto-safe two-token prefixes, which is what the
+  // Claude exporter requires without an explicit review.
+  writeJson(path.join(home, '.claude', 'remote-settings.json'), {
+    permissions: { ask: ['Bash(rg:*)'], allow: [], deny: [] },
+  });
+  const feed = scannerFeed([
+    observed('g1', 'git status'), observed('g2', 'git status --short'), observed('g3', 'git status'),
+    observed('r1', 'rg --files src'), observed('r2', 'rg --files test'), observed('r3', 'rg --files docs'),
+  ]);
+  const learn = manager(home, feed, { mode: 'auto-safe', threshold: 3, codexRulesPath: null });
+  const { application } = learn.scan();
+
+  const allow = JSON.parse(fs.readFileSync(settings, 'utf8')).permissions.allow;
+  assert.ok(allow.includes('Bash(git status *)'), 'the unblocked family is still written');
+  assert.ok(!allow.some((entry) => entry.includes('rg')),
+    'a grant that cannot stop the prompt is not written');
+  assert.deepEqual(application.applied.claude, ['bash:git status']);
+
+  // Withheld AND reported. Applying nothing to a family with no reason given is
+  // how a report starts lying, so the managed rule that beat it is named.
+  assert.deepEqual(application.withheldByPolicy, [{
+    key: 'bash:rg --files', permission: 'Bash(rg --files *)',
+    decision: 'ask', rule: 'Bash(rg:*)',
+  }]);
+});
+
+test('an unmanaged machine still writes everything it learns', (t) => {
+  // The guard is on `inert` alone. Every permission on a machine with no
+  // managed policy assesses as `unknown`, so blocking on anything broader
+  // would stop the tool writing at all off a corporate box. This is the test
+  // that would fail if the gate were widened.
+  const home = tempHome(t);
+  const settings = path.join(home, '.claude', 'settings.json');
+  writeJson(settings, { permissions: { allow: [] } });
+  const feed = scannerFeed([
+    observed('r1', 'rg --files src'), observed('r2', 'rg --files test'), observed('r3', 'rg --files docs'),
+  ]);
+  const learn = manager(home, feed, { mode: 'auto-safe', threshold: 3, codexRulesPath: null });
+  const { application } = learn.scan();
+
+  assert.deepEqual(application.withheldByPolicy, []);
+  assert.ok(JSON.parse(fs.readFileSync(settings, 'utf8')).permissions.allow
+    .includes('Bash(rg --files *)'), 'no managed policy means nothing is withheld');
+});
+
+test('a managed rule that appears later never revokes a grant already written', (t) => {
+  // The gate is on NEW grants only. Revoking a live grant because a
+  // client-refreshed policy copy now calls it inert is the same error as
+  // deleting a dead allow entry, which this project refuses to do on exactly
+  // those grounds: the copy may be stale, and the grant may still be working.
+  const home = tempHome(t);
+  const settings = path.join(home, '.claude', 'settings.json');
+  const policy = path.join(home, '.claude', 'remote-settings.json');
+  writeJson(settings, { permissions: { allow: [] } });
+  const feed = scannerFeed([
+    observed('r1', 'rg --files src'), observed('r2', 'rg --files test'), observed('r3', 'rg --files docs'),
+  ]);
+  const learn = manager(home, feed, { mode: 'auto-safe', threshold: 3, codexRulesPath: null });
+  learn.scan();
+  assert.ok(JSON.parse(fs.readFileSync(settings, 'utf8')).permissions.allow
+    .includes('Bash(rg --files *)'), 'written while unmanaged');
+
+  // The org adds the rule afterwards. A fresh manager picks up the new policy.
+  writeJson(policy, { permissions: { ask: ['Bash(rg:*)'], allow: [], deny: [] } });
+  const later = manager(home, scannerFeed([]), {
+    mode: 'auto-safe', threshold: 3, codexRulesPath: null,
+  });
+  later.scan();
+  assert.ok(JSON.parse(fs.readFileSync(settings, 'utf8')).permissions.allow
+    .includes('Bash(rg --files *)'), 'the existing grant survives the new rule');
+});

@@ -375,3 +375,4 @@ test('a blanket managed rule governs its whole tool, in all three spellings', (t
   assert.equal(overridingRule(permissive, 'Bash(docker exec *)'), null,
     'an allow does not outrank, so there is nothing to name');
 });
+

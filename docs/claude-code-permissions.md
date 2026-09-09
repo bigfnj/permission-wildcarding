@@ -272,10 +272,23 @@ most powerful non-bypass lever in the next section.
 `assessPermission` labels a permission `inert` when a managed ask or deny covers
 every command it would match, `partial` when the grant is broader than such a
 rule, `redundant` when a managed allow already covers it, and `effective`
-otherwise. An `inert` family is withheld from the Claude review list, because
-writing that rule cannot stop the prompt. `hookEventAllowed` answers the hook
-question, and `maxLayers` now returns `hookBlocked` so MAX mode names a layer
-that cannot run instead of reporting itself as on.
+otherwise. An `inert` family is withheld from the Claude review list **and from
+the write**, because writing that rule cannot stop the prompt.
+`hookEventAllowed` answers the hook question, and `maxLayers` now returns
+`hookBlocked` so MAX mode names a layer that cannot run instead of reporting
+itself as on.
+
+The "and from the write" half was a documentation claim before it was true.
+`clone` dropped `claude` from `eligibleTargets` for an inert family, but the
+apply path never consulted policy, and neither auto-safe `scan` nor
+`--learn apply` goes through `clone`, so the listing said `eligibleTargets: []`
+while `settings.json` got the entry anyway. Three limits keep the gate honest:
+it fires on `inert` alone, because `unknown` is what every permission returns on
+an unmanaged machine and blocking there would refuse every write; it applies to
+new grants only, since revoking a live grant on a client-refreshed policy copy
+is the same error as deleting a dead entry; and each withheld family is
+reported in `withheldByPolicy` with the managed rule that beat it, because
+applying nothing without saying why is how a report starts lying.
 
 `rulePrefix` models command tokens, which only `Bash` and `PowerShell` have, so
 a `Read`, `Edit`, `WebFetch(domain:...)` or `mcp__server__tool` rule used to

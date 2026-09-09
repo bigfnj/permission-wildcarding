@@ -1058,8 +1058,34 @@ function createAutoLearnManager(options = {}) {
       ? record.reviewed.filter((key) => nextCodex.includes(key))
       : record.reviewed.slice();
     const newly = { claude: [], codex: [] };
+    // A managed ask or deny outranks anything written here, so a grant for an
+    // inert family lands and the prompt survives. `clone` has withheld such a
+    // family from the review list for releases, and the docs said it was
+    // withheld, but the WRITE path never consulted policy at all: neither
+    // auto-safe `scan` nor `--learn apply` goes through `clone`. So the listing
+    // said `eligibleTargets: []` and settings.json got the entry anyway.
+    //
+    // Three deliberate limits:
+    //
+    //   - `inert` ONLY. `unknown` is what every permission returns on a machine
+    //     with no managed policy, so blocking on it would refuse every write
+    //     anywhere unmanaged. `partial` means part of the grant does work.
+    //   - NEW grants only. The retention filter above is left alone on purpose:
+    //     revoking a live grant because a client-refreshed policy copy calls it
+    //     inert is the same error as deleting a dead allow entry, which this
+    //     project refuses to do on exactly those grounds.
+    //   - Reported, never silent. Applying nothing to a family a human accepted
+    //     in Review, with no reason given, is how a report starts lying.
+    const withheld = [];
     if (useClaude) for (const item of selected) {
       if (!claudeEligible(item, includeReviewed)) continue;
+      if (assessPermission(managedPolicy(), item.claudePermission) === 'inert') {
+        withheld.push({
+          key: item.key, permission: item.claudePermission,
+          ...(overridingRule(managedPolicy(), item.claudePermission) || {}),
+        });
+        continue;
+      }
       if (!nextClaude.includes(item.key)) newly.claude.push(item.key);
       nextClaude.push(item.key);
       if (includeReviewed) nextReviewedClaude.push(item.key);
@@ -1178,6 +1204,9 @@ function createAutoLearnManager(options = {}) {
       changed: changes.length > 0, changedTargets,
       applied: newly, appliedKeys, appliedCount: appliedKeys.length,
       skippedCount: Math.max(0, (keys || Object.keys(state.candidates)).length - selected.length),
+      // Each entry names the managed rule that beat it, because a verdict alone
+      // sends the reader hunting through a few hundred managed entries.
+      withheldByPolicy: withheld.sort((a, b) => a.key.localeCompare(b.key)),
       at: changes.length ? time : null,
     };
   }
