@@ -683,3 +683,46 @@ test('a managed rule that appears later never revokes a grant already written', 
   assert.ok(JSON.parse(fs.readFileSync(settings, 'utf8')).permissions.allow
     .includes('Bash(rg --files *)'), 'the existing grant survives the new rule');
 });
+
+// `--learn apply` died with a raw TypeError out of policy-exporters whenever a
+// key outlived its candidate. The filter guarded `state.candidates[key]?.autoSafe`
+// on the left of the `||` and then passed the same possibly-absent value
+// unguarded to claudeEligible on the right. The Codex sibling survives the same
+// input because normalizePrefix opens with an Array.isArray guard.
+test('a key that outlived its candidate does not crash the apply path', (t) => {
+  const home = tempHome(t);
+  const settings = path.join(home, '.claude', 'settings.json');
+  writeJson(settings, { permissions: { allow: ['Bash(git status *)'] } });
+  // sanitizeState drops a candidate whose prefix fails validation, while
+  // applied() keeps every key verbatim and never cross-references candidates.
+  // A key in BOTH applied.claude and reviewed.claude is the trigger, and this
+  // ran on every non-observe apply regardless of includeReviewed.
+  writeJson(path.join(home, '.claude', 'wildcarding', 'auto-learn-state.json'), {
+    version: 1, mode: 'auto-safe', threshold: 3,
+    candidates: {
+      'bash:ghost': {
+        key: 'bash:ghost', tool: 'Bash', kind: 'shell', shell: 'bash', root: 'ghost',
+        prefix: [], claudePermission: 'Bash(ghost *)', risk: 'read-only',
+        baseAutoSafe: true, complex: false, reasons: [], sources: ['claude'],
+        counts: { success: 5, failed: 0, unknown: 0, total: 5 },
+      },
+    },
+    observationHashes: {}, cursors: {},
+    applied: { claude: ['bash:ghost'], codex: [] },
+    reviewed: { claude: ['bash:ghost'], codex: [] },
+    codexTargets: {}, managedClaude: {}, lastScanAt: null, lastScanStats: null, lastApplication: null,
+  });
+
+  const learn = manager(home, scannerFeed([]), {
+    mode: 'auto-safe', threshold: 3, codexRulesPath: null,
+  });
+  assert.deepEqual(learn.listCandidates(), [], 'the malformed candidate is dropped on load');
+  assert.deepEqual(learn.status().applied.claude, ['bash:ghost'], 'but its key survives');
+
+  const result = learn.apply({ includeReviewed: false });
+  assert.equal(result.changed, false);
+  assert.deepEqual(result.applied.claude, []);
+  // The user's own entry is untouched: a crash guard must not become a purge.
+  assert.deepEqual(JSON.parse(fs.readFileSync(settings, 'utf8')).permissions.allow,
+    ['Bash(git status *)']);
+});

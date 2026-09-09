@@ -1038,9 +1038,22 @@ function createAutoLearnManager(options = {}) {
     const beforeGrants = grantSnapshot(state);
     const oldClaude = state.applied.claude.slice();
     const oldReviewedClaude = new Set(state.reviewed.claude);
+    // The `?.` on the left proves the candidate can be absent, and the right
+    // side then passed the same value in unguarded, so `--learn apply` died
+    // with a raw TypeError out of policy-exporters rather than doing anything.
+    // Reachable because `sanitizeState` drops a candidate whose `key` or
+    // `prefix` fails validation while `applied()` keeps every key verbatim and
+    // never cross-references the candidates, so one bad persisted entry whose
+    // key sits in both `applied.claude` and `reviewed.claude` is enough. This
+    // ran on EVERY non-observe apply, `includeReviewed` or not.
+    //
+    // A key with no candidate is treated as not-retainable, which is what the
+    // Codex sibling below already does by way of `normalizePrefix`'s guard.
+    // Pruning the orphaned keys instead would discard claims-registry
+    // provenance, so that stays in BACKLOG.
     let nextClaude = useClaude
-      ? oldClaude.filter((key) => state.candidates[key]?.autoSafe ||
-        (oldReviewedClaude.has(key) && claudeEligible(state.candidates[key], true)))
+      ? oldClaude.filter((key) => state.candidates[key] && (state.candidates[key].autoSafe ||
+        (oldReviewedClaude.has(key) && claudeEligible(state.candidates[key], true))))
       : oldClaude.slice();
     let nextReviewedClaude = useClaude
       ? state.reviewed.claude.filter((key) => nextClaude.includes(key))
