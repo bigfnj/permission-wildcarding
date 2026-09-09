@@ -921,69 +921,94 @@ function scanHistoryFiles(options = {}) {
     }
     const prior = priorCursorFor(priorCursors, file, entry.path);
     const cursorKey = cursorKeyForFile(file);
-    const safe = safeContinuation(file, stat, prior, entry.source);
-    if (safe && stat.size === prior.size) {
-      cursors[cursorKey] = cursorForFile(file, entry.source, stat);
-      files.push({ path: file, source: entry.source, mode: 'unchanged', size: stat.size, bytesRead: 0 });
-      continue;
-    }
-
-    let mode = safe && stat.size > prior.size ? 'append' : 'full';
-    let start = 0;
-    let buffer;
-    if (mode === 'append') {
-      const tentativeStart = Math.max(0, prior.size - overlapBytes);
-      buffer = readRange(file, tentativeStart, stat.size - tentativeStart);
-      start = tentativeStart;
-      if (tentativeStart > 0) {
-        const oldPrefixLength = prior.size - tentativeStart;
-        const newline = buffer.subarray(0, oldPrefixLength).indexOf(10);
-        if (newline === -1) {
-          mode = 'full';
-          start = 0;
-          buffer = readRange(file, 0, stat.size);
-        } else {
-          start = tentativeStart + newline + 1;
-          buffer = buffer.subarray(newline + 1);
-        }
-      }
-    } else {
-      buffer = readRange(file, 0, stat.size);
-    }
-
+    // Everything from here is inside the per-file try. It used not to be: the
+    // three `readRange` calls below, and `cursorForFile` on the `unchanged`
+    // fast path, all sat outside it. `readRange` throws on ENOENT for a
+    // transcript deleted between the enumeration above and the read, on
+    // EACCES/EPERM/EBUSY while antivirus or another process holds a Windows
+    // lock, on EMFILE, and on ERR_OUT_OF_RANGE for a file past the buffer
+    // limit. Any of those escaped `scanHistoryFiles`, escaped `scan()`, and
+    // took `save(state)` with it, so ONE transient failure among hundreds of
+    // files discarded every other file's cursor progress and the extension
+    // then backed its retry off to an hour. The fast path was the easiest to
+    // miss, because it looks read-only and is in fact two file reads deep.
+    let safe = false;
+    let mode = 'full';
     try {
-      let parsed = parseHistorySlice(entry.source, buffer, {
-        file, baseOffset: start, platform: options.platform, defaultTool: options.defaultTool,
-        probeMatcher: options.probeMatcher,
-      });
-      if (mode === 'append') {
-        const appendedStart = Math.max(0, prior.size - start);
-        const resultIds = appendedResultIds(entry.source, buffer.subarray(appendedStart));
-        const parsedCalls = new Set(parsed.map((observation) => observation.callId).filter(Boolean));
-        if ([...resultIds].some((id) => !parsedCalls.has(id))) {
-          // The bounded overlap did not reach the matching request. Reconcile
-          // this file once so a result crossing the cursor is never lost.
-          start = 0;
-          buffer = readRange(file, 0, stat.size);
-          parsed = parseHistorySlice(entry.source, buffer, {
-            file, baseOffset: 0, platform: options.platform, defaultTool: options.defaultTool,
-            probeMatcher: options.probeMatcher,
-          });
-        }
+      safe = safeContinuation(file, stat, prior, entry.source);
+      if (safe && stat.size === prior.size) {
+        cursors[cursorKey] = cursorForFile(file, entry.source, stat);
+        files.push({ path: file, source: entry.source, mode: 'unchanged', size: stat.size, bytesRead: 0 });
+        continue;
       }
-      const selected = mode === 'full'
-        ? parsed
-        : parsed.filter((observation) =>
-          observation._callEnd > prior.size || observation._resultEnd > prior.size
-        );
-      observations.push(...selected);
-      cursors[cursorKey] = cursorForFile(file, entry.source, stat);
-      files.push({
-        path: file, source: entry.source, mode, size: stat.size,
-        bytesRead: buffer.length, observations: selected.length,
-      });
+
+      mode = safe && stat.size > prior.size ? 'append' : 'full';
+      let start = 0;
+      let buffer;
+      if (mode === 'append') {
+        const tentativeStart = Math.max(0, prior.size - overlapBytes);
+        buffer = readRange(file, tentativeStart, stat.size - tentativeStart);
+        start = tentativeStart;
+        if (tentativeStart > 0) {
+          const oldPrefixLength = prior.size - tentativeStart;
+          const newline = buffer.subarray(0, oldPrefixLength).indexOf(10);
+          if (newline === -1) {
+            mode = 'full';
+            start = 0;
+            buffer = readRange(file, 0, stat.size);
+          } else {
+            start = tentativeStart + newline + 1;
+            buffer = buffer.subarray(newline + 1);
+          }
+        }
+      } else {
+        buffer = readRange(file, 0, stat.size);
+      }
+
+        let parsed = parseHistorySlice(entry.source, buffer, {
+          file, baseOffset: start, platform: options.platform, defaultTool: options.defaultTool,
+          probeMatcher: options.probeMatcher,
+        });
+        if (mode === 'append') {
+          const appendedStart = Math.max(0, prior.size - start);
+          const resultIds = appendedResultIds(entry.source, buffer.subarray(appendedStart));
+          const parsedCalls = new Set(parsed.map((observation) => observation.callId).filter(Boolean));
+          if ([...resultIds].some((id) => !parsedCalls.has(id))) {
+            // The bounded overlap did not reach the matching request. Reconcile
+            // this file once so a result crossing the cursor is never lost.
+            start = 0;
+            buffer = readRange(file, 0, stat.size);
+            parsed = parseHistorySlice(entry.source, buffer, {
+              file, baseOffset: 0, platform: options.platform, defaultTool: options.defaultTool,
+              probeMatcher: options.probeMatcher,
+            });
+          }
+        }
+        const selected = mode === 'full'
+          ? parsed
+          : parsed.filter((observation) =>
+            observation._callEnd > prior.size || observation._resultEnd > prior.size
+          );
+        observations.push(...selected);
+        cursors[cursorKey] = cursorForFile(file, entry.source, stat);
+        files.push({
+          path: file, source: entry.source, mode, size: stat.size,
+          bytesRead: buffer.length, observations: selected.length,
+        });
     } catch (error) {
-      if (prior) cursors[cursorKey] = prior;
+      // Carry the prior cursor forward ONLY when it still describes the file.
+      // When `safe` is false the file was rewritten or truncated, so the prior
+      // offset points into bytes that no longer exist, and writing it back made
+      // the next scan resume from the wrong place and silently skip real
+      // observations. Better to re-read a file we failed on than to claim
+      // progress we did not make.
+      //
+      // A first-sight failure therefore still records no cursor and is re-read
+      // next scan. That is deliberate: the alternative, inventing a cursor we
+      // did not earn, trades a bounded I/O cost for permanent data loss. Making
+      // it skip-until-changed needs a failure-tracking structure of its own,
+      // which is in BACKLOG rather than smuggled in here.
+      if (safe && prior) cursors[cursorKey] = prior;
       files.push({ path: file, source: entry.source, mode: 'error', size: stat.size, error: error.message });
     }
   }

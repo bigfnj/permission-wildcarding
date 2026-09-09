@@ -371,3 +371,96 @@ test('incremental scanning falls back to a full scan after truncation', (t) => {
   assert.equal(rewritten.files[0].mode, 'full');
   assert.deepEqual(rewritten.observations.map(({ command }) => command), ['pwd']);
 });
+
+// One unreadable file used to end the whole scan. The reads sat outside the
+// per-file try, so the throw escaped scanHistoryFiles, escaped scan(), and took
+// save(state) with it: every other file's cursor progress was discarded and the
+// extension then backed its retry off to an hour. Nothing in the suite drove a
+// failing read, so the entire catch had no coverage.
+test('one unreadable transcript does not cost the whole scan its progress', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wildcard-scan-fail-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const transcript = (id, command) => `${JSON.stringify({
+    type: 'response_item',
+    payload: { type: 'function_call', name: 'shell_command', call_id: id, arguments: JSON.stringify({ command }) },
+  })}\n${JSON.stringify({
+    type: 'response_item',
+    payload: { type: 'function_call_output', call_id: id, output: { exit_code: 0 } },
+  })}\n`;
+
+  // Sorted by path, so `b` is read between `a` and `c` and a throw there would
+  // have taken `c` down with it as well as discarding `a`.
+  for (const [name, command] of [['a', 'rg alpha'], ['b', 'rg beta'], ['c', 'rg gamma']]) {
+    fs.writeFileSync(path.join(root, `${name}.jsonl`), transcript(`${name}-1`, command));
+  }
+
+  // Fail exactly one file's read, at the layer that really throws on a deleted
+  // or locked transcript, rather than by mangling its contents: a parse failure
+  // takes a different path and would not have reproduced this.
+  const realOpen = fs.openSync;
+  const target = path.join(root, 'b.jsonl');
+  t.after(() => { fs.openSync = realOpen; });
+  fs.openSync = (file, ...rest) => {
+    if (String(file) === target) {
+      const error = new Error(`EBUSY: resource busy or locked, open '${file}'`);
+      error.code = 'EBUSY';
+      throw error;
+    }
+    return realOpen(file, ...rest);
+  };
+
+  const result = scanHistoryFiles({ cursors: {}, codexRoots: [root], claudeRoots: [] });
+  const byMode = (mode) => result.files.filter((entry) => entry.mode === mode).map(
+    (entry) => path.basename(entry.path)).sort();
+
+  assert.deepEqual(byMode('error'), ['b.jsonl'], 'the locked file is reported, not thrown');
+  assert.deepEqual(byMode('full'), ['a.jsonl', 'c.jsonl'], 'and the others were still read');
+  assert.equal(Object.keys(result.cursors).length, 2,
+    'two cursors survive, so the next scan does not redo the whole corpus');
+  assert.deepEqual(result.observations.map((item) => item.command).sort(),
+    ['rg alpha', 'rg gamma']);
+  assert.match(result.files.find((entry) => entry.mode === 'error').error, /EBUSY/);
+
+  // And the file recovers on its own once the read succeeds again, with no
+  // manual intervention and no cursor invented for it in the meantime.
+  fs.openSync = realOpen;
+  const second = scanHistoryFiles({ cursors: result.cursors, codexRoots: [root], claudeRoots: [] });
+  assert.deepEqual(second.observations.map((item) => item.command), ['rg beta'],
+    'only the previously failed file is re-read');
+  assert.equal(Object.keys(second.cursors).length, 3);
+});
+
+test('a rewritten file that fails to read does not keep a cursor that no longer fits', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wildcard-scan-stale-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, 'session.jsonl');
+  const line = (id, command) => `${JSON.stringify({
+    type: 'response_item',
+    payload: { type: 'function_call', name: 'shell_command', call_id: id, arguments: JSON.stringify({ command }) },
+  })}\n`;
+
+  fs.writeFileSync(file, `${line('one', 'rg first')}${line('two', 'rg second')}`);
+  const first = scanHistoryFiles({ cursors: {}, codexRoots: [root], claudeRoots: [] });
+  const cursor = first.cursors[cursorKeyForFile(file)];
+  assert.ok(cursor, 'a clean scan records a cursor');
+
+  // Truncate to something shorter, which makes the prior cursor describe bytes
+  // that no longer exist, then fail the read. Carrying that cursor forward made
+  // the next scan resume from the wrong offset and silently skip real calls, so
+  // re-reading is the correct outcome even though it costs I/O.
+  fs.writeFileSync(file, line('three', 'rg third'));
+  const realOpen = fs.openSync;
+  t.after(() => { fs.openSync = realOpen; });
+  fs.openSync = () => { const e = new Error('EBUSY'); e.code = 'EBUSY'; throw e; };
+  const failed = scanHistoryFiles({ cursors: first.cursors, codexRoots: [root], claudeRoots: [] });
+  fs.openSync = realOpen;
+
+  assert.equal(failed.files[0].mode, 'error');
+  assert.equal(failed.cursors[cursorKeyForFile(file)], undefined,
+    'a cursor for bytes that are gone is worse than none');
+
+  const recovered = scanHistoryFiles({ cursors: failed.cursors, codexRoots: [root], claudeRoots: [] });
+  assert.deepEqual(recovered.observations.map((item) => item.command), ['rg third'],
+    'the rewritten content is read in full rather than skipped');
+});
