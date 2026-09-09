@@ -68,14 +68,16 @@ function plural(count, word) {
 // go looking for the setting.
 function preamble(entry) {
   const decision = entry.decision === 'deny' ? 'deny' : 'ask';
-  return `\`${entry.rule}\` is a managed \`${decision}\`, which outranks every ` +
+  const extra = Array.isArray(entry.rules) && entry.rules.length > 1
+    ? `, plus ${plural(entry.rules.length - 1, 'more rule')} of the same shape` : '';
+  return `\`${entry.rule}\` is a managed \`${decision}\`${extra}, which outranks every ` +
     `user allow entry, so no wildcard can stop it. Measured ${plural(entry.prompts, 'prompt')}.`;
 }
 
 const MITIGATIONS = [
   {
     id: 'batch-file-edits',
-    match: (entry) => WRITE_TOOLS.has(entry.tool) && specifierOf(entry.rule) !== null,
+    match: (entry) => WRITE_TOOLS.has(entry.tool),
     title: 'Editing a path a managed rule gates',
     body: (entry) => `${preamble(entry)} Read the file, decide every change, then ` +
       `apply ONE consolidated ${entry.tool} per file per pass instead of a sequence of ` +
@@ -84,7 +86,7 @@ const MITIGATIONS = [
   },
   {
     id: 'read-gated-path-once',
-    match: (entry) => entry.tool === 'Read' && specifierOf(entry.rule) !== null,
+    match: (entry) => entry.tool === 'Read',
     title: 'Reading a path a managed rule gates',
     body: (entry) => `${preamble(entry)} The contents do not change between reads, so ` +
       `read it once and keep what you need rather than re-reading it later in the same ` +
@@ -101,7 +103,7 @@ const MITIGATIONS = [
   },
   {
     id: 'script-multi-step-work',
-    match: (entry) => COMMAND_TOOLS.has(entry.tool) && specifierOf(entry.rule) !== null,
+    match: (entry) => COMMAND_TOOLS.has(entry.tool),
     title: 'Running a command a managed rule gates',
     body: (entry) => `${preamble(entry)} Each invocation is its own prompt, so put the ` +
       `multi-step work in a script and run the script once. Approving one script beats ` +
@@ -109,34 +111,60 @@ const MITIGATIONS = [
   },
 ];
 
-// `costliestRules` from the managed report, ranked. Anything without a tool, a
-// specifier or a known shape is skipped rather than guessed at.
+// `costliestRules` from the managed report, ranked. Anything without a tool or a
+// known shape is skipped rather than guessed at.
+//
+// Grouped by mitigation id, not emitted per rule. There are four ids and a
+// managed policy can easily carry two rules of one shape, so a per-rule list
+// produced duplicate ids, and every structure downstream assumes an id is
+// unique: the accepted/declined sets, the marker pair, and the `wanted` map in
+// `reconcileDerived`. The observable damage was that the LAST rule won, so the
+// installed block named the cheaper rule and the expensive one got no advice
+// while still consuming one of the three cap slots. Grouping fixes both: the
+// costliest rule of a shape is the one named, the others are counted into the
+// same total, and the cap now limits distinct advice rather than rule count.
 function deriveMitigations(costliestRules, options = {}) {
   const threshold = Number.isFinite(options.threshold)
     ? Math.max(1, Math.floor(options.threshold)) : DEFAULT_THRESHOLD;
   const limit = Number.isFinite(options.limit)
     ? Math.max(0, Math.floor(options.limit)) : DEFAULT_LIMIT;
   const rules = Array.isArray(costliestRules) ? costliestRules : [];
-  const derived = [];
-  const seen = new Set();
+  const groups = new Map();
+  const seenRules = new Set();
   for (const item of rules) {
-    if (derived.length >= limit) break;
     const rule = typeof item?.rule === 'string' ? item.rule : '';
     const prompts = Number(item?.prompts) || 0;
-    if (!rule || prompts < threshold || seen.has(rule)) continue;
+    if (!rule || prompts < threshold || seenRules.has(rule)) continue;
     const tool = toolOf(rule);
     if (!tool) continue;
     const entry = {
       rule, prompts, tool,
       decision: item.decision === 'deny' ? 'deny' : 'ask',
-      tools: Array.isArray(item.tools) ? item.tools.slice() : [],
+      tools: Array.isArray(item.tools) ? item.tools.filter(Boolean) : [],
     };
     const mitigation = MITIGATIONS.find((candidate) => candidate.match(entry));
     if (!mitigation) continue;
-    seen.add(rule);
+    seenRules.add(rule);
+    const group = groups.get(mitigation.id);
+    if (group) {
+      group.rules.push(rule);
+      group.prompts += prompts;
+      for (const name of entry.tools) if (!group.tools.includes(name)) group.tools.push(name);
+      continue;
+    }
+    groups.set(mitigation.id, {
+      mitigation, rule, rules: [rule], prompts, tool,
+      decision: entry.decision, tools: entry.tools.slice(),
+    });
+  }
+  const derived = [];
+  for (const group of groups.values()) {
+    if (derived.length >= limit) break;
     derived.push({
-      id: mitigation.id, rule, decision: entry.decision, prompts, tool,
-      tools: entry.tools, title: mitigation.title, body: mitigation.body(entry),
+      id: group.mitigation.id, rule: group.rule, rules: group.rules.slice(),
+      decision: group.decision, prompts: group.prompts, tool: group.tool,
+      tools: group.tools.slice(), title: group.mitigation.title,
+      body: group.mitigation.body(group),
     });
   }
   return derived;
@@ -231,11 +259,21 @@ function readFileOrEmpty(file) {
   catch (error) { return error.code === 'ENOENT' ? '' : null; }
 }
 
-// Which derived blocks each installed agent's file currently carries. Read-only,
-// and an unreadable file says so rather than reporting an empty list, because
-// "no blocks" and "cannot tell" lead to opposite next actions.
-function derivedStatus({ home = os.homedir(), targets } = {}) {
-  return (targets || installedGuidanceTargets(home)).map((target) => {
+// Claude only, unlike the static shell-style block. That block is about writing
+// one command per tool call, which is true for any agent. These mitigations are
+// not: the evidence comes from Claude transcripts and a Claude managed policy,
+// the precedence argument in every body is Claude's, and the advice names Claude
+// tools. Writing "a managed `ask` outranks every user allow entry" into
+// ~/.codex/AGENTS.md describes a model Codex does not have.
+function derivedTargets(home) {
+  return installedGuidanceTargets(home).filter((target) => target.agent === 'claude');
+}
+
+// Which derived blocks the instruction file currently carries. Read-only, and an
+// unreadable file says so rather than reporting an empty list, because "no
+// blocks" and "cannot tell" lead to opposite next actions.
+function derivedStatus({ home = os.homedir() } = {}) {
+  return derivedTargets(home).map((target) => {
     const text = readFileOrEmpty(target.path);
     return {
       agent: target.agent, path: target.path, readable: text !== null,
@@ -251,9 +289,8 @@ function derivedStatus({ home = os.homedir(), targets } = {}) {
 function setDerivedGuidance(mitigations, accepted, {
   home = os.homedir(),
   backupDir = path.join(os.homedir(), '.claude', 'backups'),
-  targets,
 } = {}) {
-  return (targets || installedGuidanceTargets(home)).map((target) => {
+  return derivedTargets(home).map((target) => {
     const base = { agent: target.agent, path: target.path };
     const text = readFileOrEmpty(target.path);
     if (text === null) {

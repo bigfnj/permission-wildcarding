@@ -967,7 +967,7 @@ function scanHistoryFiles(options = {}) {
           buffer = readRange(file, 0, stat.size);
           parsed = parseHistorySlice(entry.source, buffer, {
             file, baseOffset: 0, platform: options.platform, defaultTool: options.defaultTool,
-        probeMatcher: options.probeMatcher,
+            probeMatcher: options.probeMatcher,
           });
         }
       }

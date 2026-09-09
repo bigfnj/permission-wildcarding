@@ -60,6 +60,18 @@ if (argv.includes('--learn')) {
   process.stdin.resume();
 }
 
+// The first positional argument after a verb, with flag/value pairs skipped, so
+// a flag written before the id is not mistaken for the id.
+function positionalAfter(args, name, skip) {
+  const start = args.indexOf(name);
+  if (start === -1) return undefined;
+  for (let index = start + skip; index < args.length; index += 1) {
+    if (String(args[index]).startsWith('--')) { index += 1; continue; }
+    return args[index];
+  }
+  return undefined;
+}
+
 function learnOption(args, name, fallback) {
   const index = args.indexOf(name);
   if (index === -1) return fallback;
@@ -325,13 +337,31 @@ function guidance(args) {
         process.stdout.write(JSON.stringify(manager.derivedReview(), null, 2) + '\n');
         return;
       }
-      const id = args[args.indexOf('--guidance') + 2];
+      // Positionally, but skipping flag/value pairs. Taking `+ 2` blindly meant
+      // `--guidance accept --workspace D:\x batch-file-edits` recorded a
+      // decision for the id `--workspace`, which passes the id pattern, and
+      // then ran a full reconcile against it.
+      const id = positionalAfter(args, '--guidance', 2);
       if (!id) {
         process.stderr.write(`wildcard-perms --guidance ${cmd}: an id is required. ` +
           'Run --guidance derived to list them.\n');
         process.exit(1);
       }
-      process.stdout.write(JSON.stringify(manager.decideDerived(id, cmd), null, 2) + '\n');
+      const outcome = manager.decideDerived(id, cmd);
+      process.stdout.write(JSON.stringify(outcome, null, 2) + '\n');
+      // A failed write to someone's instruction file must not exit 0. The
+      // on/off path below already checks this; these verbs did not.
+      const failed = (outcome.targets || []).filter((target) => target.error);
+      if (failed.length) {
+        for (const target of failed) {
+          process.stderr.write(`wildcard-perms --guidance ${cmd} [${target.agent}]: ${target.error}\n`);
+        }
+        process.exitCode = 1;
+      } else if (outcome.blocked) {
+        process.stderr.write(`wildcard-perms --guidance ${cmd}: decision recorded, but the ` +
+          `instruction file was left alone (${outcome.blocked}).\n`);
+        process.exitCode = 1;
+      }
     } catch (error) {
       process.stderr.write(`wildcard-perms --guidance ${cmd}: ${error.message}\n`);
       process.exitCode = 1;

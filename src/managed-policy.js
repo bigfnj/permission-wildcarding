@@ -88,13 +88,6 @@ function readPolicy(options = {}) {
   };
 }
 
-// How a managed policy would treat the permission we are about to write.
-//
-//   'inert'     every command the grant matches also matches a managed ask or
-//               deny, so the grant changes nothing and the prompt remains
-//   'partial'   the grant is broader than such a rule, so part of it works
-//   'redundant' a managed allow already covers it
-//   'effective' the policy has nothing to say
 // The tool a rule or permission belongs to. `Edit(**/*.ps1)` is `Edit`; a bare
 // `Edit` with no specifier is also `Edit`. An mcp permission is its own tool
 // name, so dots and hyphens are allowed in the bare form.
@@ -103,6 +96,15 @@ function toolOf(value) {
   const parsed = RULE_SHAPE.exec(text);
   if (parsed) return parsed[1];
   return /^[A-Za-z_][A-Za-z0-9_.-]*$/.test(text) ? text : null;
+}
+
+// A path specifier is not a command specifier. A managed glob is authored with
+// forward slashes for a case-insensitive filesystem, so `Edit(**/*.ps1)` tested
+// against `D:\repo\Build.PS1` missed on BOTH counts and the rule looked free.
+// Folding case and separators can only ever make this module withhold or label
+// more, never widen a grant, which is the direction it already documents.
+function slashFold(value) {
+  return value.replace(/\\/g, '/').toLowerCase();
 }
 
 // Does a managed rule govern this permission, for a tool whose specifier is not
@@ -114,10 +116,24 @@ function toolOf(value) {
 // a regex cannot express is the tool-level rule: a bare `Edit` carries no
 // specifier and therefore governs every Edit call.
 function coversPermission(rule, permission) {
-  const ruleTool = toolOf(rule);
-  if (!ruleTool || ruleTool !== toolOf(permission)) return false;
-  if (!RULE_SHAPE.test(String(rule).trim())) return true;
-  return ruleMatches(rule, permission);
+  const ruleText = String(rule == null ? '' : rule).trim();
+  const permText = String(permission == null ? '' : permission).trim();
+  // MCP has two documented wildcard shapes and neither is a `Tool(specifier)`,
+  // so `toolOf` reads the whole string as the tool name and they compared
+  // unequal. Prefix matching on the `__` boundary is exact: unlike splitting on
+  // `__`, it cannot mis-parse a server name that itself contains one.
+  if (ruleText.startsWith('mcp__')) {
+    const prefix = ruleText.endsWith('*') ? ruleText.slice(0, -1) : `${ruleText}__`;
+    if (prefix.length > 'mcp__'.length - 1 && permText.startsWith(prefix)) return true;
+  }
+  const ruleTool = toolOf(ruleText);
+  if (!ruleTool || ruleTool !== toolOf(permText)) return false;
+  // A bare tool name has no specifier to match, so it covers the whole tool.
+  // Tested on the trimmed text, because the untrimmed one was what the next
+  // line used and a padded rule was invisible on every path.
+  if (!RULE_SHAPE.test(ruleText)) return true;
+  if (COMMAND_TOOLS.has(ruleTool)) return ruleMatches(ruleText, permText);
+  return ruleMatches(slashFold(ruleText), slashFold(permText));
 }
 
 // Same vocabulary as the command path below, decided on rule text instead of
@@ -133,6 +149,13 @@ function assessByText(policy, permission) {
   return 'effective';
 }
 
+// How a managed policy would treat the permission we are about to write.
+//
+//   'inert'     every command the grant matches also matches a managed ask or
+//               deny, so the grant changes nothing and the prompt remains
+//   'partial'   the grant is broader than such a rule, so part of it works
+//   'redundant' a managed allow already covers it
+//   'effective' the policy has nothing to say
 function assessPermission(policy, permission) {
   if (!policy || !policy.present) return 'unknown';
   const mine = rulePrefix(permission);

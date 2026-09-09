@@ -278,16 +278,6 @@ function restoreGrants(state, grants) {
   state.codexTargets = codexTargets(grants?.codexTargets);
   state.managedClaude = managedClaude(grants?.managedClaude);
 }
-// How many times each managed rule actually cost a prompt. The KEY is a managed
-// rule string, which is org policy: no path, argument or prompt text is
-// involved, which is what lets this be persisted at all. The decision (ask vs
-// deny) is deliberately NOT stored, because the policy is a client-refreshed
-// cache and a decision cached here could contradict the live file; it is
-// resolved at report time instead.
-//
-// Capped because this is a new dimension in a long-lived file. A managed policy
-// carries a few dozen rules, so the limit is generous and hitting it means a
-// bug rather than a workload.
 // Which derived mitigations a human has ruled on. `declined` is not the absence
 // of `accepted`: without it a rejected mitigation would be re-offered on every
 // scan forever, which is how a review list trains its reader to ignore it.
@@ -303,6 +293,31 @@ function derivedGuidance(value) {
     .filter((item) => !accepted.includes(item));
   return { accepted, declined };
 }
+// True when `rebuildManagedHits` already accounted for this call. Compared as
+// ISO-8601 strings, which sort lexicographically, so no date parsing is needed.
+//
+// A call with NO timestamp counts as already accounted for. That direction is
+// deliberate: this number is written verbatim into a human's instruction file as
+// the justification for a standing rule, so inflating it is the worse failure,
+// and a rebuild followed by a scan is the recommended bootstrap rather than an
+// edge case. Real transcripts carry timestamps on every record, so the practical
+// cost is nil, and no watermark at all means nothing is skipped.
+function countedByRebuild(state, observation) {
+  const through = state.managedHitsAt;
+  if (!through) return false;
+  const stamp = typeof observation?.timestamp === 'string' ? observation.timestamp : '';
+  return !stamp || stamp <= through;
+}
+// How many times each managed rule actually cost a prompt. The KEY is a managed
+// rule string, which is org policy: no path, argument or prompt text is
+// involved, which is what lets this be persisted at all. The decision (ask vs
+// deny) is deliberately NOT stored, because the policy is a client-refreshed
+// cache and a decision cached here could contradict the live file; it is
+// resolved at report time instead.
+//
+// Capped because this is a new dimension in a long-lived file. A managed policy
+// carries a few dozen rules, so the limit is generous and hitting it means a
+// bug rather than a workload.
 const MANAGED_HITS_LIMIT = 200;
 function managedHits(value) {
   if (!object(value)) return {};
@@ -339,7 +354,7 @@ function emptyState(mode, threshold) {
   return {
     version: VERSION, mode, threshold, candidates: {}, observationHashes: {}, cursors: {},
     applied: { claude: [], codex: [] }, reviewed: { claude: [], codex: [] },
-    codexTargets: {}, managedClaude: {}, managedHits: {},
+    codexTargets: {}, managedClaude: {}, managedHits: {}, managedHitsAt: null,
     derivedGuidance: { accepted: [], declined: [] },
     lastScanAt: null, lastScanStats: null,
     lastApplication: null,
@@ -401,6 +416,7 @@ function sanitizeState(raw, mode, threshold) {
   state.codexTargets = codexTargets(raw.codexTargets);
   state.managedClaude = managedClaude(raw.managedClaude);
   state.managedHits = managedHits(raw.managedHits);
+  state.managedHitsAt = clean(raw.managedHitsAt, 64) || null;
   state.derivedGuidance = derivedGuidance(raw.derivedGuidance);
   state.lastScanAt = clean(raw.lastScanAt, 64) || null;
   if (object(raw.lastScanStats)) state.lastScanStats = {
@@ -428,7 +444,7 @@ function persistentState(state) {
     observationHashes: state.observationHashes, cursors: state.cursors,
     applied: applied(state.applied), reviewed: applied(state.reviewed),
     codexTargets: codexTargets(state.codexTargets), managedClaude: managedClaude(state.managedClaude),
-    managedHits: managedHits(state.managedHits),
+    managedHits: managedHits(state.managedHits), managedHitsAt: state.managedHitsAt,
     derivedGuidance: derivedGuidance(state.derivedGuidance),
     lastScanAt: state.lastScanAt, lastScanStats: state.lastScanStats,
     lastApplication: state.lastApplication,
@@ -761,10 +777,17 @@ function createAutoLearnManager(options = {}) {
     for (const [rule, record] of Object.entries(object(hits) ? hits : {})) {
       addCost(rule, record.hits, record.tools);
     }
+    // A hit-table key has been through `clean`, which collapses whitespace runs
+    // and truncates at 200 characters, so comparing it to the raw policy string
+    // could never match for a long or oddly spaced rule and the entry was
+    // reported as an `ask`. Deny is the stricter fact and it ends up quoted
+    // verbatim in a standing instruction, so put both sides through the same
+    // transform before deciding.
+    const denySet = new Set((policy.raw?.deny || []).map((item) => clean(item, 200)));
     const costliestRules = [...costs.values()]
       .map((entry) => ({
         ...entry, tools: entry.tools.filter(Boolean).sort(),
-        decision: policy.raw?.deny?.some((item) => item === entry.rule) ? 'deny' : 'ask',
+        decision: denySet.has(clean(entry.rule, 200)) ? 'deny' : 'ask',
       }))
       .sort((a, b) => b.prompts - a.prompts || a.rule.localeCompare(b.rule));
     return {
@@ -790,17 +813,37 @@ function createAutoLearnManager(options = {}) {
   // What the managed report implies the agent should do differently, plus what a
   // human has already ruled on. Read-only: deriving is separate from installing
   // so a mitigation can be shown and refused.
+  // Derived uncapped, then capped only where it matters. The cap exists to
+  // limit how much advice is OFFERED, not to evict advice a human already
+  // accepted: applying it first meant a fourth costlier rule appearing silently
+  // uninstalled an accepted mitigation whose own rule was still far above
+  // threshold, which nothing in the module documented.
+  function derivedFor(state, request = {}) {
+    const current = statusFrom(state);
+    const all = deriveMitigations(current.managed.costliestRules, {
+      threshold: request.threshold, limit: Number.MAX_SAFE_INTEGER,
+    });
+    const limit = Number.isFinite(request.limit) ? Math.max(0, request.limit) : DEFAULT_LIMIT;
+    const accepted = state.derivedGuidance.accepted;
+    const declined = state.derivedGuidance.declined;
+    const decided = new Set([...accepted, ...declined]);
+    const pending = all.filter((item) => !decided.has(item.id)).slice(0, limit);
+    const pendingIds = new Set(pending.map((item) => item.id));
+    return {
+      managed: current.managed, all, pending, limit,
+      threshold: Number.isFinite(request.threshold) ? request.threshold : DEFAULT_THRESHOLD,
+      // What a reader should see: everything ruled on, plus what is on offer.
+      visible: all.filter((item) => decided.has(item.id) || pendingIds.has(item.id)),
+    };
+  }
   function derivedReview(request = {}) {
     const state = load();
-    const current = statusFrom(state);
-    const mitigations = deriveMitigations(current.managed.costliestRules, request);
-    const decided = new Set([...state.derivedGuidance.accepted, ...state.derivedGuidance.declined]);
+    const derived = derivedFor(state, request);
     return {
-      threshold: Number.isFinite(request.threshold) ? request.threshold : DEFAULT_THRESHOLD,
-      limit: Number.isFinite(request.limit) ? request.limit : DEFAULT_LIMIT,
-      policy: current.managed.policy, degraded: Boolean(current.managed.degraded),
-      mitigations,
-      pending: mitigations.filter((item) => !decided.has(item.id)),
+      threshold: derived.threshold, limit: derived.limit,
+      policy: derived.managed.policy, degraded: Boolean(derived.managed.degraded),
+      mitigations: derived.visible,
+      pending: derived.pending,
       accepted: state.derivedGuidance.accepted.slice(),
       declined: state.derivedGuidance.declined.slice(),
       targets: derivedStatus({ home }),
@@ -832,14 +875,29 @@ function createAutoLearnManager(options = {}) {
         accepted: [...accepted], declined: [...declined],
       });
       save(state);
-      const mitigations = deriveMitigations(statusFrom(state).managed.costliestRules, request);
-      const targets = setDerivedGuidance(mitigations, state.derivedGuidance.accepted,
-        { home, backupDir });
-      return {
+      const derived = derivedFor(state, request);
+      const result = {
         id: key, decision,
         accepted: state.derivedGuidance.accepted.slice(),
         declined: state.derivedGuidance.declined.slice(),
-        targets,
+      };
+      // Without a usable policy there is no derivation, and reconciling against
+      // an empty one does not "install nothing", it DELETES every accepted
+      // block from the user's own instruction file. The decision is still
+      // recorded; only the write is withheld, so a transient policy read
+      // failure costs nothing and is repaired by the next decide. Absence is
+      // withheld too: `readPolicy` documents that a machine with no managed
+      // policy proves nothing, and this module may withhold but never destroy.
+      if (derived.managed.policy !== 'present') {
+        return {
+          ...result, targets: [],
+          blocked: derived.managed.degraded ? 'managed-policy-unreadable' : 'managed-policy-absent',
+        };
+      }
+      return {
+        ...result,
+        targets: setDerivedGuidance(derived.all, state.derivedGuidance.accepted,
+          { home, backupDir }),
       };
     });
   }
@@ -1154,12 +1212,30 @@ function createAutoLearnManager(options = {}) {
       const state = load();
       const matcher = probeMatcher();
       const policy = managedPolicy();
+      // An unreadable policy is not a policy with no rules. Clearing the table
+      // here said `degraded: true` and then mutated as if clean, which is the
+      // rule this file enforces elsewhere inverted: the managed file is a
+      // client-rewritten cache, so catching it mid-write once was enough to
+      // destroy a full-corpus derivation. Absence IS positive evidence, because
+      // `readPolicy` distinguishes ENOENT from a parse failure on purpose, so
+      // that case still clears rather than keeping counts for rules that are
+      // provably gone.
+      if (policy.unreadable) {
+        const kept = Object.keys(state.managedHits).length;
+        return {
+          policy: 'unreadable', degraded: true, blocked: 'managed-policy-unreadable',
+          rules: kept, prompts: Object.values(state.managedHits)
+            .reduce((total, item) => total + item.hits, 0),
+          files: 0,
+        };
+      }
       if (!matcher) {
         state.managedHits = {};
+        state.managedHitsAt = null;
         save(state);
         return {
-          policy: policy.unreadable ? 'unreadable' : (policy.present ? 'present' : 'absent'),
-          degraded: Boolean(policy.unreadable), rules: 0, prompts: 0, files: 0,
+          policy: policy.present ? 'present' : 'absent',
+          degraded: false, rules: 0, prompts: 0, files: 0,
         };
       }
       const result = historyScanner({
@@ -1167,6 +1243,7 @@ function createAutoLearnManager(options = {}) {
       });
       const seen = new Set();
       const hits = {};
+      let watermark = '';
       for (const observation of result.observations || []) {
         if (workspaceRoot && !within(workspaceRoot, observation.cwd)) continue;
         const rule = clean(observation.managedRule, 200);
@@ -1177,14 +1254,25 @@ function createAutoLearnManager(options = {}) {
         const tool = clean(observation.tool, 48);
         if (tool && !record.tools.includes(tool)) record.tools.push(tool);
         hits[rule] = record;
+        // The newest call this pass accounted for. A scan must not count the
+        // same call again: the scan's own dedupe is the observation hash, which
+        // a rebuild deliberately does not touch, so on a state with no hashes
+        // yet (a fresh install, which is exactly when this command is
+        // recommended) a rebuild followed by a scan doubled the entire corpus,
+        // and the doubled number is what gets written into a human's
+        // instruction file as the justification for a standing rule.
+        const stamp = clean(observation.timestamp, 64);
+        if (stamp && stamp > watermark) watermark = stamp;
       }
       state.managedHits = managedHits(hits);
+      state.managedHitsAt = watermark || now();
       save(state);
       return {
         policy: 'present', degraded: false,
         rules: Object.keys(state.managedHits).length,
         prompts: Object.values(state.managedHits).reduce((total, item) => total + item.hits, 0),
         files: Array.isArray(result.files) ? result.files.length : 0,
+        countedThrough: state.managedHitsAt,
       };
     });
   }
@@ -1230,8 +1318,12 @@ function createAutoLearnManager(options = {}) {
             state.observationHashes[id] = { key: fresh.key, outcome: next, source };
             newObservations += 1;
             // Counted once, on first sight, keyed off the same hash that stops
-            // a re-scan from double-counting the candidate itself.
-            if (observation.managedRule) {
+            // a re-scan from double-counting the candidate itself. The
+            // watermark is the second guard, for the one case the hash cannot
+            // cover: a rebuild counts straight from the corpus without writing
+            // hashes, so anything it already accounted for must not be counted
+            // again here.
+            if (observation.managedRule && !countedByRebuild(state, observation)) {
               const rule = clean(observation.managedRule, 200);
               if (rule) {
                 const record = state.managedHits[rule] || { hits: 0, tools: [] };

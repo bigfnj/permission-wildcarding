@@ -187,3 +187,96 @@ test('a bad id or decision is refused rather than written', (t) => {
   assert.throws(() => manager.decideDerived('batch-file-edits', 'maybe'), /Invalid decision/);
   assert.equal(fs.readFileSync(claudeMd, 'utf8'), notes);
 });
+
+test('an unreadable policy withholds the write instead of removing what is installed', (t) => {
+  const { manager, claudeMd } = setup(t);
+  manager.decideDerived('batch-file-edits', 'accept');
+  const installed = fs.readFileSync(claudeMd, 'utf8');
+  assert.deepEqual(installedDerivedIds(installed), ['batch-file-edits']);
+
+  // The managed file is a client-rewritten cache, so catching it mid-write is
+  // realistic. With no readable policy there is no derivation, and reconciling
+  // against an empty one does not install nothing, it removes what is there and
+  // then reports the item as installed anyway. Removing this tool's own
+  // marker-fenced block is a normal, intended operation; doing it on
+  // information the tool knows is incomplete is not.
+  fs.writeFileSync(path.join(path.dirname(claudeMd), 'remote-settings.json'), '{ not json');
+  const fresh = createAutoLearnManager({
+    home: path.dirname(path.dirname(claudeMd)),
+    statePath: path.join(path.dirname(claudeMd), 'wildcarding', 'state.json'),
+    backupDir: path.join(path.dirname(claudeMd), 'backups'),
+  });
+  const blocked = fresh.decideDerived('read-gated-path-once', 'decline');
+  assert.equal(blocked.blocked, 'managed-policy-unreadable');
+  assert.deepEqual(blocked.targets, [], 'no target was touched');
+  assert.deepEqual(blocked.declined, ['read-gated-path-once'], 'the decision is still recorded');
+  assert.equal(fs.readFileSync(claudeMd, 'utf8'), installed, 'the file is byte-identical');
+
+  // And a rebuild in the same condition keeps the evidence rather than zeroing
+  // it, so one badly-timed command cannot destroy a full-corpus derivation.
+  const report = fresh.rebuildManagedHits();
+  assert.equal(report.blocked, 'managed-policy-unreadable');
+  assert.equal(report.degraded, true);
+  assert.ok(report.prompts > 0, 'the existing table survives an unreadable policy');
+});
+
+test('an accepted mitigation is not evicted by the cap when costlier rules appear', (t) => {
+  const { manager, claudeMd } = setup(t);
+  manager.decideDerived('batch-file-edits', 'accept');
+  assert.deepEqual(installedDerivedIds(fs.readFileSync(claudeMd, 'utf8')), ['batch-file-edits']);
+
+  // The cap limits how much is OFFERED. Applying it before consulting the
+  // accepted set meant three costlier rules silently uninstalled an accepted
+  // mitigation whose own rule was still far above threshold.
+  const home = path.dirname(path.dirname(claudeMd));
+  fs.writeFileSync(path.join(path.dirname(claudeMd), 'remote-settings.json'),
+    `${JSON.stringify({ permissions: { ask: [
+      'Edit(**/*.ps1)', 'Bash(curl:*)', 'Bash(cmake:*)', 'Read(**/.env*)',
+    ], deny: [], allow: [] } }, null, 2)}\n`);
+  const statePath = path.join(path.dirname(claudeMd), 'wildcarding', 'state.json');
+  const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+  state.managedHits = {
+    'Bash(curl:*)': { hits: 900, tools: ['Bash'] },
+    'Bash(cmake:*)': { hits: 800, tools: ['Bash'] },
+    'Read(**/.env*)': { hits: 700, tools: ['Read'] },
+    // The accepted item's own evidence is untouched and still far above
+    // threshold. It is only the cap that would have evicted it.
+    'Edit(**/*.ps1)': { hits: 60, tools: ['Edit'] },
+  };
+  fs.writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
+
+  const fresh = createAutoLearnManager({
+    home, statePath, backupDir: path.join(path.dirname(claudeMd), 'backups'),
+  });
+  const review = fresh.derivedReview();
+  assert.equal(review.pending.length, 3, 'three items on offer, which is the cap');
+  assert.ok(review.mitigations.some((item) => item.id === 'batch-file-edits'),
+    'and the accepted one is still visible past the cap');
+
+  const after = fresh.decideDerived('batch-network-fetches', 'accept');
+  const target = after.targets.find((item) => item.agent === 'claude');
+  assert.deepEqual(target.removed, [], 'nothing was evicted');
+  assert.deepEqual(installedDerivedIds(fs.readFileSync(claudeMd, 'utf8')).sort(),
+    ['batch-file-edits', 'batch-network-fetches']);
+});
+
+test('a rebuild and a following scan do not count the same call twice', (t) => {
+  // The recommended bootstrap on a fresh install is exactly the dangerous
+  // order: a rebuild counts straight from the corpus without writing
+  // observation hashes, so the scan that follows saw every call as first sight.
+  // The doubled number is what gets written into a human's instruction file as
+  // the justification for a standing rule.
+  const { manager, home } = setup(t, { count: 4 });
+  const statePath = path.join(home, '.claude', 'wildcarding', 'state.json');
+  const hits = () => {
+    const table = JSON.parse(fs.readFileSync(statePath, 'utf8')).managedHits;
+    return table['Edit(**/*.ps1)'] ? table['Edit(**/*.ps1)'].hits : 0;
+  };
+  assert.equal(hits(), 4, 'setup scans, so the incremental path counted them');
+
+  const rebuilt = manager.rebuildManagedHits();
+  assert.equal(rebuilt.prompts, 4);
+  assert.ok(rebuilt.countedThrough, 'the pass records how far it counted');
+  manager.scan();
+  assert.equal(hits(), 4, 'a scan after a rebuild adds nothing it already counted');
+});

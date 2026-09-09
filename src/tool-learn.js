@@ -24,7 +24,10 @@ const FILE_TOOLS = new Map([
 function target(name, input) {
   if (!input || typeof input !== 'object') return undefined;
   if (name === 'WebFetch') return typeof input.url === 'string' ? input.url : undefined;
-  if (name === 'WebSearch') return typeof input.query === 'string' ? 'search' : 'search';
+  // Both arms used to return 'search', so the guard was computed and discarded
+  // and a malformed WebSearch block still counted as evidence. Every sibling
+  // branch returns undefined on a missing or mistyped field.
+  if (name === 'WebSearch') return typeof input.query === 'string' ? 'search' : undefined;
   if (FILE_TOOLS.has(name)) {
     const file = input.file_path ?? input.path ?? input.notebook_path;
     return typeof file === 'string' && file ? 'file' : undefined;

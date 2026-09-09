@@ -64,12 +64,63 @@ test('an unknown shape produces nothing rather than filler', () => {
     rule('WebFetch(domain:example.com)', 500),
     rule('mcp__context7__query-docs', 500),
     rule('WebSearch', 500),
-    rule('Edit', 500),
     rule('not a rule at all', 500),
     rule('', 500),
     { prompts: 500 },
   ], { limit: 10 });
   assert.deepEqual(derived, []);
+});
+
+test('a bare tool-level rule is a known shape and does derive advice', () => {
+  // `coversPermission` was taught the bare-tool case precisely so a managed
+  // `Edit` matches every Edit probe, which means it can accumulate hundreds of
+  // prompts and rank first. Requiring a specifier here made that rank-one rule
+  // produce nothing, so the two modules disagreed about whether it is a shape
+  // this tool understands.
+  const edit = deriveMitigations([rule('Edit', 500)]);
+  assert.equal(edit.length, 1);
+  assert.equal(edit[0].id, 'batch-file-edits');
+  assert.match(edit[0].body, /^`Edit` is a managed `ask`, which outranks/);
+
+  const bash = deriveMitigations([rule('Bash', 500)]);
+  assert.equal(bash[0].id, 'script-multi-step-work',
+    'a bare command rule has no root, so it cannot be the network case');
+  assert.doesNotMatch(bash[0].body, /WebFetch/);
+});
+
+test('two rules of one shape become one mitigation naming the costliest', () => {
+  // There are four ids and a policy can easily carry two rules of a shape. A
+  // per-rule list produced duplicate ids, and since every structure downstream
+  // keys on the id, the LAST rule won: the installed block named the cheaper
+  // rule, the dearer one got no advice, and both still spent a cap slot.
+  const derived = deriveMitigations([
+    rule('Edit(**/*.ps1)', 300, { tools: ['Edit'] }),
+    rule('Edit(**/.github/workflows/*)', 120, { tools: ['Edit'] }),
+    rule('Bash(docker:*)', 200),
+    rule('Bash(kubectl:*)', 90),
+  ], { limit: 10 });
+
+  assert.deepEqual(derived.map((item) => item.id),
+    ['batch-file-edits', 'script-multi-step-work'], 'two shapes, not four entries');
+  assert.equal(derived[0].rule, 'Edit(**/*.ps1)', 'the costliest rule is the one named');
+  assert.deepEqual(derived[0].rules, ['Edit(**/*.ps1)', 'Edit(**/.github/workflows/*)']);
+  assert.equal(derived[0].prompts, 420, 'the advice addresses the whole shape, so the cost sums');
+  assert.match(derived[0].body, /plus 1 more rule of the same shape/);
+  assert.match(derived[0].body, /Measured 420 prompts/);
+
+  assert.equal(derived[1].rule, 'Bash(docker:*)');
+  assert.equal(derived[1].prompts, 290);
+  assert.match(derived[1].body, /plus 1 more rule of the same shape/);
+
+  // And the cap now limits distinct advice rather than rule count, so a fourth
+  // duplicate-shape rule cannot crowd out a genuinely different mitigation.
+  const capped = deriveMitigations([
+    rule('Bash(alpha:*)', 400), rule('Bash(beta:*)', 300),
+    rule('Bash(gamma:*)', 200), rule('Edit(**/*.ps1)', 150),
+  ]);
+  assert.deepEqual(capped.map((item) => item.id),
+    ['script-multi-step-work', 'batch-file-edits']);
+  assert.equal(capped[0].prompts, 900);
 });
 
 test('the threshold and the cap both hold, and default to the strict values', () => {
