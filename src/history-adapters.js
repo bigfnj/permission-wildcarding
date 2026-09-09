@@ -146,6 +146,26 @@ function numericExitCode(value) {
   return undefined;
 }
 
+// Codex reports how a script went in words even when it reports no exit code,
+// and that wording was the single largest source of discarded evidence: an
+// `unknown` outcome is dropped as not-evidence without even a stored
+// observation hash. Measured on this machine's Codex corpus, 60 recent session
+// files and 4,259 tool outputs: 2,316 resolved by an exit code, and **854**
+// carried only this wording, which is 27% of everything resolvable.
+//
+// Treating `completed` as success is an inference, so it was checked rather
+// than assumed. Across every output where BOTH the wording and an exit code
+// appear, `completed` coincided with exit 0 thirteen times and with a nonzero
+// code **zero** times. Note that `test/history-adapters.test.js` deliberately
+// fixtures `Script completed` alongside `Exit code: 1`; that combination did
+// not occur in the corpus, and it does not matter here regardless, because
+// every caller checks for an explicit code first and only falls back to this.
+function scriptWordingStatus(value) {
+  const match = /\bScript\s+(completed|failed)\b/i.exec(value);
+  if (!match) return 'unknown';
+  return match[1].toLowerCase() === 'completed' ? 'success' : 'failed';
+}
+
 function structuredResultStatus(value, options = {}, depth = 0, seen = new Set()) {
   if (depth > 8 || value === null || value === undefined) return 'unknown';
   if (typeof value === 'string') {
@@ -154,14 +174,21 @@ function structuredResultStatus(value, options = {}, depth = 0, seen = new Set()
       /\bprocess\s+exited\s+with\s+(?:exit\s+)?code\s*:?\s*(-?\d+)\b/i,
       /\bexit(?:ed)?\s+(?:with\s+)?code\s*[:=]\s*(-?\d+)\b/i,
       /\bexit_code\s*[:=]\s*(-?\d+)\b/i,
-      /[']exit_code[']\s*:\s*(-?\d+)\b/i,
-      /[']exitCode[']\s*:\s*(-?\d+)\b/i,
+      // The quote class was `[']`, a one-member class holding only an
+      // apostrophe, where `['"]` was meant. So the double-quoted spelling that
+      // `JSON.stringify` produces matched none of these, and the bare
+      // `exit_code` pattern above cannot cover it either, because the closing
+      // quote sits between the key and the colon and `\s*` will not consume
+      // it. Measured: 43 outputs in the local corpus carry the quoted form.
+      /['"]exit_code['"]\s*:\s*(-?\d+)\b/i,
+      /['"]exitCode['"]\s*:\s*(-?\d+)\b/i,
     ];
     for (const pattern of patterns) {
       const match = pattern.exec(value);
       if (match) return Number(match[1]) === 0 ? 'success' : 'failed';
     }
-    return 'unknown';
+    // An explicit code always wins; this is only reached when there is none.
+    return scriptWordingStatus(value);
   }
   if (!isObject(value) && !Array.isArray(value)) return 'unknown';
   if (seen.has(value)) return 'unknown';
@@ -559,6 +586,36 @@ function customExecCanAttributeSuccess(jsSource, commands) {
   return curlyDepth === 0;
 }
 
+// Exit-code lines if there are any, otherwise Codex's wording. Deliberately a
+// whole-payload fallback rather than a per-string one, because a single
+// execution emits BOTH a `Script completed` summary and an `Output:` block
+// carrying `Exit code: 0`. Collecting from each string independently pushed two
+// statuses for one command, and the attribution logic then refused the pair as
+// a count mismatch, which is the right call on wrong input. Evidence is only
+// added where there was none.
+function nestedShellStatuses(value) {
+  const codes = explicitNestedShellStatuses(value);
+  if (codes.length) return codes;
+  return scriptWordingStatuses(value);
+}
+
+function scriptWordingStatuses(value, statuses = [], depth = 0) {
+  if (depth > 8 || value == null) return statuses;
+  if (typeof value === 'string') {
+    const status = scriptWordingStatus(value);
+    if (status !== 'unknown') statuses.push(status);
+    return statuses;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) scriptWordingStatuses(item, statuses, depth + 1);
+    return statuses;
+  }
+  if (isObject(value)) {
+    for (const child of Object.values(value)) scriptWordingStatuses(child, statuses, depth + 1);
+  }
+  return statuses;
+}
+
 function explicitNestedShellStatuses(value, statuses = [], depth = 0) {
   if (depth > 8 || value == null) return statuses;
   if (typeof value === 'string') {
@@ -702,7 +759,7 @@ function parseCodexJsonl(text, options = {}) {
         const result = {
           status: classifyCodexOutput(item), offset: location.offset, end: location.end,
           nestedStatuses: item.type === 'custom_tool_call_output'
-            ? explicitNestedShellStatuses(item.output) : [],
+            ? nestedShellStatuses(item.output) : [],
         };
         const previous = results.get(outerCallId);
         if (previous) {

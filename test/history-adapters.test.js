@@ -464,3 +464,121 @@ test('a rewritten file that fails to read does not keep a cursor that no longer 
   assert.deepEqual(recovered.observations.map((item) => item.command), ['rg third'],
     'the rewritten content is read in full rather than skipped');
 });
+
+// Codex says how a script went in words even when it reports no exit code, and
+// an `unknown` outcome is dropped as not-evidence without even a stored hash.
+// Measured on this machine's Codex corpus: 30 observations of 6,870 gain an
+// attributable outcome, +28 of them failures, and no candidate changes
+// disposition. Small, and in the conservative direction.
+test('Codex wording resolves an outcome when no exit code is reported', () => {
+  const transcript = jsonl(
+    responseItem({
+      type: 'function_call', name: 'shell_command', call_id: 'worded-fail',
+      arguments: JSON.stringify({ command: 'rg missing' }),
+    }),
+    responseItem({
+      type: 'function_call_output', call_id: 'worded-fail',
+      output: 'Script failed\nWall time 1.1 seconds\nOutput:\n',
+    }),
+    responseItem({
+      type: 'function_call', name: 'shell_command', call_id: 'worded-ok',
+      arguments: JSON.stringify({ command: 'rg present' }),
+    }),
+    responseItem({
+      type: 'function_call_output', call_id: 'worded-ok',
+      output: 'Script completed\nWall time 0.9 seconds\nOutput:\n',
+    }),
+    // An explicit code still wins over the wording, in both spellings.
+    responseItem({
+      type: 'function_call', name: 'shell_command', call_id: 'code-wins',
+      arguments: JSON.stringify({ command: 'rg conflicted' }),
+    }),
+    responseItem({
+      type: 'function_call_output', call_id: 'code-wins',
+      output: 'Script completed\nExit code: 3',
+    }),
+    responseItem({
+      type: 'function_call', name: 'shell_command', call_id: 'json-quoted',
+      arguments: JSON.stringify({ command: 'rg quoted' }),
+    }),
+    responseItem({
+      type: 'function_call_output', call_id: 'json-quoted',
+      output: '{"output":"x","metadata":{"exit_code":1}}',
+    }),
+    // And silence stays silence: no code and no wording is still not evidence.
+    responseItem({
+      type: 'function_call', name: 'shell_command', call_id: 'still-quiet',
+      arguments: JSON.stringify({ command: 'rg pending' }),
+    }),
+    responseItem({
+      type: 'function_call_output', call_id: 'still-quiet', output: 'Wall time 0.4 seconds',
+    }),
+  );
+
+  const observations = parseCodexJsonl(transcript, { file: 'codex.jsonl', platform: 'win32' });
+  const status = (command) => observations.find((item) => item.command === command)?.status;
+  assert.equal(status('rg missing'), 'failed', 'Script failed is negative evidence');
+  assert.equal(status('rg present'), 'success');
+  assert.equal(status('rg conflicted'), 'failed', 'the exit code outranks the wording');
+  assert.equal(status('rg quoted'), 'failed',
+    'the double-quoted spelling JSON.stringify produces used to match no pattern');
+  assert.equal(status('rg pending'), 'unknown');
+});
+
+test('a nested exec reports one status per execution, not one per mention of it', () => {
+  // A single execution emits BOTH a `Script completed` summary and an `Output:`
+  // block carrying its exit code. Reading the wording per string pushed two
+  // statuses for one command, and the attribution logic then refused the pair
+  // as a count mismatch, which is correct behaviour on wrong input. So the
+  // wording is a whole-payload fallback, used only when no code is present.
+  const withBoth = jsonl(
+    responseItem({
+      type: 'custom_tool_call', name: 'exec', call_id: 'one-command',
+      input: 'await tools.shell_command({ command: "pwd" })',
+    }),
+    responseItem({
+      type: 'custom_tool_call_output', call_id: 'one-command',
+      output: [
+        { type: 'input_text', text: 'Script completed\nWall time: 1.2 seconds' },
+        { type: 'input_text', text: 'Output:\nExit code: 0\nWall time: 1.1 seconds' },
+      ],
+    }),
+  );
+  const both = parseCodexJsonl(withBoth, { file: 'codex.jsonl', platform: 'win32' });
+  assert.equal(both.find((item) => item.command === 'pwd')?.status, 'success',
+    'one execution, one status, still attributable');
+
+  // Wording alone, and only wording, is what the fallback is for.
+  const wordingOnly = jsonl(
+    responseItem({
+      type: 'custom_tool_call', name: 'exec', call_id: 'worded-only',
+      input: 'await tools.shell_command({ command: "whoami" })',
+    }),
+    responseItem({
+      type: 'custom_tool_call_output', call_id: 'worded-only',
+      output: [{ type: 'input_text', text: 'Script failed\nWall time: 0.3 seconds' }],
+    }),
+  );
+  const worded = parseCodexJsonl(wordingOnly, { file: 'codex.jsonl', platform: 'win32' });
+  assert.equal(worded.find((item) => item.command === 'whoami')?.status, 'failed');
+
+  // Success is the case that genuinely needs the nested statuses. Per
+  // applyCodexGroupResult, a custom exec is only credited with success when
+  // exactly one nested status says so, whereas failure can arrive through the
+  // group status alone. So a wording-only SUCCESS is discarded as `unknown`
+  // unless the nested fallback supplies it, and a first version of this test
+  // covered only the failure path, which let a mutation removing that fallback
+  // pass untouched.
+  const wordedSuccess = jsonl(
+    responseItem({
+      type: 'custom_tool_call', name: 'exec', call_id: 'worded-success',
+      input: 'await tools.shell_command({ command: "git ls-files" })',
+    }),
+    responseItem({
+      type: 'custom_tool_call_output', call_id: 'worded-success',
+      output: [{ type: 'input_text', text: 'Script completed\nWall time: 0.6 seconds' }],
+    }),
+  );
+  const success = parseCodexJsonl(wordedSuccess, { file: 'codex.jsonl', platform: 'win32' });
+  assert.equal(success.find((item) => item.command === 'git ls-files')?.status, 'success');
+});
