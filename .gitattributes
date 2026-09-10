@@ -1,0 +1,5 @@
+# The two installers and the uninstaller are shell scripts. Git normalises them
+# to LF in the index via core.autocrlf, but the working tree keeps CRLF on
+# Windows — so copying one out of a checkout onto Linux without git ships a file
+# bash refuses. Pin the line endings so the working tree matches the index.
+*.sh text eol=lf

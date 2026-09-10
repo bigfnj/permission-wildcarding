@@ -19,7 +19,10 @@ $settingsDir = Join-Path $userProfile ".claude"
 $settingsPath = Join-Path $settingsDir "settings.json"
 
 if (-not (Test-Path $settingsDir)) {
-    $null = New-Item -Value $settingsDir -ItemType Directory -Force
+    # -Path, not -Value: New-Item -ItemType Directory takes the location as
+    # -Path, so this silently did not create ~/.claude on a fresh machine —
+    # the exact case the Test-Path guard above exists for.
+    $null = New-Item -Path $settingsDir -ItemType Directory -Force
 }
 
 $cfg = @{}

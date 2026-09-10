@@ -1691,6 +1691,12 @@ function registerLocalWatchers(context) {
     context.subscriptions.push(vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration('permissionWildcarding.localDrain')) scheduleLocalDrain(200);
       if (event.affectsConfiguration('permissionWildcarding.guidance')) ensureGuidance(true);
+      // gates and memory.* had no listener at all, so flipping either in the
+      // Settings UI did nothing until a window reload — and memoryLint reads
+      // memory.enabled once at activation, so its four keys were picked up only
+      // by the 5-minute reconcile or a save event.
+      if (event.affectsConfiguration('permissionWildcarding.gates')) ensureGates(true);
+      if (event.affectsConfiguration('permissionWildcarding.memory')) dashboard?.refresh();
     }));
   }
   context.subscriptions.push({
