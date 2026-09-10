@@ -3147,7 +3147,24 @@ class WildcardingViewProvider {
   _push() {
     // The one place a torn-down extension could still reach the dashboard: every
     // refresh() call site funnels through here.
-    if (deactivated || !this.view) return;
+    //
+    // `visible` as well as `!this.view`, and the two cover different states. The
+    // view is DISPOSED when hidden — the manifest declares it without
+    // retainContextWhenHidden — and onDidDispose nulls `this.view`, so the
+    // `!this.view` half already covers a closed sidebar. What it does not cover is
+    // the view being collapsed within a showing container, where it stays alive
+    // and merely turns invisible, and the window between a hide and its disposal
+    // event being delivered. In both, the full synchronous work-up ran and posted
+    // to a webview whose content had already been torn down.
+    //
+    // No dirty flag is needed: resolveWebviewView already installs
+    // `onDidChangeVisibility(() => { if (view.visible) this.refresh(); })`, so
+    // becoming visible re-pushes with fresh state.
+    //
+    // Scope note, because an audit oversold this one: it is NOT worth ~22 ms x 50
+    // sites, because the dominant collapsed-sidebar case was already handled. It
+    // is worth the one line as robustness.
+    if (deactivated || !this.view || !this.view.visible) return;
     const hint = this.hint;
     this.hint = null;
     const settings = readSettings();

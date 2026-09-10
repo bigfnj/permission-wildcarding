@@ -828,3 +828,43 @@ test('a concurrent write inside the lock is not flattened by a stale delta', asy
     await app.dispose();
   }
 });
+
+test('a view that is alive but not visible gets no push and no work-up', async (t) => {
+  // The gap `!this.view` does not close. A WebviewView is disposed when hidden
+  // (the manifest has no retainContextWhenHidden) and onDidDispose nulls
+  // `this.view`, so a CLOSED sidebar was already handled. But a view collapsed
+  // within a showing container stays alive and merely turns invisible, and there
+  // is a window between a hide and its disposal event being delivered. In both,
+  // the whole synchronous work-up ran — processAllowList, a MEMORY.md read per
+  // discovered store, a dry-run drain per workspace folder — and then posted to a
+  // webview whose content was already gone.
+  const env = setup(t);
+  env.write({ permissions: { allow: FIFTEEN, deny: [] } });
+  const app = harness(env.tempHome);
+  try {
+    const ui = fakeView();
+    app.provider.resolveWebviewView(ui.view);
+    await settle();
+    assert.equal(ui.posted.length, 1, 'precondition: a visible view is pushed to');
+
+    // Collapsed, not disposed: `this.view` still points at it.
+    ui.view.visible = false;
+    const posts = ui.posted.length;
+    const passes = app.passes.count;
+    app.provider.refresh();
+    await settle();
+
+    assert.equal(ui.posted.length, posts, 'nothing is posted to an invisible webview');
+    assert.equal(app.passes.count, passes,
+      'the work-up is skipped entirely, not just the post');
+
+    // And becoming visible again re-pushes, via the onDidChangeVisibility handler
+    // resolveWebviewView already installs — which is why no dirty flag is needed.
+    ui.view.visible = true;
+    ui.on.visibility();
+    await settle();
+    assert.ok(ui.posted.length > posts, 'showing the view again pushes fresh state');
+  } finally {
+    await app.dispose();
+  }
+});
