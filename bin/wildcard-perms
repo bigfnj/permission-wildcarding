@@ -8,17 +8,22 @@ const {
   processAllowList, writeFileAtomicSync, applyBypass, isBypassOn, currentMode,
   applyMax, isMaxOn, maxLayers,
 } = require('../src/permissions');
-const {
-  createPolicyLock, POLICY_LOCK_CODE, POLICY_LOCK_PATH, POLICY_LOCK_BUSY_MESSAGE,
-} = require('../src/policy-lock');
-const { drainLocalSettings } = require('../src/local-settings');
-
 // codex-max, agent-guidance, agent-gates and child_process are used by exactly
 // one command verb each and by nothing on the hook path, which runs after every
 // single tool call. `learn()` below already lazy-requires the learner stack for
 // this reason; the same reasoning was never extended to these. Measured at the
 // process level: 50 ms for bare node, 58 ms with only what the hook needs,
 // 70 ms with all of it, so this is ~12 ms returned per tool call.
+//
+// `policy-lock` and `local-settings` were the two the reasoning missed, and they
+// were the ones it applied to most cleanly: BOTH are reachable only after the
+// existsSync gate in drainFromHook, the case the comment there documents as
+// normal ("zero such files exist anywhere in the measured project tree"), and
+// each drags a further module in — crypto behind policy-lock, policy-guard
+// behind local-settings. Re-measured over 15 runs each: 50.1 ms bare node,
+// 63.3 ms with permissions alone, 71.6 ms with all three. Another ~8 ms
+// returned per tool call, for requires the common path never reaches. Node
+// caches modules, so the verbs that do need them pay the load exactly once.
 
 const SETTINGS  = path.join(os.homedir(), '.claude', 'settings.json');
 const PACK_PATH = path.join(__dirname, '..', 'patterns', 'starter-pack.json');
@@ -32,8 +37,37 @@ const GUIDANCE_USAGE = 'usage: wildcard-perms --guidance on|off|status\n' +
   '       wildcard-perms --guidance accept|decline|reset <id>\n';
 const GATES_USAGE = 'usage: wildcard-perms --gates on|off|status|refresh\n';
 
+// Every verb, so an unrecognized flag can be told apart from hook mode below.
+const VERBS = ['--learn', '--seed', '--drain', '--guidance', '--gates',
+  '--codex-max', '--max', '--bypass'];
+const HELP_USAGE = 'wildcard-perms — generalize approved Claude Code and Codex permissions\n\n' +
+  'Run with NO arguments to act as a PostToolUse hook (reads a JSON event on stdin).\n\n' +
+  LEARN_USAGE + DRAIN_USAGE + GUIDANCE_USAGE + GATES_USAGE +
+  'usage: wildcard-perms --seed\n' +
+  'usage: wildcard-perms --max on|off|status\n' +
+  'usage: wildcard-perms --codex-max on|off|status\n' +
+  'usage: wildcard-perms --bypass on|off|status\n' +
+  'usage: wildcard-perms --help | --version\n';
+
 const argv = process.argv.slice(2);
-if (argv.includes('--learn')) {
+if (argv.includes('--help') || argv.includes('-h')) {
+  // Before the verbs on purpose, so `--learn --help` explains rather than runs.
+  process.stdout.write(HELP_USAGE);
+} else if (argv.includes('--version') || argv.includes('-V')) {
+  // Required lazily: the hook path must not pay for reading package.json.
+  process.stdout.write(`${require('../package.json').version}\n`);
+} else if (argv.length && !VERBS.some((verb) => argv.includes(verb))
+    && argv.some((arg) => arg.startsWith('-'))) {
+  // An unrecognized flag must NEVER reach hook mode. Hook mode rewrites
+  // settings.json, so `--gate` (a typo for `--gates`) silently rewrote the
+  // user's permission policy and exited 0 — and on a TTY, where nothing ever
+  // closes stdin, it instead hung forever waiting for an event that was never
+  // coming. There was also no `--help` at all, so the single most likely first
+  // command anyone types was itself a policy write.
+  process.stderr.write('wildcard-perms: unrecognized option '
+    + `${argv.filter((arg) => arg.startsWith('-')).join(' ')}\n\n${HELP_USAGE}`);
+  process.exitCode = 2;
+} else if (argv.includes('--learn')) {
   learn(argv);
 } else if (argv.includes('--seed')) {
   seed();
@@ -207,6 +241,7 @@ function mergeUserAllow(entries) {
 }
 
 function drainWorkspace(workspaceRoot, { dryRun = false } = {}) {
+  const { drainLocalSettings } = require('../src/local-settings');
   return drainLocalSettings({
     workspaceRoot,
     readUserSettings: readSettings,
@@ -231,6 +266,7 @@ function drainFromHook(input) {
   // not an error and never was, so this only reorders the cheap test ahead of
   // the expensive one.
   if (!fs.existsSync(path.join(cwd, '.claude', 'settings.local.json'))) return;
+  const { createPolicyLock, POLICY_LOCK_PATH } = require('../src/policy-lock');
   try {
     createPolicyLock({ lockPath: POLICY_LOCK_PATH }).locked(() => {
       const report = drainWorkspace(cwd);
@@ -523,6 +559,9 @@ function seed() {
 // MAX-off unions the sidecar snapshot with what was granted since, so a write
 // landing between the read and the write would be re-pruned back out.
 function withPolicyLock(flag, run) {
+  const {
+    createPolicyLock, POLICY_LOCK_PATH, POLICY_LOCK_CODE, POLICY_LOCK_BUSY_MESSAGE,
+  } = require('../src/policy-lock');
   try {
     createPolicyLock({ lockPath: POLICY_LOCK_PATH }).locked(run);
   } catch (err) {
