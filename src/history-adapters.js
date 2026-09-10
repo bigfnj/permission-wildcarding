@@ -883,7 +883,14 @@ function findJsonlFiles(root, source, output, failures) {
     if (error && error.code === 'ENOENT') return;
     if (!Array.isArray(failures)) return;
     const message = (error && error.message) || String(error);
-    failures.push({ path: path.resolve(target), source, mode: 'error', error: message });
+    // `scope: 'root'` distinguishes "could not enumerate this directory" from
+    // "read of this file failed". Both are reported through the same channel so
+    // the error count is right, but they mean opposite things to the caller
+    // deciding whether the scan looked at anything: a file error proves it did,
+    // a walk failure proves it could not. Without this field the two were
+    // indistinguishable, and the cursor-preservation guard in
+    // auto-learn-manager.js was defeated by the very case it was written for.
+    failures.push({ path: path.resolve(target), source, mode: 'error', scope: 'root', error: message });
   };
   while (pending.length) {
     const current = pending.pop();

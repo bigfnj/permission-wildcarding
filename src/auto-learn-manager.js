@@ -1436,7 +1436,17 @@ function createAutoLearnManager(options = {}) {
       // reinstating that would resume from the wrong offset and silently skip
       // real calls. See the per-file catch in `scanHistoryFiles`.
       const scannedFiles = Array.isArray(result.files) ? result.files : [];
-      const blindScan = scannedFiles.length === 0 && Object.keys(state.cursors).length > 0;
+      // Root-walk failures are excluded, because a directory we could not
+      // enumerate is not a file we looked at. They arrive through the same
+      // `files[]` error channel — added so an unreadable root raises the error
+      // count instead of looking like an empty corpus — and that made
+      // `scannedFiles.length === 0` FALSE in exactly the scenario this guard
+      // exists for. The two changes shipped in the same commit and the second
+      // defeated the first: an EACCES or disconnected-share root still wiped
+      // every cursor, so the next scan re-read and re-counted the whole corpus
+      // and inflated the counts.success that gates auto-safe apply.
+      const observedFiles = scannedFiles.filter((entry) => entry?.scope !== 'root');
+      const blindScan = observedFiles.length === 0 && Object.keys(state.cursors).length > 0;
       if (!blindScan) {
         state.cursors = {};
         for (const [file, value] of Object.entries(result.cursors)) {

@@ -301,6 +301,38 @@ test('a scan that enumerated no file keeps the cursors it did not re-earn', (t) 
     'a deliberate cursor drop is not undone by the guard above');
 });
 
+test('a root that could not be enumerated does not get to erase the cursor map', (t) => {
+  const home = tempHome(t);
+  let result = {
+    observations: [observed('1', 'git status')],
+    cursors: { [CURSOR_KEY]: { source: 'claude', size: 100, offset: 100 } },
+    files: [{ path: 'a.jsonl', source: 'claude', mode: 'read', size: 100 }],
+  };
+  const learn = manager(home, () => result, { codexRulesPath: null, threshold: 1 });
+  const persistedCursors = () => JSON.parse(fs.readFileSync(learn.paths.state, 'utf8')).cursors;
+  learn.scan();
+  assert.deepEqual(Object.keys(persistedCursors()), [CURSOR_KEY], 'a cursor was banked');
+
+  // The reason this needs its own test: root-walk failures are reported through
+  // the SAME `files[]` error channel as a failed file read, so a scan that
+  // could not enumerate anything had a non-empty `files` and looked, to the
+  // guard, like a scan that had examined a file. Two changes in one commit, the
+  // second defeating the first.
+  //
+  // Real trigger: EACCES on ~/.claude/projects from antivirus, or a
+  // disconnected profile share. Consequence: every byte offset lost, so the
+  // next scan re-reads and re-counts the whole corpus and inflates the
+  // counts.success that gates auto-safe apply.
+  result = {
+    observations: [],
+    cursors: {},
+    files: [{ path: path.join(home, '.claude', 'projects'), source: 'claude', mode: 'error', scope: 'root', error: 'EACCES' }],
+  };
+  learn.scan();
+  assert.deepEqual(Object.keys(persistedCursors()), [CURSOR_KEY],
+    'a scan that could not read a directory has not looked at any file');
+});
+
 test('reviewed apply requires a current fingerprint and rejects a risk change after selection', (t) => {
   const home = tempHome(t);
   const successes = [
