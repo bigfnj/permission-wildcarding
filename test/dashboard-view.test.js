@@ -83,17 +83,26 @@ function harness(tempHome) {
   };
 
   const extensionPath = require.resolve('../vscode-extension/extension');
+  const settingsWritePath = require.resolve('../src/settings-write');
+  const scriptedReaders = new Set([extensionPath, settingsWritePath]);
   const rootSrc = path.resolve(__dirname, '..', 'src');
   const originalLoad = Module._load;
   Module._load = function load(request, parent, isMain) {
     if (request === 'vscode') return vscode;
     if (request === 'os') return { ...os, homedir: () => tempHome };
-    if (request === 'fs' && parent?.filename === extensionPath) {
+    if (request === 'fs' && scriptedReaders.has(parent?.filename)) {
       // A seam for one specific, routine failure: Claude Code rewrites
       // settings.json in place on every approval, /model and /effort, so two
       // reads taken moments apart do not have to agree, and the second one can
-      // land inside a write. Only the extension's own reads are scripted —
-      // writeFileAtomicSync in src/ keeps the real fs.
+      // land inside a write.
+      //
+      // Both modules on the write path are scripted, because the path spans two:
+      // removeAllowEntry reads in extension.js, then writeAllow re-reads in
+      // src/settings-write.js to rebase onto the newest copy. Scripting only the
+      // extension's reads left the SECOND one hitting the real disk, so the
+      // "write failed" precondition silently could not happen and the test
+      // asserted nothing. Only readFileSync is replaced — writeFileAtomicSync
+      // keeps the real fs, so the writes under test are genuine.
       const realFs = originalLoad.call(this, 'fs', parent, isMain);
       return {
         ...realFs,
@@ -129,7 +138,17 @@ function harness(tempHome) {
     return originalLoad.call(this, request, parent, isMain);
   };
 
+  // Drop every cached shared module as well as the extension, so each one is
+  // re-required under the mocked `os` and the scripted `fs` above. A module that
+  // captured either at first load keeps the FIRST test's temp home and the real
+  // fs for the rest of the file — which is how the scripted 'corrupt' read
+  // silently stopped reaching writeAllow's re-read once that moved into src/,
+  // leaving the failure this test exists to check unable to happen.
+  // local-drain-extension.test.js already does this, for the same reason.
   delete require.cache[extensionPath];
+  for (const cached of Object.keys(require.cache)) {
+    if (cached.startsWith(rootSrc + path.sep)) delete require.cache[cached];
+  }
   const extension = require(extensionPath);
   extension.activate({ subscriptions: [] });
   return {
