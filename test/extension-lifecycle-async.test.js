@@ -48,6 +48,11 @@ function harness(tempHome, options = {}) {
   const commands = new Map();
   const watchers = [];
   const spawns = [];
+  const configListeners = [];
+  // Every setInterval the extension arms, so a test can assert that a torn-down
+  // host armed NONE. resetAutoLearnTimer's 5-minute interval is the one that
+  // matters: armed after deactivate() cleared the handle, nothing ever clears it.
+  const intervals = [];
   // Every worker the extension asks for, so a test can assert that one was NOT
   // built. "Did it refuse" is not observable from the error message alone:
   // the runner's own guard produces the same text.
@@ -56,6 +61,7 @@ function harness(tempHome, options = {}) {
   const errors = [];
   const infos = [];
   const settings = { ...(options.settings || {}) };
+  let provider = null;
 
   const vscode = {
     ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
@@ -73,7 +79,10 @@ function harness(tempHome, options = {}) {
     window: {
       createStatusBarItem() { return { hide() {}, show() {}, dispose() {} }; },
       createOutputChannel() { return { appendLine() {}, clear() {}, show() {}, dispose() {} }; },
-      registerWebviewViewProvider() { return disposable(); },
+      // CAPTURED. Whether a push reaches the webview is the only way to see
+      // that `dashboard` still points at the live provider — the other
+      // observable effects of a refresh happen with or without it.
+      registerWebviewViewProvider(_id, instance) { provider = instance; return disposable(); },
       setStatusBarMessage(message) { statuses.push(String(message)); },
       showErrorMessage(message) { errors.push(String(message)); },
       showInformationMessage(message) { infos.push(String(message)); return Promise.resolve(undefined); },
@@ -103,7 +112,11 @@ function harness(tempHome, options = {}) {
           update: async (key, value) => { settings[key] = value; },
         };
       },
-      onDidChangeConfiguration() { return disposable(); },
+      // CAPTURED, not stubbed. A no-op here is why nothing in this file could
+      // reach ensureGuidance, scheduleAutoLearn or resetAutoLearnTimer — all
+      // three are driven by configuration changes, and all three were missed by
+      // the lifecycle guard pass precisely because no test could see them.
+      onDidChangeConfiguration(cb) { configListeners.push(cb); return disposable(); },
       onDidChangeWorkspaceFolders() { return disposable(); },
     },
   };
@@ -175,6 +188,14 @@ function harness(tempHome, options = {}) {
     }
   };
 
+  const originalSetInterval = global.setInterval;
+  global.setInterval = (fn, ms) => {
+    const handle = originalSetInterval(fn, ms);
+    if (typeof handle?.unref === 'function') handle.unref();
+    intervals.push({ fn, ms, handle });
+    return handle;
+  };
+
   purge();
   const extension = require(extensionPath);
   extension.activate({ subscriptions: [] });
@@ -184,9 +205,20 @@ function harness(tempHome, options = {}) {
     extension,
     infos,
     settings,
+    intervals,
+    // Mutable, so a test can change a setting the way the Settings UI does and
+    // then fire the configuration listener.
+    settings,
+    get provider() { return provider; },
     spawns,
     statuses,
     workers,
+    // Fire a configuration change the way VS Code does, so the handlers behind
+    // it are reachable.
+    fireConfigChange(section) {
+      const event = { affectsConfiguration: (key) => String(section).startsWith(key) };
+      for (const cb of configListeners) cb(event);
+    },
     watcherFor(name) {
       const hit = watchers.find((watcher) => watcher.pattern?.pattern === name);
       assert.ok(hit, `no watcher registered for ${name}`);
@@ -198,6 +230,8 @@ function harness(tempHome, options = {}) {
     // reconciliation interval alive and the test process with it.
     async dispose() {
       await extension.deactivate();
+      for (const entry of intervals) clearInterval(entry.handle);
+      global.setInterval = originalSetInterval;
       Module._load = originalLoad;
       purge();
     },
@@ -448,6 +482,141 @@ test('a watcher event during deactivate cannot re-arm a cleared timer', async (t
 
     assert.equal(fs.readFileSync(settingsPath, 'utf8'), UNGENERALIZED,
       'a torn-down extension host wrote the user\u2019s settings.json');
+  } finally {
+    await app.dispose();
+  }
+});
+
+
+test('a configuration change after teardown does not rewrite the instruction files', async (t) => {
+  // ensureGates was guarded in the lifecycle pass; ensureGuidance, its twin, was
+  // not — and it writes ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md. The
+  // configuration listener stays live until VS Code disposes the subscriptions,
+  // which happens AFTER deactivate() resolves, so a flip landing in that window
+  // reached setGuidanceAll from a torn-down host. Measured before the fix:
+  // CLAUDE.md went from 1802 bytes to 24, the managed block simply deleted.
+  //
+  // This is the axis the file could not test at all, because the harness stubbed
+  // onDidChangeConfiguration to a no-op.
+  //
+  // The setting must genuinely CHANGE. My first version fired the event with the
+  // value unchanged, which leaves ensureGuidance with nothing to do — so
+  // removing the guard was invisible and the mutant survived. Flipping to false
+  // is what makes it want to REMOVE the block.
+  const home = tempHome(t);
+  const claudeMd = path.join(home, '.claude', 'CLAUDE.md');
+  fs.writeFileSync(claudeMd, '# my own notes\n\nnothing managed here yet\n');
+
+  const app = harness(home, { settings: { 'guidance.enabled': true } });
+  try {
+    // After activation, which calls ensureGuidance() itself and legitimately
+    // installs the block.
+    const before = fs.readFileSync(claudeMd, 'utf8');
+    assert.match(before, /BEGIN permission-wildcarding/, 'activation installed the block');
+
+    await app.extension.deactivate();
+    app.settings['guidance.enabled'] = false;   // the flip a user makes
+    app.fireConfigChange('permissionWildcarding.guidance.enabled');
+    await tick(300);
+
+    assert.equal(fs.readFileSync(claudeMd, 'utf8'), before,
+      'a torn-down host removed the managed block from the user\u2019s instruction file');
+  } finally {
+    await app.dispose();
+  }
+});
+test('a configuration change after teardown arms no Auto Learn timer', async (t) => {
+  // scheduleAutoLearn and resetAutoLearnTimer were the two schedulers the guard
+  // pass missed. resetAutoLearnTimer is the worse of the two: it arms a
+  // 5-minute setInterval, and one armed after deactivate() has cleared the
+  // handle is never cleared by anything. Each tick then bumps
+  // autoLearnFailureCount and autoLearnNextRetryAt, driving the retry backoff to
+  // its 60-minute ceiling, so a same-realm re-activate inherits an Auto Learn
+  // that looks enabled and does nothing.
+  const home = tempHome(t);
+  const app = harness(home, { settings: { 'autoLearn.enabled': true } });
+  try {
+    await app.extension.deactivate();
+    const armedBefore = app.intervals.length;
+
+    app.fireConfigChange('permissionWildcarding.autoLearn.enabled');
+    await tick(50);
+
+    assert.equal(app.intervals.length, armedBefore,
+      'a torn-down host armed a periodic Auto Learn scan that nothing will clear');
+  } finally {
+    await app.dispose();
+  }
+});
+
+test('a re-activate during the drain keeps its own dashboard and memory lint', async (t) => {
+  // The drain has no deadline by deliberate decision. If the host's deactivate
+  // timeout expires and a same-realm activate() runs during it, the OLD
+  // deactivate's continuation resumes — and it used to null `dashboard` and
+  // `memoryLint`, slots the SUCCESSOR had already populated.
+  //
+  // Measured before the fix: 0 pushes reached the successor's live webview
+  // through the module slot, while calling refresh() on the instance directly
+  // still produced one. The panel rendered and its buttons worked, so nothing
+  // looked broken — every one of the ~35 `dashboard?.refresh()` call sites was
+  // simply a permanent no-op for the life of the window, and
+  // `memoryLint?.reconfigure()` likewise, which is verbatim the defect
+  // reconfigure() was added to fix.
+  //
+  // The observable has to be a PUSH. My first version asserted that a watcher
+  // event still generalized settings.json, which runWildcarding does with or
+  // without `dashboard` — so the mutant survived. Only the webview can see it.
+  const home = tempHome(t);
+  const app = harness(home, { settings: { 'autoLearn.enabled': true } });
+  try {
+    // A completed scan, so a runner exists and deactivate really awaits a drain.
+    await app.commands.get('permission-wildcarding.autoLearnScan')();
+
+    const teardown = app.extension.deactivate();
+    // The overlap: a fresh activation while the drain is still pending.
+    app.reactivate();
+    await teardown;
+
+    // Attach a webview to the successor's provider and ask for a push.
+    const posted = [];
+    const view = {
+      visible: true,
+      webview: {
+        options: null, html: '',
+        postMessage: (message) => { posted.push(message); return Promise.resolve(true); },
+        onDidReceiveMessage: () => ({ dispose() {} }),
+      },
+      onDidDispose: () => ({ dispose() {} }),
+      onDidChangeVisibility: () => ({ dispose() {} }),
+    };
+    assert.ok(app.provider, 'the successor registered a provider');
+    app.provider.resolveWebviewView(view);
+    await tick(200);
+    const afterAttach = posted.length;
+    assert.ok(afterAttach > 0, 'attaching the view pushes once, directly on the instance');
+
+    // Now drive a refresh through the MODULE-LEVEL slot, which is the only thing
+    // the nulling breaks. resolveWebviewView above calls _push() on the instance
+    // and succeeds even with `dashboard` null — that is exactly why the first
+    // version of this assertion let the mutant survive. A watcher event goes via
+    // `dashboard?.refresh()`, so it lands only if the slot still points at the
+    // successor's provider.
+    const settingsPath = path.join(home, '.claude', 'settings.json');
+    fs.writeFileSync(settingsPath, JSON.stringify({
+      permissions: { allow: ['Bash(rg *)', 'Bash(fd *)'], deny: [] },
+    }, null, 2) + '\n');
+    app.watcherFor('settings.json').fire('change', { fsPath: settingsPath });
+    await tick(1200);
+
+    assert.ok(posted.length > afterAttach,
+      'the successor\u2019s dashboard slot was nulled by the old teardown, so every '
+      + 'dashboard?.refresh() call site is a permanent no-op');
+
+    // And Auto Learn is not stuck: the runner slot was freed, so a scan works.
+    app.errors.length = 0;
+    await app.commands.get('permission-wildcarding.autoLearnScan')();
+    assert.ok(!app.errors.some((m) => /deactivating/.test(m)),
+      'the successor did not inherit the dead worker runner');
   } finally {
     await app.dispose();
   }

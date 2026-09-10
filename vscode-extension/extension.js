@@ -110,6 +110,10 @@ let dashboardBounce = null;     // debounce for dashboard pushes (see refresh())
 // reach it; see the memory branch of the listener.
 let memoryLint = null;
 let deactivated = false;
+// Bumped by every activate(). deactivate() captures it before awaiting the Auto
+// Learn drain so a continuation that resumes after a same-realm re-activate can
+// tell it is no longer the current generation. See the tail of deactivate().
+let activationGeneration = 0;
 
 // The children themselves. execFile returns a ChildProcess and not one of the
 // four call sites retained it, so deactivate could only ever hope they were
@@ -1642,13 +1646,27 @@ async function explainAutoLearnPrompt() {
 // writes and scan once activity settles, using the configurable debounce (the
 // thing that felt too frequent at its old 1.2s). Explicit-delay callers are
 // deliberate quick refreshes after a specific action and pass their own value.
+// Guarded like schedule/scheduleLocalDrain/schedulePolicyCheck. These two were
+// missed by that pass, and the Auto Learn transcript watcher is the highest-
+// frequency trigger in the extension — Claude Code appends to those files
+// constantly, including during a reload. Measured after deactivate() resolved:
+// one watcher event took active Timeouts 0 -> 1, and one
+// onDidChangeConfiguration for permissionWildcarding.autoLearn took it to 2, one
+// of which is a fresh 5-minute setInterval that nothing will ever clear. Each
+// tick then bumps autoLearnFailureCount and autoLearnNextRetryAt, driving the
+// backoff to its 60-minute ceiling — so a same-realm re-activate inherits a
+// silently dead Auto Learn.
 function scheduleAutoLearn(delay) {
+  if (deactivated) return;
   if (delay == null) delay = autoLearnConfig().debounceSeconds * 1000;
   clearTimeout(autoLearnBounce);
   autoLearnBounce = setTimeout(() => runAutoLearnScan(false), delay);
 }
 
 function resetAutoLearnTimer() {
+  // Before the clear as well as the arm: a torn-down host must not leave a
+  // 5-minute interval behind, and must not clear a SUCCESSOR's either.
+  if (deactivated) return;
   clearInterval(autoLearnTimer);
   const cfg = autoLearnConfig();
   if (!cfg.enabled) return;
@@ -1773,6 +1791,7 @@ function activate(context) {
   // upgrade, re-activates in the same realm), so the teardown flag has to be
   // released here or the second activation is muted for its whole lifetime.
   deactivated = false;
+  activationGeneration += 1;
   // Watch settings.json for any change (Claude Code approval, manual edit, etc.).
   // RelativePattern (not a plain string) — plain strings only watch files inside
   // opened workspace folders, but ~/.claude/settings.json usually isn't one.
@@ -2527,6 +2546,13 @@ function guidanceEnabled() {
 // written by an older version. Silent when already correct: this runs on every
 // activation and must not rewrite the user's instruction file for nothing.
 function ensureGuidance(announce = false) {
+  // The same gate ensureGates has, and for the same reason: this writes the
+  // user's CLAUDE.md and ~/.codex/AGENTS.md, and it is reached from the
+  // configuration listener, which stays live until VS Code disposes the
+  // subscriptions — i.e. after deactivate() resolves. Measured: flipping
+  // guidance.enabled after teardown rewrote CLAUDE.md from 1802 bytes to 24.
+  // Its twin was guarded in the lifecycle pass and this one was missed.
+  if (deactivated) return;
   try {
     const want = guidanceEnabled();
     const states = guidanceStatusAll().filter((state) => state.readable);
@@ -3790,6 +3816,7 @@ class WildcardingViewProvider {
 }
 
 async function deactivate() {
+  const generation = activationGeneration;
   // First, before anything is awaited: everything below this line is racing the
   // continuations it is trying to stop.
   deactivated = true;
@@ -3811,34 +3838,49 @@ async function deactivate() {
   killLiveChildren();
   if (outputChannel) { try { outputChannel.dispose(); } catch { /* already gone */ } }
   outputChannel = null;
-  if (autoLearnWorkerRunner) await autoLearnWorkerRunner.deactivate();
-  // Dropped AFTER the drain, so nothing shortens it. `deactivating` inside the
-  // runner is sticky and its public API ({run, deactivate, stats}) has no reset,
-  // while getAutoLearnWorkerRunner() only builds one when this slot is empty —
-  // so a retained instance made every Auto Learn op after a same-realm
-  // re-activate reject "Auto Learn is deactivating", permanently. The busy latch
-  // is the same shape one level up: left true, every later scan short-circuits
-  // as "already running".
-  autoLearnWorkerRunner = null;
-  autoLearnBusy = false;
-
-  // The retainers, dropped last. 27 module-level mutables survive a deactivate;
-  // most are timer handles, already cleared above, and holding a dead handle
-  // costs nothing. These four are different — they hold real memory across a
-  // same-realm re-activate (an extension disable/enable, or an upgrade):
+  // The retainers, dropped BEFORE the await, not after.
+  //
+  // These hold real memory across a same-realm re-activate (an extension
+  // disable/enable, or an upgrade), unlike the timer handles above — which are
+  // already cleared, and holding a dead handle costs nothing:
   //
   //   dashboard    the webview provider, and through it the whole ExtensionContext
   //   memoryLint   the same, via this.context, which reconfigure() needs
-  //   autoLearnManager / autoLearnCardCache   parsed history state, which is the
-  //                largest thing this extension ever builds
+  //   autoLearnManager / autoLearnCardCache   parsed history state, the largest
+  //                thing this extension ever builds
   //
-  // Nulling them is safe because every caller is either `?.`-guarded or behind
-  // the `deactivated` check, and activate() rebuilds all four.
+  // They were originally nulled at the END of this function, after the drain, and
+  // that was a real defect. The drain below has no deadline by deliberate
+  // decision, so if the host's deactivate timeout expires and a same-realm
+  // activate() runs during it, this continuation resumes and nulls slots the
+  // SUCCESSOR has already populated. Measured: 0 pushes reached the successor's
+  // live webview through `dashboard?.refresh()` while calling refresh() on the
+  // instance directly still produced one — the panel rendered and its buttons
+  // worked, and all ~35 refresh call sites were a permanent no-op for the life of
+  // the window. `memoryLint = null` did the same to reconfigure(), which is
+  // verbatim the defect reconfigure() was added to fix.
+  //
+  // None of them needs the drain to finish, so nothing is lost by dropping them
+  // here.
   dashboard = null;
   memoryLint = null;
   autoLearnManager = null;
   autoLearnManagerKey = null;
   autoLearnCardCache = null;
+
+  if (autoLearnWorkerRunner) await autoLearnWorkerRunner.deactivate();
+  // This one DOES have to come after the drain, so nothing shortens it.
+  // `deactivating` inside the runner is sticky and its public API has no reset,
+  // while getAutoLearnWorkerRunner() only builds one when the slot is empty — so
+  // a retained instance made every Auto Learn op after a same-realm re-activate
+  // reject "Auto Learn is deactivating", permanently. Nulling it is correct
+  // whether or not a successor exists: the successor could not have created its
+  // own while this slot was full, so it would inherit this dead one.
+  autoLearnWorkerRunner = null;
+  // The busy latch is different: a successor's in-flight scan can legitimately
+  // hold it, so only clear it if no re-activate happened while we awaited.
+  // `activate()` bumps the generation, which is the cheapest way to tell.
+  if (generation === activationGeneration) autoLearnBusy = false;
 }
 
 module.exports = { activate, deactivate };
