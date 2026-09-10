@@ -71,14 +71,27 @@ if (Test-Path $genFile) { $script:compiledAt = (Get-Item $genFile).LastWriteTime
 # Discovered the way the product does: every ~/.claude/projects/*/memory holding a
 # MEMORY.md, most recently touched first.
 function Find-MemoryDir {
-    if ($env:PW_MEMORY_DIR) { return $env:PW_MEMORY_DIR }
+    # A configured value that does not exist SKIPS rather than fails, which is this
+    # script's contract for every machine-specific setting. Returning it unchecked
+    # turned a typo into a red board instead of an honest skip.
+    if ($env:PW_MEMORY_DIR) {
+        if (Test-Path $env:PW_MEMORY_DIR) { return $env:PW_MEMORY_DIR }
+        return $null
+    }
     $root = Join-Path $env:USERPROFILE '.claude\projects'
     if (-not (Test-Path $root)) { return $null }
     $candidates = Get-ChildItem $root -Directory -ErrorAction SilentlyContinue |
         ForEach-Object { Join-Path $_.FullName 'memory' } |
         Where-Object { Test-Path (Join-Path $_ 'MEMORY.md') }
     if (-not $candidates) { return $null }
-    return ($candidates | Sort-Object { (Get-Item (Join-Path $_ 'MEMORY.md')).LastWriteTime } -Descending)[0]
+    # @(...) around the sort, not just around the pipeline. PowerShell unwraps a
+    # single-element pipeline result to the bare object, so with exactly ONE memory
+    # directory -- the normal case -- `(...)[0]` indexed into the STRING and returned
+    # its first character, i.e. "C". That silently made $gateFile "C\<name>.md", so
+    # the corpus-watcher check reported "skipped -- gated memory not found" forever
+    # even with PW_GATE_MEMORY correctly set. It skipped rather than failed, which is
+    # why it went unnoticed.
+    return @($candidates | Sort-Object { (Get-Item (Join-Path $_ 'MEMORY.md')).LastWriteTime } -Descending)[0]
 }
 
 function Get-ConfiguredPairs([string]$Value, [string]$Separator) {
@@ -144,7 +157,16 @@ if (-not (Test-Path $genFile)) {
     $raw = Get-Content $genFile -Raw
     if ($null -eq $raw) { $raw = '' }
     $gen = $raw.Trim()
-    $gateCount = ([regex]::Matches($gen, '(?m)^- \*\*')).Count
+    # Read the count out of the generated header rather than inferring it from
+    # prose. The old regex was '(?m)^- \*\*', which assumed every gate opens with a
+    # bold lead-in -- true of the pre-2026-09-09 corpus and of nothing else. It
+    # reported "0 gate(s)" for a healthy 5-gate file, i.e. the one number in this
+    # section that could contradict the PASS beside it. recall.py writes the count
+    # itself (_compile_gates_text: "## Standing gates (N memories, managed)"), so
+    # take it from there and fall back to counting top-level bullets.
+    $headerCount = [regex]::Match($gen, '##\s+Standing gates\s+\((\d+)\s+memor')
+    $gateCount = if ($headerCount.Success) { [int]$headerCount.Groups[1].Value }
+                 else { ([regex]::Matches($gen, '(?m)^-\s')).Count }
     Check 'compiled file is non-empty' ($gen.Length -gt 0) "$($gen.Length) bytes, $gateCount gate(s)"
 
     $sha = [regex]::Match($gen, 'sha ([0-9a-f]{16})')
@@ -356,18 +378,16 @@ if ($script:failed -gt 0) {
 }
 
 Write-Host "Eyes-only checks (open the Activity Bar dashboard):"
-Write-Host "  1. A 'Memory gates' card exists. It should read OFF while the corpus holds"
-Write-Host "     no scope:global gate blocks -- that is the CORRECT state, not a defect."
-Write-Host "     (It read 'ON - 6 gates' before the 2026-09-09 ~/.claude loss."
-Write-Host "     Checked 2026-09-10: PW_GATE_MEMORY and PW_RECALL_PROBES are unset in"
-Write-Host "     this shell AND in HKCU:\Environment, and no permissionWildcarding key"
-Write-Host "     names a gate in VS Code's settings.json -- so NONE of the six names"
-Write-Host "     survives on this machine. An earlier version of this text said four"
-Write-Host "     were recoverable from those variables; that was true only while they"
-Write-Host "     were set. Set them if you reconstruct a gate, and this script will"
-Write-Host "     probe it under the freshness section.)"
+Write-Host "  1. A 'Memory gates' card exists and reads ON with a gate count matching"
+Write-Host "     the 'compiled file is non-empty' line above. The corpus was re-gated"
+Write-Host "     2026-09-10 with 5 scope:global memories, so ON is now the expected"
+Write-Host "     state; OFF would mean the compile or the install regressed."
+Write-Host "     (History, so this is not re-derived: it read 'ON - 6 gates' before the"
+Write-Host "     2026-09-09 loss. None of those six names survived -- PW_GATE_MEMORY and"
+Write-Host "     PW_RECALL_PROBES were unset in the shell AND in HKCU:\Environment, and"
+Write-Host "     no permissionWildcarding key named a gate in VS Code's settings.json."
+Write-Host "     The five current gates are re-authored, not recovered.)"
 Write-Host "  2. Its button is quiet/bordered, NOT a big red bar, labelled 'Remove gates...'"
-Write-Host "     -- only applicable once gates are ON; skip while the card reads OFF."
 Write-Host "  3. 'Shell-style guidance' button is also quiet now, labelled 'Remove guidance...'"
 Write-Host "     (it used to be a red 'Remove from 2 instruction files')"
 Write-Host "  4. Clicking either opens a modal confirm; CANCEL must change nothing"
