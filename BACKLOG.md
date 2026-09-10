@@ -1253,7 +1253,7 @@ already a fixed point, which is the only state in which it must fire zero times.
 
 ---
 
-## MEASUREMENT HAZARD: reads cost 6x more in `%TEMP%` than in `~/.claude`
+## MEASUREMENT HAZARD (mechanism CORRECTED below — read to the end)
 
 **Read this before benchmarking anything in this project, and before trusting any
 fs figure recorded in this file.**
@@ -1286,10 +1286,45 @@ of three refuted rows in the table above. The audit even observed the anomaly �
 down to 0.159 ms" — and attributed it to that file being *frequently accessed*
 rather than to *where it lives*.
 
-**The rule:** any fs benchmark of this extension must run against a real
-`~/.claude`, or it will overstate every read by ~6x. A sandboxed `HOME` is correct
-for behaviour and required for isolation; it is invalid for timing. CPU-bound
-measurements (`processAllowList`, `coverLookupKeys`) are unaffected.
+### MECHANISM CORRECTED — it is the file EXTENSION, plus a path exclusion
+
+The "6x in `%TEMP%`" framing above reproduces reliably and is still the wrong
+explanation. Cross-testing content x location x size x **extension** — 19 files
+of 2,700 identical bytes in ONE directory, warm, n=41, ms per file:
+
+```
+.js 0.095   .cjs 0.093   |   .md 0.505  .json 0.514  .txt 0.512
+                             .mjs 0.517  .ts 0.508   .ps1 0.509  (no ext) 0.513
+```
+
+The dominant variable is the **extension**, not the directory. A separate path
+effect sits on top: byte-identical `.md` reads at **0.084 ms** inside
+`~/.claude` versus **0.491-0.532 ms** in `%TEMP%`, `C:\Users\<user>` and
+another volume. `statSync` is barely affected either way. That is the signature
+of Defender exclusions — by extension for `.js`/`.cjs`, by path for `~/.claude`.
+Unconfirmed: `Get-MpPreference` needs elevation, so this is inferred from
+behaviour.
+
+**The corrected rule, which is narrower than my first version:**
+
+- **`require()` of a `.js` module is location-independent.** Cold module-load
+  and require-chain figures measured in a sandbox are **valid**. The blanket
+  "sandbox fs numbers are wrong" was too broad and would have discarded good
+  measurements — including the 212-byte-floor result above, which used `.js`
+  files outside the repo and therefore still stands.
+- **`.json` and `.md` reads are 4-6x inflated outside the excluded path.** The
+  dashboard's own 87-call fs plan measures **4.87 min / 5.61 p50 ms** against
+  the real `~/.claude` and **18.99 / 20.82** against a byte-identical sandbox
+  mirror: 15.3 ms p50 of pure artifact. So the three refuted rows above are
+  still correctly refuted; only the reason changes.
+- So "read every file" versus "stat every file" is **1.6x where the data lives
+  and 10.3x in a sandbox**, which inverts the conclusion of any
+  stat-stamp-versus-read optimization.
+- CPU-bound measurements (`processAllowList`, `coverLookupKeys`) are unaffected
+  by either effect and are the most trustworthy figures in this file.
+
+Worth confirming elevated, because it changes where every future fs measurement
+in this project should be sited.
 
 ## Whole-object settings.json writers: FIVE sites, not one
 
@@ -1413,4 +1448,244 @@ has **no direct test at all**. Seven test files stub `memoryReport` to a zero-ar
 function and only `memory-lint-watchers.test.js` requires the real module, for
 its watcher behaviour. A function performing 17+ file reads per dashboard push
 is entirely uncovered.
+
+
+---
+
+## Audit of 2026-09-10, third pass — five agents over the day's commits
+
+Everything below is from agents that reproduced their findings, and every claim
+I acted on I re-verified myself. **Fixed in this pass** (see the git log for
+detail): `writeAllow` destroying a non-array deny; `readSettingsState` and
+`stateOfText` disagreeing; `stateOfText` classifying on `existsSync`;
+`SETTINGS_CONTENDED_CODE` having no reader; two slots a wedged Auto Learn scan
+stranded across a re-activate; `_push`'s guard treating a missing `visible` as
+hidden; `lockedRetries` unreset on one of two early returns; and my own
+concurrency test's fixture, which did not pin the property it named.
+
+### Untested-but-correct: mutants that survive today
+
+Each of these is CORRECT at HEAD and has no test that would notice a
+reversion. Ranked by what a reversion would cost.
+
+| Site | Surviving mutant | Consequence if reverted |
+|---|---|---|
+| `extension.js` post-lock `reportAlreadyOptimal` | replace the whole branch with `if (false)` | `backupPolicy` never runs on the "somebody else generalized it while we waited" path, so **a deleted backup is not rebuilt** — the one property that helper's comment promises |
+| `extension.js` toast counts | revert to the probe's `after`/`before` | wrong added/removed numbers reported to the user |
+| `extension.js` `lastRun` | delete the assignment | the dashboard's "last run" never advances |
+| `extension.js` probe read guard | delete `if (!settings) …` | reports "already optimal" over an unreadable settings.json instead of staying silent |
+| both `lockedRetries = 0` resets | delete either | retry budget strands or never strands; untested at **both** sites |
+| `coverKeyCache` cap value | `LIMIT = 3` | the comment's "5000 is load-bearing, a cap below the list length clears mid-sweep" is asserted nowhere |
+| `coverLookupKeys` non-string passthrough | delete it | nothing observes it |
+
+### A test whose message is false for the case it names
+
+`test/dashboard-view.test.js` — *"one push per burst, and the wildcarding pass
+is not repeated for it"* asserts `passes.count - before === 1` with the comment
+"one pass per settings write, not two". It seeds an already-optimal list, so **no
+settings write happens**. On the actual write path `runWildcarding` now runs
+`processAllowList` twice by design (probe + in-lock recompute). Confirmed:
+removing the hint on the optimal path is killed by this test; removing it on the
+**write** path survives. The write-path hint has no coverage at all.
+
+Related, and NOT vacuous as feared: the five `policy-backup.test.js` tests that
+call `runNow` on an already-optimal list now exercise the *unlocked probe* path
+and a `backupPolicy` mutant kills 8 of them. What moved is which path they
+cover — `backupPolicy` under the lock is no longer exercised by any of them.
+
+### The dashboard "Active" pill cannot see a corrupt settings.json
+
+`extension.js` sets `active: fs.existsSync(SETTINGS)`, rendered as
+"Active" / "Idle — settings.json not found". `existsSync` cannot separate
+present-and-parseable from present-and-corrupt, so a corrupt or mid-write file
+shows a green "Active" while every writer throws `SETTINGS_UNREADABLE`. This is
+the mirror of the bug already fixed in `toggleMax`, and the three-state
+`readSettingsState` exists for exactly this.
+
+### A leak my own re-activate fix introduced
+
+Nulling `autoLearnWorkerRunner` in `activate()` (correct, and required) makes a
+neighbouring comment in `deactivate()` false: it argues "the successor could not
+have created its own while this slot was full, so it would inherit this dead
+one." It now can. So when a wedged predecessor's worker finally answers, its
+post-drain continuation nulls the **successor's live** runner without
+`.deactivate()`ing it — a leaked worker thread per occurrence. The fix is the
+same `generation === activationGeneration` guard already used for the busy latch.
+
+Also: **`node --test` has no default per-test timeout**, so a never-settling
+promise hangs the whole file instead of failing it. The wedged-worker test
+should carry an explicit `{ timeout }`, and arguably every async test in that
+file should.
+
+### The memory-gate compiler: four ways to lose a standing gate silently
+
+All reproduced. These matter more than they look, because a gate that vanishes
+takes a safety instruction out of every future session with no error anywhere.
+
+1. **A typo in the CLOSING `<!-- /gate -->` deletes the gate and lint still says
+   clean.** `recall.py` tests only for the OPENING marker when linting, while the
+   compiler requires both. Renaming the closer in one memory compiled **7 gates
+   instead of 8** while lint printed "every standing order compiled", exit 0. The
+   staleness check cannot save you either, because source and artifact go wrong
+   together.
+2. **The `clean:` line asserts three things it never checks** — total bytes,
+   entry count, and unresolved `[[links]]`. A 33 KB / 416-entry index with a
+   broken wiki-link prints both warnings *and* "clean". `memoryLint.js` repeats
+   the same defect and reports an issue count of 0.
+3. **Two gate blocks are written and never compiled** — `heredoc-eats-backslashes`
+   and `xml-comments-reject-double-hyphen` both carry `<!-- gate -->` with no
+   `scope:` line, so the compiler skips them and lint's inverse condition is
+   blind to it.
+4. **`--lint` always exits 0**, so it can never gate CI or a pre-commit hook.
+   And `_fm()` reads only `text[:400]`, so a long `description:` pushes `scope:`
+   out of range and silently drops a gate.
+
+Plus: `memoryLint.js`'s gate selection is a second implementation that disagrees
+with `recall.py` on 2 of 4 inputs, while its comment claims it "mirrors
+recall.py … kept deliberately literal so the two are easy to compare". Nothing
+compares them. Same shape as `coverIndexKey`/`coverLookupKeys`.
+
+### The launcher guard holds; its harness has gaps
+
+No false reject exists — all 19 path shapes tried are accepted (spaces, `$`,
+backtick, `powershell`/`cmd`/`node_modules` in a directory name, CJK + emoji,
+UNC, mapped drive, 8.3, `\\?\`, >260 chars, trailing dot/space, relative). But:
+
+- **`verify-installers.ps1` has no zero-case floor.** With an empty results
+  array it prints "0 pass, 0 fail" and exits 0. PASS means "nothing that ran
+  failed", never "16 cases ran". `verify-release.ps1` already has the fix pattern.
+- **The static guard is blind to suffix wrappers and to reassignment.**
+  `'node "' + $p + '" & powershell -c evil'`, `'… | cmd /c more'`, and a later
+  `$hookCommand = 'cmd /c ' + $hookCommand` all pass it. This matters because it
+  is the ONLY launcher check on the POSIX CI leg.
+- **The two halves disagree on case.** PowerShell `-match` is case-insensitive so
+  `NODE "…"` passes there, while the JS assertion has no `/i` and rejects it —
+  even though both uninstallers, cited as the contract, ARE case-insensitive.
+- `APPROVE_COMMAND` does no quote escaping, so a POSIX `$HOME` containing `"`
+  emits a genuinely broken command that the test rejects with the wrong
+  diagnosis.
+
+### Dead code, re-measured — and three earlier entries were WRONG
+
+Method note that changed three verdicts: **comment mentions are not references.**
+
+- **`SETTINGS_CONTENDED_CODE` was NOT resolved** by the vanish refusal, contrary
+  to what I wrote here earlier today: that refusal SETS the code, it does not
+  read it. Now genuinely wired (see the git log).
+- **`enableMaxAllow`, `disableMaxAllow` and `registerApproveHook` are all still
+  DEAD**, not "test-only" — their apparent test uses are comments.
+- **`readAllow` no longer exists**; that entry is closed.
+- Also now fixed and closable: `policyCache` invalidation, `rebuildManagedHits`
+  missing from the worker's allowed operations, and `run()` relying on `finish()`
+  never returning.
+- Headline count holds at **41 dead export names**, 68 test-only, 111
+  production. New unlabelled ones include `prunePermissions`, `MAX_ALLOW_CORE`,
+  `detectMcpServers`, `ensureApproveScript`, `unregisterApproveHook`,
+  `gatesStatus`, `readCodexMaxState`/`writeCodexMaxState`, and
+  `fastLint`/`fullReport`/`pickPrimaryDir`.
+- **Careful:** removing the *export entries* is free, but every one of those
+  `src/permissions.js` functions is live INSIDE `applyMax`/`maxLayers`. A cleanup
+  that deletes the function with the export takes MAX mode with it.
+- **Four NEW option keys with no supplier:** `options.now` in `policy-lock.js`,
+  `auto-learn-manager.js` and `codex-max.js` — three modules with no injectable
+  clock, which is why none has a time-dependent test — and
+  `options.cacheFile` in `fixed-point-cache.js`. `now` is worth SUPPLYING rather
+  than deleting; it is the seam those modules need.
+- **Newly proven unreachable** (by enumerating the input space, not asserting):
+  the four `managerStatus`/`managerCandidates`/`autoLearnEvidence` fallbacks, the
+  `mergeClaudeAllow` object-third-arg shim, `createSettingsWriter`'s `= {}`
+  default and `|| defaultSettingsPath()`, `assessPolicy`'s `claimed`, and
+  `fixed-point-cache`'s `cacheFile ||`.
+- **Write-only locals:** `wrote` in the CLI's `--max`, `lastErr` in
+  `writeFileAtomicSync`, and `err.result`/`err.latest` on both CONTENDED throws.
+  Four unused imports: `isCoveredBy` in two modules, `SETTINGS_ABSENT`/
+  `SETTINGS_PRESENT` in the extension.
+- **~60 stale `file:line` refs in this file, and 7 stale cross-file refs in code
+  comments.** A corrected list was produced; applying it is mechanical and worth
+  doing before the next audit wastes time on it. Everything below `runWildcarding`
+  in `extension.js` shifted by ~41 lines this pass alone.
+
+### README.md — five concrete falsehoods, one safety-relevant
+
+1. **"Neither touches your allow list" is false.** Both installers interactively
+   prompt to seed, then run `--seed`, merging a **395-entry** pack that includes
+   `Bash(rm *)`, `PowerShell(Remove-Item *)` and `PowerShell(Stop-Process *)`.
+   The "edit the pack first" heads-up appears AFTER the prompt has been answered.
+   Narrow the sentence to the *uninstallers* (where it is true) and move the
+   heads-up above the install instructions. **Highest-priority doc fix.**
+2. "Use the dashboard to Apply safe candidates" — no such control exists; the
+   orphaned handler is the dead webview arm already recorded here.
+3. "`isCoveredBy` sits inside both quadratic passes" — contradicted by the code's
+   own comment saying the index turns the scan linear. The section's timings
+   predate ~29 ms of documented savings and it names `drainFromHook`, which does
+   not exist.
+4. "The version is taken from the release tag, so you don't hand-edit
+   package.json" — `package.mjs` writes only the extension manifest, never the
+   root one that `--version` reads. That IS the skew fixed by hand today.
+5. MAX's "status-bar indicator while it's on" is permanent, not conditional.
+
+Plus: 7 of 10 verbs documented, `--help`/`--version` absent entirely, the
+`auto-learn-manager`/`auto-learn-worker` descriptions swapped, and 8 of 20 `src/`
+modules missing from "What's here" — including `fixed-point-cache.js`, which
+writes an undocumented user-visible artefact at
+`~/.claude/wildcarding/fixed-point.json`.
+
+### Optimization: the new DO list, measured in the right place
+
+`processAllowList` warm is now **0.983 min / 1.095 p50** at 431 entries, not the
+2.675/3.178 recorded earlier — the `coverLookupKeys` memo retired that figure,
+and with it the "two `covers()` sweeps are 73% of the pass" claim. The new
+dominant term is `createCoverIndex`: the two index builds are 21.2% + 21.4% of
+the pass, now EQUAL to the two sweeps.
+
+| Item | Measured | Regime | Rec |
+|---|---|---|---|
+| **`coverIndexKey` memo**, same bounded idiom as the one just landed. It is **74%** of an index build | warm 0.983/1.095 -> 0.483/0.540 (**-51%**); 1200 entries -55%; cold 6.98/8.61 -> 6.81/8.04 | A/B vs a built arm, interleaved, warm n=270 / cold n=41 | **DO** |
+| **`fastLint`'s 19 `existsSync`** — answer the broken-link check from the filename list `fullReport` already has | **saves 1.07 min / 1.23 p50 ms per push** | real `~/.claude`, warm, n=61 | **DO** |
+| **`recall_index.json` cache** on its own `mtime:size` (157 KB re-parsed every push) | saves 0.51/0.64 ms | real `~/.claude`, warm, n=81 | DO, low |
+| **Hook stdin -> `fs.readFileSync(0, 'utf8')`** | 1.17-1.27 ms in-process, **not resolvable end-to-end** | cold, n=61, 3 arms | DO, low — it REMOVES 5 lines. Needs an explicit `if (!cwd)` fallback: a partial read silently truncates the JSON and the drain stops promoting approvals forever with no failing log line |
+| **Sticky dashboard hint** — retain `{allow, optimized}` and revalidate with `sameList` | saves 1.38-2.19 min / 1.65-2.20 p50 ms per push | warm, n=180, 3 runs | **DEFERRED, not refuted.** It collides with "a stale hint is recomputed, not trusted": with a cache, a stale hint falls back to a cache that IS valid against disk, so no pass runs and that assertion goes 1 -> 0. Weakening a guard test to accommodate an optimization is how tests lose teeth. Revisit by re-expressing that test around the OUTPUT rather than the pass count |
+
+**Measured and DROPPED — do not re-derive:**
+
+- **`activate()`'s two lock acquisitions** — the premise is now stale. Counted
+  empirically: a converged list with no project-local file takes **0**
+  acquisitions; 1 if either half has work; 2 only on a first run. Taking the lock
+  off both unchanged paths already did this. Merging would fuse two independent
+  retry budgets for near-zero gain.
+- **Inlining `fixed-point-cache` into the CLI** — built the arm, verified it
+  removes exactly 2 fs calls; three cold runs give sign-consistent deltas of
+  +0.8 to +3.7 ms, entirely inside the noise floor. ~200 lines duplicated for
+  nothing.
+- **The FNV-1a loop** — 0.513/0.600 cold, but the second call is 0.088/0.101, so
+  **84% is V8 warm-up, not the loop**. A 4-byte-unrolled variant is SLOWER cold.
+  Replacing the content hash with `mtime:size` would weaken the one property the
+  module exists for.
+- **The 19 `statSync` in `recallIndexStatus`** (0.765/0.848, the largest single
+  fs component) — they ARE the staleness check, and `recall_index.json` is not
+  watched. A stale "not stale" badge is worse than 0.8 ms.
+- `settings.json` read 3x (0.302/0.506), `gates.generated.md` read 3x
+  (0.118/0.450), `CLAUDE.md` read 2x (0.073/0.306), `MEMORY.md` read 2x
+  (0.142/0.149) — all at or below the bar, confirming the earlier refutations.
+- **Perfect fs dedupe as a package**: 87 -> 62 calls saves only 1.54/1.64 ms
+  against the real location, LESS than the sum of its parts because each part
+  carries shared per-call overhead. The `fastLint` item alone captures 70% of it.
+
+**Hit path re-baselined: still 13 fs calls, nothing crept in.** `require.cache`
+on a hit holds exactly 2 modules. The dominant remaining term is **not fs** — it
+is the stdin round-trip at 3.78 min / 5.48 p50 ms, of which only ~1.2 ms is
+stream overhead the hook controls.
+
+### Housekeeping
+
+**6,692 stale directories in `%TEMP%`** from pre-fix runs (`pw-gates` 3073,
+`pw-local` 1535, `pw-guidance` 942, `permission-wildcarding-backup` 325; oldest
+2026-08-19). The leak itself is fixed and measured at 0 per run. Clearing the
+residue is a one-time manual sweep, deliberately not automated:
+
+```
+Get-ChildItem $env:TEMP -Directory |
+  Where-Object { $_.Name -match '^(permission-wildcarding|pw|codex-max)-' } |
+  Remove-Item -Recurse -Force
+```
 
