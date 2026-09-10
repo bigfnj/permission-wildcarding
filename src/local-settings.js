@@ -29,7 +29,8 @@ const os = require('os');
 const path = require('path');
 
 const {
-  generalizePermission, isCoveredBy, isMaxAllowOn, writeFileAtomicSync, BASH_SCRIPT_KEYWORDS,
+  generalizePermission, isCoveredBy, createCoverIndex, isMaxAllowOn, writeFileAtomicSync,
+  BASH_SCRIPT_KEYWORDS,
 } = require('./permissions');
 // The same glob matcher the policy guard uses to decide whether managed policy
 // outranks an entry. A deny rule beats a user allow entry, so a candidate it
@@ -69,8 +70,25 @@ function promotionFor(entry) {
 // Already granted, by the same test the policy guard uses: present verbatim, or
 // covered by a broader wildcard. `isCoveredBy` reports false for identity, so
 // the verbatim check has to be explicit.
+// `allow.includes` is linear and the cover scan behind it was too, both paid per
+// local entry and twice over via redundantUnder. A Set plus the shared index
+// makes each lookup constant-ish; isCoveredBy still decides coverage.
 function grantedBy(entry, allow) {
-  return allow.includes(entry) || allow.some((wildcard) => isCoveredBy(entry, wildcard));
+  return grantedByIndex(allow)(entry);
+}
+
+// Memoized on the array identity, so a caller that asks about many entries
+// against one allow list builds the index once. Callers that pass a fresh array
+// each time simply get the old behaviour, correctly.
+const grantedByCache = new WeakMap();
+function grantedByIndex(allow) {
+  const cached = grantedByCache.get(allow);
+  if (cached) return cached;
+  const verbatim = new Set(allow);
+  const index = createCoverIndex(allow);
+  const fn = (entry) => verbatim.has(entry) || index.covers(entry);
+  grantedByCache.set(allow, fn);
+  return fn;
 }
 
 // Phase 1 — what to add to user scope. Deliberately does not decide what to
