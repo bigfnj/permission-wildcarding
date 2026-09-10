@@ -95,7 +95,21 @@ function rawSettingsText(target) {
 // Deny rules present in `before` that `after` would not carry. Used to refuse a
 // transform that would drop the safety boundary.
 function deniesLost(before, after) {
-  const had = Array.isArray(before?.permissions?.deny) ? before.permissions.deny : [];
+  const raw = before?.permissions?.deny;
+  // A malformed deny — a bare string, an object — is still the user's stated
+  // safety boundary, and `Array.isArray` alone silently permitted dropping it:
+  // `had` came out `[]`, the guard returned "nothing lost", and
+  // `deny: "Bash(rm -rf *)"` was written away with `wrote: true`. This writer
+  // refuses to be the thing that drops a deny rule, and that has to hold for the
+  // shapes it cannot enumerate too. Compared by value, so a transform that spreads
+  // `permissions` through (both current ones do) still passes.
+  if (raw !== undefined && raw !== null && !Array.isArray(raw)) {
+    const kept = after?.permissions?.deny;
+    if (kept === raw) return [];
+    try { if (JSON.stringify(kept) === JSON.stringify(raw)) return []; } catch { /* cyclic */ }
+    return [`a non-array deny (${typeof raw})`];
+  }
+  const had = Array.isArray(raw) ? raw : [];
   if (!had.length) return [];
   const kept = new Set(Array.isArray(after?.permissions?.deny) ? after.permissions.deny : []);
   return had.filter((rule) => !kept.has(rule));
@@ -193,6 +207,8 @@ function createSettingsWriter({ settingsPath, onWrite } = {}) {
   function writeTransform(transform, { attempts = 3 } = {}) {
     let lastLatest = null;
     let lastResult = null;
+    // Has ANY attempt seen the file present? See the vanish refusal below.
+    let sawPresent = false;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       // ONE read serves both the transform's input and the compare-and-swap
       // baseline. They must be the same bytes, and originally they were not:
@@ -213,7 +229,39 @@ function createSettingsWriter({ settingsPath, onWrite } = {}) {
         err.code = SETTINGS_UNREADABLE_CODE;
         throw err;
       }
-      // `absent` yields {}, which is the legitimate first-run case.
+      // `absent` yields {}, which is the legitimate first-run case — but ONLY on
+      // an attempt where the file has never been seen. On a retry it means the
+      // file VANISHED while the transform ran, and that is the single worst input
+      // this function can be handed: {} spreads to a settings.json holding
+      // nothing but the key the verb touched, and applyMax additionally overwrites
+      // a correct allow snapshot with an EMPTY one, so `--max off` then restores
+      // nothing. Both verbs exit 0 reporting success, and a CLI-only install has
+      // no backup.
+      //
+      // Measured end to end through the real verb, with one external delete landing
+      // inside the transform: 432 allow entries plus `model`, `effortLevel` and
+      // `agentPushNotifEnabled` were replaced by 7 blanket entries and a hooks key,
+      // and `--max off` "restored" an empty list. That is verbatim the disaster the
+      // SETTINGS_UNREADABLE refusal exists to prevent, reached through the retry
+      // loop instead of through the read — which is why the preflight guard could
+      // not see it: it ran once, before the loop.
+      //
+      // Refusing leaves the file exactly as the external actor left it, which is
+      // strictly safer than materialising a stump. The code is CONTENDED because
+      // that is what the caller must do about it — nothing was written, retry on
+      // the next trigger — and adding a second code nothing consumes would make
+      // the unconsumed-constant problem worse rather than better.
+      if (before.state === SETTINGS_ABSENT && sawPresent) {
+        const err = new Error(
+          `${target} existed when this write began and has since been deleted, so `
+          + 'writing the transform would replace it with a stump',
+        );
+        err.code = SETTINGS_CONTENDED_CODE;
+        err.result = lastResult;
+        err.latest = lastLatest;
+        throw err;
+      }
+      if (before.state !== SETTINGS_ABSENT) sawPresent = true;
       const latest = before.settings;
       const result = transform(latest);
       lastLatest = latest;
@@ -239,6 +287,16 @@ function createSettingsWriter({ settingsPath, onWrite } = {}) {
       // thing that drops one rather than doing it silently. Both current
       // transforms spread `permissions` through, so this never fires for them —
       // it is a guard for the next author.
+      // ORDERING, stated because it is a real limitation and not an oversight:
+      // the two guards below judge the transform's OUTPUT, so unlike the
+      // SETTINGS_UNREADABLE refusal above they cannot run before the transform.
+      // By the time either throws, `applyMax`'s side effects (the allow snapshot
+      // and the approve script) have already landed. That is tolerable only
+      // because both transforms are idempotent overwrites, so the leftovers are
+      // inert — a snapshot and an approve script for a MAX that never turned on,
+      // which the next successful call replaces. A future transform whose side
+      // effects are NOT idempotent must not use this writer.
+      //
       // A shape guard before the deny guard, because its failure is worse.
       // `JSON.stringify(undefined, null, 2) + '\n'` is the ten bytes
       // "undefined\n", so a transform returning { changed: true } with no

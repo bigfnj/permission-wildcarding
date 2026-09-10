@@ -369,3 +369,110 @@ test('a JSON scalar or array on disk is unreadable, not an empty object', (t) =>
     assert.equal(fs.readFileSync(env.file, 'utf8'), body, `untouched for ${body}`);
   }
 });
+
+test('a file that VANISHES mid-transform is refused, not replaced with a stump', (t) => {
+  // The worst input this writer can be handed, and it was live at HEAD until the
+  // regressions audit found it. `absent -> {}` was treated as "the legitimate
+  // first-run case" on EVERY attempt, including retries — where "the file existed
+  // and is now gone" is not a first run. The preflight SETTINGS_UNREADABLE guard
+  // runs once before the loop, so it could not see it.
+  //
+  // Reproduced end to end through the real verb: `--max on` against a 432-entry
+  // file with one external delete landing inside the transform wrote a
+  // settings.json holding 7 blanket entries and a hooks key — `model`,
+  // `effortLevel`, `agentPushNotifEnabled` and all 432 entries gone — recorded an
+  // EMPTY allow snapshot, and exited 0 reporting success. `--max off` then
+  // "restored" nothing. On a CLI-only install there is no backup.
+  const env = tempSettings(t, {
+    model: 'claude-opus-5',
+    effortLevel: 'high',
+    permissions: { allow: ['Bash(git status *)', 'Bash(npm test *)'] },
+  });
+
+  let calls = 0;
+  assert.throws(
+    () => env.writer().writeTransform((latest) => {
+      calls += 1;
+      // The external actor deletes the file while the transform is running. On
+      // attempt 1 this fails the compare-and-swap (bytes -> null) and retries;
+      // attempt 2 is the one that used to see `{}` and write the stump.
+      if (calls === 1) fs.rmSync(env.file);
+      return { changed: true, settings: { ...latest, permissions: { allow: ['Bash(*)'] } } };
+    }),
+    (err) => {
+      assert.match(err.message, /has since been deleted/);
+      assert.equal(err.code, SETTINGS_CONTENDED_CODE);
+      return true;
+    },
+  );
+
+  // Once, not twice: attempt 1 ran the transform and lost the CAS, and attempt 2
+  // refused on the READ, before calling it again. That ordering matters — the
+  // transform has side effects (applyMax writes the allow snapshot), so refusing
+  // ahead of it is what keeps the second attempt from taking a snapshot of {}.
+  assert.equal(calls, 1, 'the refusal came from the read, ahead of a second transform');
+  // The refusal must leave the file exactly as the external actor left it. A
+  // stump here is the mutant: `{"permissions":{"allow":["Bash(*)"]}}`.
+  assert.equal(fs.existsSync(env.file), false,
+    'the writer materialised a stump over a file it had just seen with real content');
+});
+
+test('a first run really is still allowed to create the file', (t) => {
+  // The other side of the vanish guard: `absent` on an attempt that has never
+  // seen the file present is a genuine first run and must still work. Without
+  // this, the fix above would break every fresh install — test/cli-hook.test.js
+  // pins the CLI half, this pins the unit.
+  const env = tempSettings(t);   // no second argument: the file is genuinely absent
+  assert.equal(fs.existsSync(env.file), false, 'starting from no file at all');
+
+  const out = env.writer().writeTransform((latest) => {
+    assert.deepEqual(latest, {}, 'a first run sees {}');
+    return { changed: true, settings: { permissions: { defaultMode: 'bypassPermissions' } } };
+  });
+
+  assert.equal(out.wrote, true);
+  assert.equal(JSON.parse(fs.readFileSync(env.file, 'utf8')).permissions.defaultMode, 'bypassPermissions');
+});
+
+test('a MALFORMED deny is still refused, not silently dropped', (t) => {
+  // `deniesLost` gated on Array.isArray, so a bare-string deny made `had` empty,
+  // the guard answered "nothing lost", and the rule was written away with
+  // `wrote: true`. A malformed deny is still the user's stated safety boundary,
+  // and this writer's whole contract on that key is that it refuses to be the
+  // thing that drops one.
+  const env = tempSettings(t, {
+    model: 'A',
+    permissions: { allow: ['Bash(ls)'], deny: 'Bash(rm -rf *)' },
+  });
+
+  assert.throws(
+    () => env.writer().writeTransform((latest) => ({
+      changed: true,
+      settings: { model: latest.model, permissions: { allow: latest.permissions.allow } },
+    })),
+    /would drop 1 deny rule\(s\).*non-array deny \(string\)/s,
+  );
+
+  const onDisk = JSON.parse(fs.readFileSync(env.file, 'utf8'));
+  assert.equal(onDisk.permissions.deny, 'Bash(rm -rf *)', 'the malformed deny survived');
+});
+
+test('a transform that carries a malformed deny through is allowed', (t) => {
+  // The guard must not become a blanket refusal for anyone with a malformed deny:
+  // both production transforms spread `permissions` through, so they preserve it
+  // by value and must still be able to write. Compared by value, not identity,
+  // because a spread produces a new reference for the object case.
+  const env = tempSettings(t, {
+    permissions: { allow: ['Bash(ls)'], deny: { Bash: ['rm'] } },
+  });
+
+  const out = env.writer().writeTransform((latest) => ({
+    changed: true,
+    settings: { ...latest, permissions: { ...latest.permissions, defaultMode: 'plan' } },
+  }));
+
+  assert.equal(out.wrote, true, 'a value-preserving transform is not blocked');
+  const onDisk = JSON.parse(fs.readFileSync(env.file, 'utf8'));
+  assert.deepEqual(onDisk.permissions.deny, { Bash: ['rm'] });
+  assert.equal(onDisk.permissions.defaultMode, 'plan');
+});
