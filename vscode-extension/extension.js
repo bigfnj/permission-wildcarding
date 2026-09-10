@@ -12,7 +12,7 @@ const { createAutoLearnWorkerRunner } = require('./autoLearnWorkerRunner');
 // Share core logic with the hook variant — permissions.js is copied into
 // src/ by scripts/package.mjs so both modes stay in sync from a single source.
 const {
-  processAllowList, writeFileAtomicSync, isBypassOn, currentMode,
+  processAllowList, writeFileAtomicSync, isBypassOn,
   applyMax, isMaxOn, maxLayers, buildMaxAllowSet, MAX_MARKERS,
 } = require('./src/permissions');
 const { createAutoLearnManager } = require('./src/auto-learn-manager');
@@ -94,6 +94,41 @@ let policyBounce = null;        // debounce for policy-signal / settings-change 
 let localDrainBounce = null;    // debounce for settings.local.json writes
 let localDrainRetries = 0;      // consecutive deferrals while settings.json was unreadable
 let localDrainAt = null;        // timestamp of the last local drain that changed something
+let dashboardBounce = null;     // debounce for dashboard pushes (see refresh())
+
+// ── deactivation ──────────────────────────────────────────────────────────────
+// Set by deactivate(), cleared by activate(). Clearing a timer stops a spawn
+// STARTING; it says nothing about work already in flight, and deactivate had no
+// way to ask. Every async continuation below that would touch the dashboard,
+// spawn a child or write a file checks this one flag instead of each growing its
+// own cancellation story.
+//
+// The worst case was the gate compile: its callback chains into ensureGates() →
+// setGatesAll(), so a compile that started before a reload rewrote the user's
+// CLAUDE.md / AGENTS.md from a torn-down extension host.
+let deactivated = false;
+
+// The children themselves. execFile returns a ChildProcess and not one of the
+// four call sites retained it, so deactivate could only ever hope they were
+// finished — including the 180s recall rebuilds.
+const liveChildren = new Set();
+
+function trackChild(child) {
+  if (!child || typeof child.on !== 'function') return child;
+  liveChildren.add(child);
+  const forget = () => liveChildren.delete(child);
+  // Both, because a spawn failure emits 'error' and never 'close'.
+  child.on('close', forget);
+  child.on('error', forget);
+  return child;
+}
+
+function killLiveChildren() {
+  for (const child of [...liveChildren]) {
+    try { child.kill(); } catch { /* already gone */ }
+  }
+  liveChildren.clear();
+}
 
 // ── settings.json helpers ─────────────────────────────────────────────────────
 function readSettings() {
@@ -703,7 +738,10 @@ async function rebuildRecall() {
     { location: vscode.ProgressLocation.Notification, title: 'permission-wildcarding: rebuilding recall index…' },
     () => new Promise((resolve) => {
       const env = { ...process.env, RECALL_MODEL_DIR: st.modelDir, RECALL_MEMORY_DIR: dir, RECALL_REEXEC: '1' };
-      execFile(st.py, [script, '--rebuild'], { env, timeout: 180000 }, (err, _stdout, stderr) => {
+      trackChild(execFile(st.py, [script, '--rebuild'], { env, timeout: 180000 }, (err, _stdout, stderr) => {
+        // A 180s rebuild easily outlives a reload, and deactivate kills it — so
+        // the error this reports would be the teardown's own SIGTERM.
+        if (deactivated) { resolve(); return; }
         if (err) {
           vscode.window.showErrorMessage(`permission-wildcarding: recall rebuild failed — ${(stderr || err.message || '').trim().slice(0, 300)}`);
         } else {
@@ -712,7 +750,7 @@ async function rebuildRecall() {
         }
         dashboard?.refresh();
         resolve();
-      });
+      }));
     })
   );
 }
@@ -730,6 +768,9 @@ async function rebuildRecall() {
 const RECALL_AUTO_COOLDOWN_MS = 15 * 60 * 1000;
 function autoSyncRecallIfStale() {
   try {
+    // Checked before the spawn, not only in the callback: a child started after
+    // teardown is one killLiveChildren() has already been past.
+    if (deactivated) return;
     if (Date.now() - recallRebuildAt < RECALL_AUTO_COOLDOWN_MS) return;
     const { dir } = memoryReport();
     if (!dir) return;
@@ -740,7 +781,8 @@ function autoSyncRecallIfStale() {
     if (!recallIndexStatus(dir).stale) return; // cache already matches the corpus
     recallRebuildAt = Date.now();
     const env = { ...process.env, RECALL_MODEL_DIR: st.modelDir, RECALL_MEMORY_DIR: dir, RECALL_REEXEC: '1' };
-    execFile(st.py, [script, '--list'], { env, timeout: 180000 }, (err, _stdout, stderr) => {
+    trackChild(execFile(st.py, [script, '--list'], { env, timeout: 180000 }, (err, _stdout, stderr) => {
+      if (deactivated) return;
       if (!err) {
         const n = recallIndexCount(dir);
         vscode.window.setStatusBarMessage(
@@ -750,7 +792,7 @@ function autoSyncRecallIfStale() {
         console.error('permission-wildcarding: auto recall sync failed —', (stderr || err.message || '').trim().slice(0, 300));
       }
       dashboard?.refresh();
-    });
+    }));
   } catch { /* auto-sync is best-effort — never break anything else */ }
 }
 
@@ -1267,7 +1309,7 @@ function execFileCaptured(executable, args) {
   // PATH check finds can still be unlaunchable when it resolves to a shim.
   const launch = commandLaunch(executable, args);
   return new Promise((resolve, reject) => {
-    execFile(launch.file, launch.args, {
+    trackChild(execFile(launch.file, launch.args, {
       windowsHide: true, timeout: 30000, maxBuffer: 1024 * 1024, ...launch.options,
     }, (error, stdout, stderr) => {
       if (error) {
@@ -1276,7 +1318,7 @@ function execFileCaptured(executable, args) {
         return;
       }
       resolve({ stdout: String(stdout || ''), stderr: String(stderr || '') });
-    });
+    }));
   });
 }
 
@@ -1548,6 +1590,9 @@ async function explainAutoLearnPrompt() {
         '\n\nScope limitation: only visible user and trusted-workspace rule files were checked; managed/system policy, session approval state, and sandbox restrictions may still prompt.',
     });
   } catch (error) {
+    // The rejection may be our own teardown: deactivate kills the child, which
+    // surfaces here as a failed check the user never caused.
+    if (deactivated) return;
     vscode.window.showErrorMessage(
       `Codex execpolicy check failed without changing rules: ${error.detail || error.message}`
     );
@@ -1670,6 +1715,10 @@ function sharedChannel({ fresh = false } = {}) {
 }
 
 function activate(context) {
+  // The module can outlive a deactivate (an extension disable/enable, or an
+  // upgrade, re-activates in the same realm), so the teardown flag has to be
+  // released here or the second activation is muted for its whole lifetime.
+  deactivated = false;
   // Watch settings.json for any change (Claude Code approval, manual edit, etc.).
   // RelativePattern (not a plain string) — plain strings only watch files inside
   // opened workspace folders, but ~/.claude/settings.json usually isn't one.
@@ -2043,7 +2092,18 @@ function toggleMax() {
       if (!turningOn) {
         // Purge MAX blanket entries from the backup so the policy guard does not
         // treat them as "missing" and re-assert them, re-enabling MAX silently.
-        forgetFromBackup(buildMaxAllowSet(settings.permissions?.allow ?? []));
+        //
+        // Only the ones MAX itself added, which is what MAX-off actually removed:
+        // res.settings already unions the pre-MAX snapshot back in, so anything
+        // still present there is the user's and must keep its backup cover. The
+        // old line forgot the whole set — Read(*), Edit, Write, WebFetch(*),
+        // WebSearch and every mcp__<server>__* — contradicting restoreFromBackup's
+        // own note that "the full MAX set is legitimately used outside MAX too, so
+        // only the two markers that uniquely signal MAX-on are excluded". One MAX
+        // round trip silently dropped that half of the high-water mark.
+        const restoredAllow = res.settings?.permissions?.allow ?? [];
+        forgetFromBackup(buildMaxAllowSet(settings.permissions?.allow ?? [])
+          .filter((entry) => !restoredAllow.includes(entry)));
       }
       lastRun = Date.now();
       layers = maxLayers(res.settings);
@@ -2095,6 +2155,17 @@ function schedule(delay = 400) {
   debounceTimer = setTimeout(() => runWildcarding(), delay);
 }
 
+// The dashboard's badge is processAllowList(<what is on disk>), which this pass
+// has just finished computing. `after` is already generalized, so
+// processAllowList(after) === after — that is the idempotence the watcher-loop
+// guard above relies on — and handing the pair over lets the refresh skip a
+// second quadratic pass over the same list. The dashboard still re-checks that
+// the disk holds `after`, so a write that lands in between costs nothing but the
+// recompute it would have done anyway.
+function wildcardingHint(after) {
+  return Array.isArray(after) ? { allow: after, optimized: after } : null;
+}
+
 // Generalize + prune the allow list. `manual` = invoked via the button/command
 // (surface a status message even when nothing changed).
 function runWildcarding(manual = false) {
@@ -2139,7 +2210,7 @@ function runWildcarding(manual = false) {
     // added by hand first reaches the backup.
     backupPolicy(after, settings?.permissions?.deny);
     if (manual) vscode.window.setStatusBarMessage('$(shield) permission-wildcarding: already optimal', 4000);
-    dashboard?.refresh();
+    dashboard?.refresh(wildcardingHint(after));
     return;
   }
 
@@ -2158,7 +2229,7 @@ function runWildcarding(manual = false) {
     }
   }
 
-  dashboard?.refresh();
+  dashboard?.refresh(wildcardingHint(after));
 }
 
 // ── project-local approvals ─────────────────────────────────────────────────────
@@ -2452,6 +2523,9 @@ function compileGates({ quiet = false } = {}) {
       vscode.window.showWarningMessage('permission-wildcarding: ' + msg);
     }
   };
+  // Nothing here may start after teardown: the callback chains into a write of
+  // the user's instruction files.
+  if (deactivated) return Promise.resolve(false);
   const script = recallScriptPath();
   if (!script) {
     warn('recall.py not found, so gates cannot be compiled.', 'Set recall.py path…');
@@ -2465,7 +2539,10 @@ function compileGates({ quiet = false } = {}) {
   const { dir } = memoryReport();
   return new Promise((resolve) => {
     const env = { ...process.env, RECALL_REEXEC: '1', ...(dir ? { RECALL_MEMORY_DIR: dir } : {}) };
-    execFile(st.py, [script, '--gates-compile'], { env, timeout: 60000 }, (err, _out, stderr) => {
+    trackChild(execFile(st.py, [script, '--gates-compile'], { env, timeout: 60000 }, (err, _out, stderr) => {
+      // Resolve false rather than true, so no caller chains into a policy write
+      // on the strength of a compile the teardown just cancelled.
+      if (deactivated) { resolve(false); return; }
       if (err) {
         const detail = (stderr || err.message || '').trim().slice(0, 300);
         if (quiet) console.error('permission-wildcarding: gate compile failed —', detail);
@@ -2474,7 +2551,7 @@ function compileGates({ quiet = false } = {}) {
         return;
       }
       resolve(true);
-    });
+    }));
   });
 }
 
@@ -2483,6 +2560,10 @@ function compileGates({ quiet = false } = {}) {
 // activation and must not rewrite the user's instruction file for nothing.
 function ensureGates(announce = false) {
   try {
+    // The last gate before setGatesAll(). Reached from the compiled-file watcher
+    // and from the compile callback, both of which can land after deactivate —
+    // and this writes the user's CLAUDE.md / AGENTS.md.
+    if (deactivated) return;
     const want = gatesEnabled();
     const states = gatesStatusAll().filter((state) => state.readable);
     if (!states.length) return;
@@ -2596,19 +2677,25 @@ function gatesCardData() {
 }
 
 // One removal path, shared by the dashboard's ✕ and the QuickPick below, so the
-// two can never diverge on the backup-first ordering that makes a prune stick.
+// two can never diverge on the ordering that makes a prune stick.
 function removeAllowEntry(perm) {
   if (!perm) return false;
   const settings = readSettings();
   if (!settings) return false;
   const allow = (settings.permissions?.allow ?? []).filter((p) => p !== perm);
   try {
-    // Drop it from the backup first. The backup is a high-water mark, so
-    // without this the entry would come straight back on the next restore and
-    // the policy guard would keep reporting it as missing — a deliberate prune
-    // must be an instruction, not damage to recover from.
-    forgetFromBackup([perm]);
+    // Settings FIRST, backup second. The prune does have to leave the high-water
+    // mark — otherwise the entry returns on the next restore and the policy guard
+    // reports it as missing forever — but doing that first meant betting the
+    // backup on a write that routinely fails: writeAllow throws
+    // SETTINGS_UNREADABLE_CODE whenever it lands inside one of the in-place
+    // rewrites Claude Code performs on every approval, /model and /effort. The
+    // entry then stayed live in settings.json while its only copy was gone from
+    // the backup, so a later wipe could not bring it back — the one unrecoverable
+    // outcome, traded for a recoverable one (a stale backup entry the guard
+    // offers to re-assert or forget).
     writeAllow(settings, allow);
+    forgetFromBackup([perm]);
     lastRun = Date.now();
     vscode.window.setStatusBarMessage(`$(shield) permission-wildcarding: removed ${perm}`, 4000);
     return true;
@@ -2672,12 +2759,24 @@ async function showWildcardPicker() {
 }
 
 // ── dashboard (Activity Bar webview) ────────────────────────────────────────────
+
+// Short enough to read as instant, long enough to collapse a watcher pair. The
+// other bounces in this file are 200ms–2s because they debounce *work*; this one
+// debounces a render, so it is sized to the burst and nothing more.
+const DASHBOARD_BOUNCE_MS = 60;
+
+// Cheap enough to be worth it: an O(n) compare in front of an O(n²) pass.
+function sameList(a, b) {
+  return a.length === b.length && a.every((entry, index) => entry === b[index]);
+}
+
 class WildcardingViewProvider {
   static viewId = 'permissionWildcarding.dashboard';
 
   constructor(context) {
     this.context = context;
     this.view = null;
+    this.hint = null;  // { allow, optimized } from the caller, consumed by the next _push
   }
 
   resolveWebviewView(view) {
@@ -2728,18 +2827,47 @@ class WildcardingViewProvider {
     this.refresh();
   }
 
-  // Push current state to the webview.
-  refresh() {
+  // Ask for a push. Debounced like every other handler in this file (memBounce,
+  // gatesBounce, policyBounce, localDrainBounce, autoLearnBounce): this was the
+  // one that ran straight through, and it has ~35 call sites — several of them
+  // watcher pairs (onDidChange + onDidCreate, or a delete beside a create) that
+  // fire together, each paying for a full work-up including a quadratic
+  // processAllowList.
+  //
+  // `hint` is an { allow, optimized } pair from a caller that just computed it.
+  // Used only when the list it was computed from is still what is on disk, so a
+  // write that landed in between falls back to a fresh pass rather than
+  // rendering a count against the wrong list.
+  refresh(hint = null) {
+    // Before the timer, not inside it: nothing to push means nothing to schedule,
+    // and this is the guard that keeps a collapsed sidebar (the view is disposed
+    // on hide) from doing the whole work-up on every background event.
     if (!this.view) return;
+    this.hint = hint && Array.isArray(hint.allow) && Array.isArray(hint.optimized) ? hint : null;
+    clearTimeout(dashboardBounce);
+    dashboardBounce = setTimeout(() => this._push(), DASHBOARD_BOUNCE_MS);
+  }
+
+  // Push current state to the webview.
+  _push() {
+    // The one place a torn-down extension could still reach the dashboard: every
+    // refresh() call site funnels through here.
+    if (deactivated || !this.view) return;
+    const hint = this.hint;
+    this.hint = null;
     const settings = readSettings();
     const allow = Array.isArray(settings?.permissions?.allow) ? settings.permissions.allow : [];
     const wildcards = allow.filter((p) => p.includes('*')).sort();
-    const mode = currentMode(settings);
     // What Wildcard Now would actually change. The "specific" tally is not that
     // number: an entry with no `*` is often one the pass can never generalize
     // (Edit, Write, WebSearch, an exact mcp__server__tool), so badging the button
     // with it advertises work that resolves to "already optimal".
-    const optimized = processAllowList(allow);
+    //
+    // processAllowList is quadratic — ~57ms on the 423-entry list this was built
+    // for — and runWildcarding had just run it over the same input immediately
+    // before calling refresh(), so every settings write paid for it twice on the
+    // extension-host thread.
+    const optimized = hint && sameList(hint.allow, allow) ? hint.optimized : processAllowList(allow);
     const pendingWildcard = optimized.length === allow.length && optimized.every((p, i) => p === allow[i])
       ? 0
       : optimized.filter((p) => !allow.includes(p)).length + allow.filter((p) => !optimized.includes(p)).length;
@@ -3456,6 +3584,9 @@ class WildcardingViewProvider {
 }
 
 async function deactivate() {
+  // First, before anything is awaited: everything below this line is racing the
+  // continuations it is trying to stop.
+  deactivated = true;
   clearTimeout(debounceTimer);
   clearTimeout(policyBounce);
   clearTimeout(localDrainBounce);
@@ -3467,9 +3598,23 @@ async function deactivate() {
   // against a torn-down extension after a reload or an upgrade.
   clearTimeout(gatesBounce);
   clearTimeout(recallSyncTimer);
+  clearTimeout(dashboardBounce);
+  // A cleared timer only stops a spawn that had not started. These four had, and
+  // nothing retained them, so a reload left up to a 180s python child running
+  // against a torn-down host — and the gate compile's callback wrote policy.
+  killLiveChildren();
   if (outputChannel) { try { outputChannel.dispose(); } catch { /* already gone */ } }
   outputChannel = null;
   if (autoLearnWorkerRunner) await autoLearnWorkerRunner.deactivate();
+  // Dropped AFTER the drain, so nothing shortens it. `deactivating` inside the
+  // runner is sticky and its public API ({run, deactivate, stats}) has no reset,
+  // while getAutoLearnWorkerRunner() only builds one when this slot is empty —
+  // so a retained instance made every Auto Learn op after a same-realm
+  // re-activate reject "Auto Learn is deactivating", permanently. The busy latch
+  // is the same shape one level up: left true, every later scan short-circuits
+  // as "already running".
+  autoLearnWorkerRunner = null;
+  autoLearnBusy = false;
 }
 
 module.exports = { activate, deactivate };
