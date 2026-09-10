@@ -266,6 +266,41 @@ test('workspace evidence is cwd-bound while state/backups stay home and the poli
   assert.equal(first.paths.lock, second.paths.lock);
 });
 
+// A scan that enumerated NO FILE AT ALL used to replace the cursor map with
+// nothing. `findJsonlFiles` cannot read a root it has no access to -- EACCES
+// from antivirus, a disconnected profile share -- and it reports that per
+// directory rather than throwing, so the whole result comes back empty: every
+// byte offset the corpus had earned was discarded, the next scan re-read and
+// re-counted the lot, and `lastScanStats` said {files:0, observations:0,
+// errors:0}, which is exactly what "nothing to do" looks like.
+test('a scan that enumerated no file keeps the cursors it did not re-earn', (t) => {
+  const home = tempHome(t);
+  let result = {
+    observations: [observed('one', 'git status')],
+    cursors: { [CURSOR_KEY]: { source: 'claude', size: 100, offset: 100 } },
+    files: [{ source: 'claude', mode: 'full' }],
+  };
+  const learn = manager(home, () => result, { codexRulesPath: null, threshold: 1 });
+  const persistedCursors = () => JSON.parse(fs.readFileSync(learn.paths.state, 'utf8')).cursors;
+  learn.scan();
+  assert.deepEqual(Object.keys(persistedCursors()), [CURSOR_KEY]);
+
+  result = { observations: [], cursors: {}, files: [] };
+  const blind = learn.scan();
+  assert.equal(blind.files, 0);
+  assert.deepEqual(Object.keys(persistedCursors()), [CURSOR_KEY],
+    'a scan with nothing to say about any file does not get to erase the map');
+
+  // The guard is on the file list, NOT on the cursor map being empty. A scan
+  // that DID look at a file and still returned no cursor for it dropped that
+  // cursor on purpose -- it describes bytes a rewrite has removed, and resuming
+  // from it would silently skip real calls -- so that drop must still land.
+  result = { observations: [], cursors: {}, files: [{ source: 'claude', mode: 'error' }] };
+  learn.scan();
+  assert.deepEqual(Object.keys(persistedCursors()), [],
+    'a deliberate cursor drop is not undone by the guard above');
+});
+
 test('reviewed apply requires a current fingerprint and rejects a risk change after selection', (t) => {
   const home = tempHome(t);
   const successes = [

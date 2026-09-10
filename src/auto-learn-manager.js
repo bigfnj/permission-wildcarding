@@ -687,7 +687,11 @@ function createAutoLearnManager(options = {}) {
   // settings.json cannot interleave, and so a wildcarding rewrite cannot land
   // between the settings write and the claims write of one application.
   const { locked } = createPolicyLock({ lockPath, staleMs: lockStaleMs, now });
-  function clone(item, known) {
+  // `policy` is a PARAMETER rather than a `managedPolicy()` call, because this
+  // runs once per candidate and `managedPolicy()` stats the policy file to
+  // check its cache stamp: 36.2 us each, so a listing did N stats where one
+  // would do. The verdict cannot change within a single listing anyway.
+  function clone(item, known, policy) {
     const to = [
       ...(known.claude.has(item.key) ? ['claude'] : []),
       ...(known.codex.has(item.key) ? ['codex'] : []),
@@ -697,7 +701,7 @@ function createAutoLearnManager(options = {}) {
     // changes nothing and the prompt survives. Withhold the proposal rather
     // than offer work that cannot pay off. Policy is never consulted to WIDEN
     // eligibility, only to withhold it.
-    const policyVerdict = assessPermission(managedPolicy(), item.claudePermission);
+    const policyVerdict = assessPermission(policy, item.claudePermission);
     const eligibleTargets = [
       ...(claudeSettingsPath && policyVerdict !== 'inert' && claudeEligible(item, true) ? ['claude'] : []),
       ...(codexRulesPath && codexEligible(item, true) ? ['codex'] : []),
@@ -715,7 +719,8 @@ function createAutoLearnManager(options = {}) {
     return candidatesFrom(load(), query);
   }
   function candidatesFrom(state, query = {}) {    const known = { claude: new Set(state.applied.claude), codex: new Set(state.applied.codex) };
-    let result = Object.values(state.candidates).map((item) => clone(item, known));
+    const policy = managedPolicy();
+    let result = Object.values(state.candidates).map((item) => clone(item, known, policy));
     if (query.autoSafe === true) result = result.filter((item) => item.autoSafe);
     if (query.pending === true) result = result.filter((item) => item.pendingTargets.length > 0);
     if (query.disposition) {
@@ -1112,12 +1117,16 @@ function createAutoLearnManager(options = {}) {
     //   - Reported, never silent. Applying nothing to a family a human accepted
     //     in Review, with no reason given, is how a report starts lying.
     const withheld = [];
+    // Read once for the whole application, not twice per item: `managedPolicy()`
+    // stats the policy file on every call to validate its cache stamp, and the
+    // verdict must not change halfway through one application regardless.
+    const policy = useClaude ? managedPolicy() : null;
     if (useClaude) for (const item of selected) {
       if (!claudeEligible(item, includeReviewed)) continue;
-      if (assessPermission(managedPolicy(), item.claudePermission) === 'inert') {
+      if (assessPermission(policy, item.claudePermission) === 'inert') {
         withheld.push({
           key: item.key, permission: item.claudePermission,
-          ...(overridingRule(managedPolicy(), item.claudePermission) || {}),
+          ...(overridingRule(policy, item.claudePermission) || {}),
         });
         continue;
       }
@@ -1411,12 +1420,31 @@ function createAutoLearnManager(options = {}) {
       }
       for (const item of Object.values(state.candidates)) refresh(item, state.threshold);
       const prunedObservations = pruneObservationHashes(state, observationHashLimit);
-      state.cursors = {};
-      for (const [file, value] of Object.entries(result.cursors)) {
-        const safe = cursor(value);
-        const id = /^path-sha256:[a-f0-9]{24}$/.test(file)
-          ? file : `path-sha256:${hash(Buffer.from(normalizedPath(file), 'utf8')).slice(0, 24)}`;
-        if (safe) state.cursors[id] = safe;
+      // A scan that enumerated NO FILES AT ALL does not get to speak for the
+      // cursor map. `findJsonlFiles` cannot read a root it has no access to --
+      // EACCES from antivirus, a disconnected profile share -- and it reports
+      // that per directory rather than throwing, so the whole result comes back
+      // empty. Replacing the map from that discarded every byte offset the
+      // corpus had earned, and the next scan then re-read and re-counted every
+      // transcript, while `lastScanStats` said {files:0, observations:0,
+      // errors:0}: indistinguishable from "nothing to do".
+      //
+      // The guard is on the FILE LIST being empty, NOT on the cursor map being
+      // empty. A scan that did enumerate files and still returned no cursor
+      // dropped it on purpose -- a rewritten file whose read then failed must
+      // lose its cursor, because it points at bytes that no longer exist -- and
+      // reinstating that would resume from the wrong offset and silently skip
+      // real calls. See the per-file catch in `scanHistoryFiles`.
+      const scannedFiles = Array.isArray(result.files) ? result.files : [];
+      const blindScan = scannedFiles.length === 0 && Object.keys(state.cursors).length > 0;
+      if (!blindScan) {
+        state.cursors = {};
+        for (const [file, value] of Object.entries(result.cursors)) {
+          const safe = cursor(value);
+          const id = /^path-sha256:[a-f0-9]{24}$/.test(file)
+            ? file : `path-sha256:${hash(Buffer.from(normalizedPath(file), 'utf8')).slice(0, 24)}`;
+          if (safe) state.cursors[id] = safe;
+        }
       }
       // Enforce the cap on the way out, so one scan cannot leave the file
       // holding more rules than the normalizer would accept reading it back.

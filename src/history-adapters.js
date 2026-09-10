@@ -109,22 +109,38 @@ function applyResult(observation, result) {
 }
 
 // Offsets are byte-based so an append scanner can compare them with fs.stat.
+//
+// The split is on the newline BYTE rather than on a decoded string, because a
+// decoded line no longer knows how many bytes it came from, and recovering that
+// with `Buffer.byteLength` per line was 26% of this function's self time: 90.8
+// -> 60.1 ms over a 19.5 MB corpus. Byte 10 and byte 13 cannot appear inside a
+// multi-byte UTF-8 sequence, so slicing on them is decode-safe. A string caller
+// is encoded once here rather than given a second code path, so the offsets
+// stay byte-exact whichever way the parser is entered.
 function parseJsonlRecords(text, options, onRecord) {
-  const sourceText = Buffer.isBuffer(text) ? text.toString('utf8') : String(text == null ? '' : text);
+  const source = Buffer.isBuffer(text) ? text : Buffer.from(String(text == null ? '' : text), 'utf8');
   const baseOffset = Number.isFinite(options && options.baseOffset) ? options.baseOffset : 0;
-  const lines = sourceText.split('\n');
   let offset = baseOffset;
-  for (let index = 0; index < lines.length; index += 1) {
-    const rawLine = lines[index];
-    const hasNewline = index < lines.length - 1;
-    const byteLength = Buffer.byteLength(rawLine, 'utf8') + (hasNewline ? 1 : 0);
+  let start = 0;
+  let index = 0;
+  for (;;) {
+    const newline = source.indexOf(10, start);
+    const lineEnd = newline === -1 ? source.length : newline;
+    const byteLength = (lineEnd - start) + (newline === -1 ? 0 : 1);
     const location = { offset, end: offset + byteLength, index };
     offset += byteLength;
-    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
-    if (!line.trim()) continue;
-    let record;
-    try { record = JSON.parse(line); } catch { continue; }
-    if (isObject(record)) onRecord(record, location);
+    index += 1;
+    const textEnd = lineEnd > start && source[lineEnd - 1] === 13 ? lineEnd - 1 : lineEnd;
+    if (textEnd > start) {
+      const line = source.toString('utf8', start, textEnd);
+      if (line.trim()) {
+        let record;
+        try { record = JSON.parse(line); } catch { record = undefined; }
+        if (isObject(record)) onRecord(record, location);
+      }
+    }
+    if (newline === -1) break;
+    start = newline + 1;
   }
 }
 
@@ -467,7 +483,7 @@ function findCommandProperty(source, objectStart) {
         const colon = skipTrivia(source, keyEnd);
         if (source[colon] === ':') {
           const valueStart = skipTrivia(source, colon + 1);
-          if (key === 'command' && isQuote(source[valueStart])) {
+          if (NESTED_COMMAND_KEYS.has(key) && isQuote(source[valueStart])) {
             const literal = readJsStringLiteral(source, valueStart);
             if (!literal || !literal.valid) return null;
             const afterValue = skipTrivia(source, literal.end);
@@ -503,6 +519,26 @@ function findCommandProperty(source, objectStart) {
 
 // Tiny lexer for the generated functions.exec shape. It never evaluates JS;
 // variables, concatenation, interpolation, and computed properties are rejected.
+//
+// Codex has shipped two names for the nested shell entry point, and
+// `src/auto-learn.js` already knows both (COMMAND_TOOLS, :8-11). This module
+// knew only the older one, so a 0.153.x rollout — whose generated body calls
+// `tools.exec_command({ cmd: "..." })` — extracted nothing, and since the
+// extractor is the only way a `custom_tool_call` becomes an observation, the
+// whole Codex corpus produced ZERO observations in every mode. Verified on a
+// real rollout, and silent: an empty command list is indistinguishable here
+// from a script that ran no shell at all.
+//
+// The two names spell the command differently (`command` vs `cmd`), and both
+// spellings are accepted for both names on purpose. An accepted spelling that
+// never occurs costs one set lookup; a missing one costs the entire corpus, as
+// above, with no error anywhere to say so.
+const NESTED_SHELL_METHODS = new Set(['shell_command', 'exec_command']);
+const NESTED_COMMAND_KEYS = new Set(['command', 'cmd']);
+const NESTED_SHELL_CALL_RE = new RegExp(
+  `\\btools\\s*\\.\\s*(?:${[...NESTED_SHELL_METHODS].join('|')})\\s*\\(`,
+);
+
 function extractNestedShellCommands(jsSource) {
   const source = typeof jsSource === 'string' ? jsSource : '';
   const commands = [];
@@ -527,7 +563,7 @@ function extractNestedShellCommands(jsSource) {
     if (source[cursor] !== '.') { index = toolsIdentifier.end; continue; }
     cursor = skipTrivia(source, cursor + 1);
     const method = readIdentifier(source, cursor);
-    if (!method || method.value !== 'shell_command') { index = toolsIdentifier.end; continue; }
+    if (!method || !NESTED_SHELL_METHODS.has(method.value)) { index = toolsIdentifier.end; continue; }
     cursor = skipTrivia(source, method.end);
     if (source[cursor] !== '(') { index = method.end; continue; }
     cursor = skipTrivia(source, cursor + 1);
@@ -576,7 +612,11 @@ function customExecCanAttributeSuccess(jsSource, commands) {
   if (/\b(?:catch|class|do|else|exit|finally|for|function|if|switch|try|while|with)\b|&&|\|\||=>|\?/.test(code)) {
     return false;
   }
-  const call = /\btools\s*\.\s*shell_command\s*\(/g.exec(code);
+  // Both nested names, for the reason given at NESTED_SHELL_METHODS. Teaching
+  // the extractor alone would have surfaced the calls with success permanently
+  // unattributable, so `counts.success` would stay at zero and auto-safe would
+  // still never fire on a Codex-only corpus.
+  const call = NESTED_SHELL_CALL_RE.exec(code);
   if (!call || !/\bawait\s*$/.test(code.slice(0, call.index))) return false;
   let curlyDepth = 0;
   for (let index = 0; index < call.index; index++) {
@@ -683,6 +723,20 @@ function applyCodexGroupResult(group, result) {
   for (const observation of group) applyResult(observation, effectiveResult);
 }
 
+// Codex writes `cwd` and the session id in the head-of-file `session_meta`
+// record and nowhere else, so the same few lines have to serve both the
+// in-order parse and the head-only seed read below.
+function applyCodexSessionState(record, state) {
+  const payload = isObject(record.payload) ? record.payload : {};
+  if (record.type === 'session_meta') {
+    state.session = firstDefined(stringValue(payload.id), stringValue(payload.session_id), state.session);
+    state.cwd = firstDefined(stringValue(payload.cwd), state.cwd);
+  }
+  state.session = firstDefined(stringValue(record.sessionId), stringValue(record.session_id), state.session);
+  state.cwd = firstDefined(stringValue(record.cwd), state.cwd);
+  return state;
+}
+
 function parseCodexJsonl(text, options = {}) {
   const observations = [];
   const callGroups = new Map();
@@ -693,12 +747,7 @@ function parseCodexJsonl(text, options = {}) {
 
   parseJsonlRecords(text, options, (record, location) => {
     const payload = isObject(record.payload) ? record.payload : {};
-    if (record.type === 'session_meta') {
-      state.session = firstDefined(stringValue(payload.id), stringValue(payload.session_id), state.session);
-      state.cwd = firstDefined(stringValue(payload.cwd), state.cwd);
-    }
-    state.session = firstDefined(stringValue(record.sessionId), stringValue(record.session_id), state.session);
-    state.cwd = firstDefined(stringValue(record.cwd), state.cwd);
+    applyCodexSessionState(record, state);
 
     for (const item of codexItems(record)) {
       if (item.type === 'function_call') {
@@ -813,32 +862,56 @@ function normalizeRootEntries(options) {
   return entries;
 }
 
-function findJsonlFiles(root, source, output) {
+function findJsonlFiles(root, source, output, failures) {
   // Transcript roots can contain Windows junctions or symlinked directories.
   // Walking them recursively can revisit the same directory forever and crash
   // the worker with "Maximum call stack size exceeded". Use a real-path set
   // and an iterative walk so either a cycle or extreme nesting is harmless.
   const pending = [root];
   const visitedDirectories = new Set();
+  // A path that does not exist is the normal case, not a failure: a machine
+  // with no Codex has no `~/.codex/sessions`, and reporting that every scan
+  // would leave the error count permanently nonzero. Anything else — EACCES
+  // from antivirus, a disconnected profile share, EMFILE — is a subtree we
+  // were unable to look at, and used to be swallowed whole: the walk returned
+  // no files, so `lastScanStats` read {files:0, observations:0, errors:0},
+  // which is exactly what "nothing to do" looks like.
+  // Never throws: an exception escaping the walk would take the whole scan and
+  // every other root's progress with it, which is the failure mode the per-file
+  // try in `scanHistoryFiles` exists to prevent.
+  const note = (target, error) => {
+    if (error && error.code === 'ENOENT') return;
+    if (!Array.isArray(failures)) return;
+    const message = (error && error.message) || String(error);
+    failures.push({ path: path.resolve(target), source, mode: 'error', error: message });
+  };
   while (pending.length) {
     const current = pending.pop();
     let stat;
-    try { stat = fs.statSync(current); } catch { continue; }
+    try { stat = fs.statSync(current); } catch (error) { note(current, error); continue; }
     if (stat.isFile()) {
       if (current.toLowerCase().endsWith('.jsonl')) output.push({ source, path: path.resolve(current) });
       continue;
     }
     if (!stat.isDirectory()) continue;
     let canonical;
-    try { canonical = fs.realpathSync.native(current); } catch { continue; }
+    try { canonical = fs.realpathSync.native(current); } catch (error) { note(current, error); continue; }
     canonical = process.platform === 'win32' ? canonical.toLowerCase() : canonical;
     if (visitedDirectories.has(canonical)) continue;
     visitedDirectories.add(canonical);
     let entries;
-    try { entries = fs.readdirSync(current, { withFileTypes: true }); } catch { continue; }
+    try { entries = fs.readdirSync(current, { withFileTypes: true }); }
+    catch (error) { note(current, error); continue; }
     for (const entry of entries) {
       const child = path.join(current, entry.name);
-      if (entry.isDirectory()) pending.push(child);
+      // A Windows junction reports isDirectory() AND isFile() false and only
+      // isSymbolicLink() true, so queuing on isDirectory() alone skipped the
+      // entire subtree with no error at all -- and `isFile()` below rejects a
+      // symlink to a transcript for the same reason. Queue every link and let
+      // the `statSync` above, which follows links, decide what it is; the
+      // realpath set is already there to stop a cycle, which is what it was
+      // written for.
+      if (entry.isDirectory() || entry.isSymbolicLink()) pending.push(child);
       else if (entry.isFile() && entry.name.toLowerCase().endsWith('.jsonl')) {
         output.push({ source, path: path.resolve(child) });
       }
@@ -880,6 +953,71 @@ function fingerprintFile(file, size) {
   };
 }
 
+// On the unchanged fast path the new fingerprint is provably the prior one:
+// `safeContinuation` has just re-hashed exactly these two ranges and compared
+// them, and the size has not moved, so `fingerprintFile` would read the same
+// 8 KB and produce the same two digests. Reusing them saves two reads and two
+// hashes per unchanged file (~131 us each, and the corpus is almost entirely
+// unchanged files). Guarded on the ranges being the ones this version would
+// choose, so a cursor written by an older or hand-edited build is rebuilt at
+// full strength rather than having its weaker ranges carried forward forever.
+function continuedFingerprint(prior, size) {
+  if (!isObject(prior)) return null;
+  const tailStart = Math.max(0, size - FINGERPRINT_BYTES);
+  if (prior.headLength !== Math.min(FINGERPRINT_BYTES, size)) return null;
+  if (prior.tailStart !== tailStart || prior.tailLength !== size - tailStart) return null;
+  if (!prior.headHash || !prior.tailHash) return null;
+  return {
+    headLength: prior.headLength, headHash: prior.headHash,
+    tailStart, tailLength: prior.tailLength, tailHash: prior.tailHash,
+  };
+}
+
+// Codex records the session id and `cwd` ONLY in the head-of-file
+// `session_meta` line. An append slice starts at `prior.size - overlapBytes`,
+// so the head is absent, both stay undefined, and the manager then drops the
+// observation outright when a workspace root is configured
+// (`src/auto-learn-manager.js:1367`, `within(root, undefined) === false`) --
+// or keeps it under a SECOND identity, because `session` is part of
+// `identityParts` (:75-77). Two ids for one call defeat the `observationHashes`
+// dedupe and inflate `counts.success`, which is what gates auto-safe apply.
+//
+// So the head line is re-read, and deliberately NOT cached on the cursor: a
+// cwd is a user path and no path may reach persisted state. One extra read per
+// changed Codex transcript is the cheap half of that trade.
+//
+// It has to read FORWARD to the first newline rather than grab a fixed prefix.
+// On a real 0.153.4 rollout the `session_meta` line is 22,095 bytes, because
+// `payload.base_instructions.text` carries the whole ~21 KB system prompt, and
+// a read that stops mid-record yields no parseable line at all --
+// `parseJsonlRecords` skips unparseable lines in silence, so the failure would
+// look exactly like a transcript with no session_meta. FINGERPRINT_BYTES is
+// 4096, so the head read `safeContinuation` already did cannot be reused
+// either. Capped, and a cap miss simply yields no seed.
+const SEED_CHUNK_BYTES = 64 * 1024;
+const SEED_MAX_BYTES = 1024 * 1024;
+
+function codexHeadSeed(file) {
+  try {
+    const chunks = [];
+    let total = 0;
+    let newline = -1;
+    while (newline === -1 && total < SEED_MAX_BYTES) {
+      const chunk = readRange(file, total, Math.min(SEED_CHUNK_BYTES, SEED_MAX_BYTES - total));
+      if (!chunk.length) break;
+      newline = chunk.indexOf(10);
+      chunks.push(newline === -1 ? chunk : chunk.subarray(0, newline));
+      total += chunk.length;
+    }
+    if (newline === -1) return null;
+    const line = Buffer.concat(chunks).toString('utf8').replace(/\r$/, '');
+    const record = JSON.parse(line);
+    if (!isObject(record)) return null;
+    const seed = applyCodexSessionState(record, {});
+    return seed.session === undefined && seed.cwd === undefined ? null : seed;
+  } catch { return null; }
+}
+
 function cursorKeyForFile(file) {
   const absolutePath = path.normalize(path.resolve(file));
   const canonicalPath = process.platform === 'win32' ? absolutePath.toLowerCase() : absolutePath;
@@ -911,21 +1049,22 @@ function safeContinuation(file, stat, prior, source) {
   }
 }
 
-function cursorForFile(file, source, stat) {
+function cursorForFile(file, source, stat, fingerprint) {
   return {
     source, size: stat.size, offset: stat.size, mtimeMs: stat.mtimeMs,
-    ino: stat.ino || undefined, ...fingerprintFile(file, stat.size),
+    ino: stat.ino || undefined, ...(fingerprint || fingerprintFile(file, stat.size)),
   };
 }
 
+// The Buffer is handed on undecoded on purpose: `parseJsonlRecords` needs the
+// bytes to hand out byte offsets for free, and decoding here threw them away.
 function parseHistorySlice(source, buffer, options) {
-  const text = buffer.toString('utf8');
-  return source === 'codex' ? parseCodexJsonl(text, options) : parseClaudeJsonl(text, options);
+  return source === 'codex' ? parseCodexJsonl(buffer, options) : parseClaudeJsonl(buffer, options);
 }
 
 function appendedResultIds(source, buffer) {
   const ids = new Set();
-  parseJsonlRecords(buffer.toString('utf8'), {}, (record) => {
+  parseJsonlRecords(buffer, {}, (record) => {
     if (source === 'codex') {
       for (const item of codexItems(record)) {
         if (item.type !== 'function_call_output' && item.type !== 'custom_tool_call_output') continue;
@@ -958,7 +1097,14 @@ function scanHistoryFiles(options = {}) {
     ? Math.max(0, Math.floor(options.overlapBytes))
     : DEFAULT_OVERLAP_BYTES;
   const found = [];
-  for (const root of normalizeRootEntries(options)) findJsonlFiles(root.path, root.source, found);
+  // Reported through the same per-file error channel as a failed read, so a
+  // root we could not enumerate raises the error count instead of looking like
+  // an empty corpus. The manager reads this to decide whether the scan has
+  // earned the right to replace the cursor map at all.
+  const walkFailures = [];
+  for (const root of normalizeRootEntries(options)) {
+    findJsonlFiles(root.path, root.source, found, walkFailures);
+  }
   const unique = new Map();
   for (const entry of found) {
     const key = process.platform === 'win32' ? entry.path.toLowerCase() : entry.path;
@@ -966,7 +1112,7 @@ function scanHistoryFiles(options = {}) {
   }
   const observations = [];
   const cursors = {};
-  const files = [];
+  const files = [...walkFailures];
   const sorted = [...unique.values()].sort((a, b) => a.path.localeCompare(b.path));
 
   for (const entry of sorted) {
@@ -994,7 +1140,8 @@ function scanHistoryFiles(options = {}) {
     try {
       safe = safeContinuation(file, stat, prior, entry.source);
       if (safe && stat.size === prior.size) {
-        cursors[cursorKey] = cursorForFile(file, entry.source, stat);
+        cursors[cursorKey] = cursorForFile(file, entry.source, stat,
+          continuedFingerprint(prior, stat.size));
         files.push({ path: file, source: entry.source, mode: 'unchanged', size: stat.size, bytesRead: 0 });
         continue;
       }
@@ -1022,9 +1169,16 @@ function scanHistoryFiles(options = {}) {
         buffer = readRange(file, 0, stat.size);
       }
 
+        // Seeded only where the head is genuinely out of the slice, and only
+        // for Codex, which is the only source that states the session and cwd
+        // once at the top of the file. Claude repeats both on every record, so
+        // Claude transcripts -- the volume -- pay nothing for this.
+        const seed = entry.source === 'codex' && mode === 'append' && start > 0
+          ? codexHeadSeed(file) : null;
         let parsed = parseHistorySlice(entry.source, buffer, {
           file, baseOffset: start, platform: options.platform, defaultTool: options.defaultTool,
           probeMatcher: options.probeMatcher,
+          session: seed && seed.session, cwd: seed && seed.cwd,
         });
         if (mode === 'append') {
           const appendedStart = Math.max(0, prior.size - start);
