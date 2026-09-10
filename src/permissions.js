@@ -264,9 +264,15 @@ function isBypassOn(settings) {
   return currentMode(settings) === BYPASS_MODE;
 }
 
-function withMode(settings, mode) {
-  return { ...settings, permissions: { ...(settings?.permissions ?? {}), defaultMode: mode } };
-}
+// NOTE: a second `function withMode` used to be declared further down this file,
+// and because both were module-scope function declarations the LATER one won for
+// every caller — including applyBypass below, which reads as though it uses the
+// one that stood here. The two were not equivalent: this one always wrote
+// `defaultMode`, the surviving one deletes the key when mode is null "rather
+// than writing a value the user never had". So bypass-off has always taken the
+// deleting behaviour, which is the correct one, decided by declaration order
+// rather than by choice. The dead declaration is removed; the survivor and its
+// comment are the single definition now.
 
 // Compute the settings object for turning bypass on/off. Side effect: stashes the
 // previous mode (on) or reads it back (off) via the sidecar so the toggle round-
