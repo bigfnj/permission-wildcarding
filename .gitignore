@@ -27,9 +27,5 @@ CLAUDE.local.md
 .windsurfrules
 SESSION_*
 
-# personal release-acceptance harness: hardcodes this machine's memory corpus and
-# private project paths, so it stays local rather than shipping in a public repo
-scripts/verify-release.ps1
-
 # electron crash log dropped in the repo root
 debug.log
