@@ -532,3 +532,201 @@ test('the hook loads no generalizer at all on a cache hit', (t) => {
   assert.equal(fs.readFileSync(out, 'utf8'), 'absent',
     'src/permissions.js must not be loaded on a cache hit');
 });
+
+
+// ── the argument dispatch in front of hook mode ──────────────────────────────
+//
+// bin/wildcard-perms is a flat if/else chain whose FINAL else is hook mode, and
+// hook mode rewrites settings.json. The three branches in front of it —
+// --help/-h, --version/-V and the unrecognized-option guard — had no coverage
+// at all, which is the wrong way round: reaching the last else by accident is
+// the failure the guard exists to stop.
+//
+// The guard is the load-bearing one. Without it `--gate` (a typo for `--gates`)
+// fell through to hook mode, so the single most likely first command anyone
+// types silently rewrote the user's permission policy and exited 0 — and on a
+// TTY, where nothing ever closes stdin, it instead hung forever waiting for an
+// event that was never coming. Both halves are pinned: the policy file must be
+// byte-identical afterwards, and stdin must never be read.
+
+const { spawn } = require('node:child_process');
+const PACKAGE_VERSION = require('../package.json').version;
+
+// Deliberately NOT a fixed point: hook mode collapses the two `rg` entries and
+// rewrites the file. That is what makes "byte-identical afterwards" an
+// assertion rather than a tautology about a file nothing would have touched.
+const UNOPTIMIZED = ['Bash(git status)', 'Bash(git diff)', 'Bash(rg foo)', 'Bash(rg bar)'];
+
+// runHook's environment, but the arguments are the subject and stdin carries a
+// real hook event: if a branch falls through to the last else, the event that
+// would rewrite the policy is already sitting there waiting to be read.
+function runArgs(home, args) {
+  const root = path.parse(home).root;
+  return spawnSync(process.execPath, [CLI, ...args], {
+    cwd: home, encoding: 'utf8', windowsHide: true,
+    input: JSON.stringify({ cwd: home, tool_name: 'Bash' }),
+    env: {
+      ...process.env, HOME: home, USERPROFILE: home,
+      HOMEDRIVE: root.replace(/[\\/]$/, ''), HOMEPATH: home.slice(root.length - 1),
+    },
+  });
+}
+
+const bytesOf = (home) => fs.readFileSync(path.join(home, '.claude', 'settings.json'));
+
+for (const flag of ['--gate', '-x', '--dry-run', '--learn-all']) {
+  test(`an unrecognized flag (${flag}) is refused, and writes nothing`, (t) => {
+    const home = tempHome(t, { permissions: { allow: UNOPTIMIZED } });
+    const before = bytesOf(home);
+
+    const run = runArgs(home, [flag]);
+
+    assert.equal(run.status, 2,
+      `a refusal exits 2, not 0 — exiting 0 is how this went unnoticed; got ${run.status}`);
+    assert.equal(run.stdout, '', 'the refusal belongs on stderr, so a pipe does not swallow it');
+    assert.equal(run.stderr.split('\n')[0], `wildcard-perms: unrecognized option ${flag}`,
+      `the offending flag has to be named back; got: ${JSON.stringify(run.stderr.slice(0, 200))}`);
+    // Followed by the full usage, because a bare refusal leaves the reader
+    // guessing at the verb they meant.
+    assert.match(run.stderr, /^usage: wildcard-perms --gates on\|off\|status\|refresh$/m);
+    assert.match(run.stderr, /^usage: wildcard-perms --help \| --version$/m);
+    assert.ok(bytesOf(home).equals(before),
+      'settings.json must be byte-identical: falling through to hook mode rewrote it');
+  });
+}
+
+test('every flag in an unrecognized invocation is named back, not just the first', (t) => {
+  const home = tempHome(t, { permissions: { allow: UNOPTIMIZED } });
+  const before = bytesOf(home);
+
+  const run = runArgs(home, ['--gate', 'on', '--verbose']);
+
+  assert.equal(run.status, 2);
+  assert.equal(run.stderr.split('\n')[0],
+    'wildcard-perms: unrecognized option --gate --verbose');
+  assert.ok(bytesOf(home).equals(before));
+});
+
+test('an unrecognized flag never reads stdin, and never waits for it', async (t) => {
+  // THE observable that matters, and the one the exit code cannot give you: the
+  // bug was that an unknown flag reached hook mode and processed the allow
+  // list. So spawn with stdin held OPEN — never end()ed, exactly as a TTY
+  // leaves it — and prove two things at once:
+  //
+  //   * the process exits anyway. Hook mode only runs on stdin's 'end', so a
+  //     fall-through hangs forever here instead of exiting.
+  //   * the payload is never drained. It is deliberately larger than any pipe
+  //     buffer, so the write callback can only complete if something on the
+  //     other end actually read it. Measured: 39 ms / not drained through the
+  //     guard, versus a hang and a full 8 MiB drained in hook mode.
+  const home = tempHome(t, { permissions: { allow: UNOPTIMIZED } });
+  const before = bytesOf(home);
+  const root = path.parse(home).root;
+  // NOT cwd: home. A child that has to be killed still holds its cwd open on
+  // Windows, and tempHome's rmSync then throws EBUSY from an after-hook — which
+  // is how the failing version of this test hung the runner instead of just
+  // reporting the failure.
+  const child = spawn(process.execPath, [CLI, '--gate'], {
+    cwd: os.tmpdir(), windowsHide: true,
+    env: {
+      ...process.env, HOME: home, USERPROFILE: home,
+      HOMEDRIVE: root.replace(/[\\/]$/, ''), HOMEPATH: home.slice(root.length - 1),
+    },
+  });
+
+  let stderr = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  // A valid hook event, padded past the pipe buffer. Valid on purpose: under a
+  // fall-through it is a real event that really would rewrite the policy.
+  let drained = false;
+  child.stdin.on('error', () => {});
+  child.stdin.write(
+    JSON.stringify({ cwd: home, tool_name: 'Bash', pad: 'x'.repeat(8 * 1024 * 1024) }),
+    (error) => { if (!error) drained = true; },
+  );
+
+  // On the timeout the child is KILLED and then awaited, so this resolves only
+  // once every pipe is closed. Resolving on the timer alone left the hung child
+  // referenced by the runner, and a failing assertion is worthless if the
+  // reporter never gets to print it.
+  let timedOut = false;
+  const outcome = await new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.stdin.destroy();
+      child.kill('SIGKILL');
+    }, 10000);
+    child.on('close', (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal });
+    });
+  });
+
+  assert.equal(timedOut, false,
+    'the process must exit without stdin ever being closed — hook mode waits for EOF forever');
+  assert.equal(outcome.code, 2, `exited on ${outcome.signal ?? 'no signal'}`);
+  assert.equal(drained, false,
+    'stdin was consumed, so the flag reached hook mode and the event was processed');
+  assert.match(stderr, /^wildcard-perms: unrecognized option --gate$/m);
+  assert.ok(bytesOf(home).equals(before), 'and the policy file is untouched');
+});
+
+for (const flag of ['--help', '-h']) {
+  test(`${flag} explains itself, exits 0, and writes nothing`, (t) => {
+    const home = tempHome(t, { permissions: { allow: UNOPTIMIZED } });
+    const before = bytesOf(home);
+
+    const run = runArgs(home, [flag]);
+
+    assert.equal(run.status, 0, run.stderr);
+    assert.equal(run.stderr, '', `help is not an error; got: ${run.stderr}`);
+    // The one line that has to be there: with no --help at all, the first thing
+    // a new user typed was itself a policy write.
+    assert.match(run.stdout,
+      /^Run with NO arguments to act as a PostToolUse hook \(reads a JSON event on stdin\)\.$/m);
+    for (const verb of ['--learn', '--drain', '--guidance', '--gates', '--seed',
+      '--max', '--codex-max', '--bypass']) {
+      assert.ok(run.stdout.includes(`usage: wildcard-perms ${verb}`),
+        `${verb} is dispatched but undocumented, so --help cannot be trusted to be complete`);
+    }
+    assert.ok(bytesOf(home).equals(before), 'help must not touch the policy file');
+  });
+}
+
+test('--help wins over a verb, so --learn --help explains instead of running', (t) => {
+  // The ordering of the chain is the whole point: --help is checked ahead of
+  // the verbs on purpose. Behind them, `--learn apply --help` runs the apply.
+  const home = tempHome(t, { permissions: { allow: UNOPTIMIZED } });
+  const before = bytesOf(home);
+
+  const run = runArgs(home, ['--learn', 'apply', '--help']);
+
+  assert.equal(run.status, 0, run.stderr);
+  assert.equal(run.stderr, '');
+  assert.match(run.stdout, /^usage: wildcard-perms --help \| --version$/m);
+  assert.ok(bytesOf(home).equals(before));
+  // Every artefact --learn would leave lives under this one directory (state,
+  // claims registry, policy lock), so its absence proves the verb never ran —
+  // and stays true whatever those files are called next.
+  assert.equal(fs.existsSync(path.join(home, '.claude', 'wildcarding')), false,
+    'no Auto Learn artefact may be created: --learn must not have run at all');
+});
+
+for (const flag of ['--version', '-V']) {
+  test(`${flag} prints exactly the package version, and writes nothing`, (t) => {
+    const home = tempHome(t, { permissions: { allow: UNOPTIMIZED } });
+    const before = bytesOf(home);
+
+    const run = runArgs(home, [flag]);
+
+    assert.equal(run.status, 0, run.stderr);
+    assert.equal(run.stderr, '');
+    // Compared against package.json rather than a literal, so a release bump
+    // cannot leave this test asserting a version the CLI no longer reports.
+    assert.equal(run.stdout, `${PACKAGE_VERSION}\n`);
+    assert.match(run.stdout, /^\d+\.\d+\.\d+\n$/,
+      'the version is consumed by installers and must stay bare — no banner, no prefix');
+    assert.ok(bytesOf(home).equals(before), '--version must not touch the policy file');
+  });
+}

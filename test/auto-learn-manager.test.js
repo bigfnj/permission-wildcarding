@@ -489,6 +489,157 @@ test('rollback never overwrites an external edit that races after a managed targ
 });
 
 
+// ── "Policy changed before Auto Learn could write it" ────────────────────────
+//
+// applyUnlocked writes each policy target as a WHOLE object, computed from a
+// snapshot taken earlier in the call. The only thing that makes that safe is the
+// unchanged() re-check immediately in front of every atomicWrite: it compares
+// the file on disk against the snapshot the pending content was built from, and
+// throws rather than writing if anything moved. Claude Code rewrites
+// settings.json on every /model, /effort and approval and takes no lock, so
+// "something moved" is the routine case, not the exotic one.
+//
+// The test above injects its external write AFTER a target has been written, so
+// it covers ROLLBACK. Detection had nothing: `grep "Policy changed" test/`
+// returned no hits at all, and every branch of that guard was unpinned.
+//
+// These two tests are the prerequisite for the proposed migration of this writer
+// to writeTransform. That migration would replace "detect the change and throw"
+// with "re-read and retry, up to 3 times, then succeed" — which is a different
+// contract, not an implementation detail, because a retry recomputes the whole
+// object from the NEW bytes and silently applies over the top of whoever wrote
+// them. Without these tests that swap passes the entire suite unchanged.
+
+test('a settings.json write inside the apply window is detected, and its bytes survive', (t) => {
+  const home = tempHome(t);
+  const settings = path.join(home, '.claude', 'settings.json');
+  writeJson(settings, { permissions: { allow: ['WebSearch'] }, theme: 'dark' });
+  // What Claude Code would have just written: a fresh approval plus a /model
+  // change. Losing this is losing a user action, not a stale copy of our own.
+  const external = JSON.stringify({
+    permissions: { allow: ['WebSearch', 'Bash(gh pr view)'] },
+    theme: 'dark', model: 'claude-opus-5',
+  }, null, 2) + '\n';
+  const feed = scannerFeed([
+    observed('1', 'git status'), observed('2', 'git status'), observed('3', 'git status'),
+  ]);
+
+  // The seam is a one-shot fs.renameSync patch in THIS process, not a hook
+  // added to the product. It fires the instant the transaction finishes
+  // renaming its first `.bak` into place — which is after the pre-flight
+  // unchanged() sweep over every change, and before the per-change re-check
+  // that guards each atomicWrite. So the external write lands strictly inside
+  // the window that the second guard, and only the second guard, exists to
+  // catch. The only coupling is "the transaction backs each target up before it
+  // writes it", which is the load-bearing shape of applyUnlocked itself.
+  //
+  // Two seams were tried and rejected first. The window is sub-millisecond, so
+  // real timing from a second process cannot hit it repeatably; and the
+  // manager's injectable `now` looked ideal (`const time = now()` sits between
+  // the two guards) but is ALSO called by policy-lock during lock acquisition,
+  // before any snapshot is taken — writing from there lands before the window,
+  // the apply then merges into the external bytes and correctly succeeds. That
+  // near miss is why `injected` is asserted below.
+  const realRename = fs.renameSync;
+  const realWrite = fs.writeFileSync;
+  t.after(() => { fs.renameSync = realRename; });
+  let armed = false;
+  let injected = 0;
+  fs.renameSync = (from, to) => {
+    const result = realRename(from, to);
+    if (armed && typeof to === 'string' && to.endsWith('.bak')) {
+      armed = false;
+      injected += 1;
+      realWrite(settings, external);
+    }
+    return result;
+  };
+  const learn = manager(home, feed, { threshold: 3, codexRulesPath: null });
+  learn.scan();
+  const key = 'bash:git status';
+  assert.ok(learn.listCandidates().some((item) => item.key === key && item.autoSafe),
+    'the apply below has to have something real to write, or this proves nothing');
+
+  armed = true;
+  let failure;
+  // Restored in `finally` as well as in t.after: fs.renameSync is process-wide,
+  // and the patch has no business being live for one instruction longer than
+  // the apply it is timing.
+  try { learn.apply(); }
+  catch (error) { failure = error; }
+  finally { fs.renameSync = realRename; }
+
+  // The injection must actually have fired. A concurrency test whose race never
+  // happens is the exact "test that cannot fail" this project refuses.
+  assert.equal(injected, 1, 'the external write never landed inside the window');
+  assert.equal(failure?.message, `Policy changed before Auto Learn could write it: ${settings}`,
+    `expected the pre-write guard to throw; got: ${failure?.message ?? '<no error>'}`);
+  // Distinct from the pre-flight sweep's wording on purpose: the two guards fail
+  // at different points and only one of them is in front of a write.
+  assert.doesNotMatch(failure.message, /while Auto Learn was preparing it/,
+    'that is the earlier sweep — this test must exercise the guard in front of atomicWrite');
+  // Nothing had been written yet, so rollback had nothing to undo and must have
+  // said so. The case where rollback does real work is the next test.
+  assert.equal(failure.rollbackConflicts, undefined,
+    'rollback reported a conflict for a write that never happened');
+  assert.equal(fs.readFileSync(settings, 'utf8'), external,
+    'THE property: the bytes that landed inside the window are still on disk');
+  assert.equal(fs.existsSync(learn.paths.claudeClaims), false,
+    'the transaction aborted before its first write, so no target may exist');
+  assert.deepEqual(learn.status().appliedKeys, [],
+    'and nothing may be recorded as applied — state must not claim a write that failed');
+});
+
+test('a write inside the window between two targets is detected, and rollback stays clean', (t) => {
+  // Same guard, but reached at change index 1 rather than 0, so `written` is
+  // non-empty and rollback has real work: it must restore the target it wrote
+  // and leave the externally-written one alone. Without this case the
+  // rollbackConflicts assertion above is satisfied by a rollback that did
+  // nothing at all.
+  const home = tempHome(t);
+  const settings = path.join(home, '.claude', 'settings.json');
+  const originalSettings = JSON.stringify(
+    { permissions: { allow: ['WebSearch'] }, theme: 'dark' }, null, 2) + '\n';
+  fs.mkdirSync(path.dirname(settings), { recursive: true });
+  fs.writeFileSync(settings, originalSettings);
+  const feed = scannerFeed([
+    observed('1', 'git status'), observed('2', 'git status'), observed('3', 'git status'),
+  ]);
+  // The claims registry is change index 1. afterPolicyWrite fires between the
+  // write of index 0 and the guard on index 1 — the same window, one target
+  // later — and unlike the rollback test above it does NOT throw, so the guard
+  // itself is what has to stop the write.
+  const externalClaims = '{"version":1,"permissions":{},"owner":"somebody else"}\n';
+  const kinds = [];
+  const learn = manager(home, feed, {
+    threshold: 3, codexRulesPath: null,
+    testHooks: {
+      afterPolicyWrite(event) {
+        kinds.push(event.kind);
+        if (event.kind === 'claude') fs.writeFileSync(learn.paths.claudeClaims, externalClaims);
+      },
+    },
+  });
+  learn.scan();
+
+  let failure;
+  try { learn.apply(); } catch (error) { failure = error; }
+
+  assert.deepEqual(kinds, ['claude'],
+    'the claims target must never have been written — the guard has to stop it');
+  assert.equal(failure?.message,
+    `Policy changed before Auto Learn could write it: ${learn.paths.claudeClaims}`,
+    `expected the pre-write guard to throw; got: ${failure?.message ?? '<no error>'}`);
+  assert.equal(failure.rollbackConflicts, undefined,
+    'rollback owned the settings write outright and must have undone it without conflict');
+  assert.equal(fs.readFileSync(settings, 'utf8'), originalSettings,
+    'the target this apply did write is rolled back to the bytes it found');
+  assert.equal(fs.readFileSync(learn.paths.claudeClaims, 'utf8'), externalClaims,
+    'THE property: the foreign write is never overwritten, not even by the rollback');
+  assert.deepEqual(learn.status().appliedKeys, []);
+});
+
+
 test('undo survives an unrelated settings write and removes only its own entry', (t) => {
   const home = tempHome(t);
   const settings = path.join(home, '.claude', 'settings.json');
