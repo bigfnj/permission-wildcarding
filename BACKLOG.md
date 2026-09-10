@@ -29,153 +29,161 @@ that last one added because the fallback-not-union decision was initially
 untested, and a union would resurrect a deliberately pruned entry. Suite 290
 tests, 289 pass, 1 POSIX-only skip, 0 fail.
 
+Tiers 1-3 of the 2026-09-09 audit are burned down, 2026-09-10. Thirteen entries
+above were removed as closed; the commits carry the mutation results that justify
+each. Headlines, all measured on this machine:
+
+- **The hook locks and rebases.** It was the highest-frequency writer of
+  settings.json and the only one that neither locked nor re-read. Two phases now:
+  the unlocked read is a negative test only, and the changed path takes one lock
+  covering both the write and the drain, discards the snapshot and recomputes
+  inside it. Replaying the delta instead would have lost a permission outright —
+  `Bash(npm test)` granted while MAX was on, marked removed by the stale pass and
+  deleted after `--max off` deliberately preserved it. Interleaved measurement,
+  n=14 each: min 157 / median 175 ms before AND after, so the common path is
+  unchanged.
+- **processAllowList: 57 -> 6 ms warm, 85.8 -> 11.6 ms cold** at 423 entries, and
+  the same index now serves the other two coverage pools (policy-guard's worst
+  case 15.5 -> 6.47 ms). `isCoveredBy` is untouched and still decides every
+  answer; the index only narrows, so only a false negative could change a result.
+  The differential test found one on its first run — `Bash(rm -rf /*)` has its
+  star inside the last token — which is why token-misaligned rules go to the
+  linear fallback.
+- **Codex evidence is observable again.** `extractNestedShellCommands` accepted
+  only `tools.shell_command` while `auto-learn.js` already knew `exec_command`, so
+  current Codex transcripts yielded ZERO observations in every mode. Fixing the
+  extractor alone was not enough: `customExecCanAttributeSuccess` matched the same
+  narrow set, which would have left every call permanently `unknown` and
+  `counts.success` at 0. Append-mode `cwd`/`session` are now re-seeded by reading
+  forward to the first newline — a fixed-size read cannot work, because the real
+  `session_meta` line is 22,095 bytes of Codex system prompt.
+- **The extension no longer outlives its own async work.** One `deactivated` flag,
+  released on re-activate; all four `execFile` children tracked and killed; the
+  worker runner nulled and the busy latch cleared, so a same-realm re-activate is
+  not permanently stuck rejecting "Auto Learn is deactivating".
+- **The dashboard is under test at all** — 8 tests including a permanent backtick
+  guard over the `_html` template literal, after three syntax breaks came from
+  one. No production export was needed: capturing argument 2 of
+  `registerWebviewViewProvider` was the whole unlock.
+- **The release harness is committable**, parameterized by four environment
+  variables with auto-discovery, and verified both configured (16 PASS) and
+  entirely bare (14 PASS, 6 INFO) so a fresh clone gets skips rather than red.
+
+Suite: **297 -> 337 passing**, 2 platform skips, 0 fail, CI green on ubuntu and
+windows x node 20 and 22.
+
 ## Open
 
-### The hook writes settings.json with no lock and no rebase, and can lose a deny rule
+### Three writers still spread from their own read
 
-**Highest-severity finding of the 2026-09-09 audit.** `bin/wildcard-perms:193-207`.
-The hook is the highest-frequency writer of settings.json on this machine
-(PostToolUse on `Bash|PowerShell`) and it is the one writer that takes no lock.
-`README.md:36` says "the advisory lock **every** policy writer takes" and
-`:561` says the wildcarding pass and Auto Learn "both take the same lock". That
-is true of the extension's `runWildcarding` (`extension.js:2133`, which locks and
-retries) and **false of the CLI's**. The two most frequent writers have zero
-mutual exclusion. It also does not rebase, unlike `writeAllow`
-(`extension.js:142-176`), which documents this exact hazard and defends against it.
+Fixed for the hook, `--seed` and the drain's `mergeUserAllow`; NOT fixed for
+`--max` and `--bypass` (`bin/wildcard-perms`, the two remaining `writeSettings`
+call sites). Both compute a whole settings object from their own read and write it
+back, so they revert anything that landed in between. They are lock-held, so they
+are safe against Auto Learn and each other — the exposure is against Claude Code,
+which never takes the lock and rewrites this file on every /model, /effort and
+approval. Lower frequency than the hook, same class of loss. They do not fit
+`writeAllow` directly because their output is a whole settings object rather than
+an allow list; the fix is either a rebasing whole-object writer or reshaping them
+to return an allow list.
 
-Failure scenario, and it loses the thing this project says it never loses: the
-user hand-adds `Bash(rm -rf *)` to `permissions.deny`. A tool call completes, the
-hook fires, reads settings.json *before* that edit lands, spends ~56 ms in
-processAllowList, then writes back its snapshot —
-`permissions: { ...settings.permissions, allow: after }` carries the **old**
-deny. The rule is gone, and nothing re-asserts it: the high-water backup only
-restores a deny it already recorded, and it never saw this one.
+### The extension writes a MAX refusal it never reports
 
-Narrow window, because the write is skipped when the list is already a fixed
-point — but it opens precisely when a new approval has just been persisted, which
-is when a concurrent write is most likely. Secondary: a write landing between
-Auto Learn's settings write and its claims write leaves the registry describing
-entries that no longer exist, the exact failure `policy-lock.js:1-7` was written
-to prevent.
+`applyMax` now returns `{ changed: false, error: 'max-snapshot-failed' }` when the
+allow snapshot cannot be written, and `applyMax` stops the sequence so the approve
+hook is not registered for a MAX that was never established. The CLI reports it
+and exits 1. The extension's toggle does `if (!res.changed) return` and never
+inspects `error` (`vscode-extension/extension.js`, the `applyMax` call site), so
+the user clicks MAX, nothing happens, and nothing says why. Harmless — MAX stays
+off, which is the safe direction — but silent.
 
-`--seed` has the same shape (`bin/wildcard-perms:515-541`: read, merge, write, no
-lock, no rebase) while `withPolicyLock` is defined 20 lines below and used by
-`--drain`, `--bypass` and `--max`. Two extension writers also bypass the lock —
-`restoreFromBackup` (`extension.js:444`, reached from the **automatic** bulk-loss
-path at `:379`, i.e. during a policy wipe, maximum contention) and `_remove`
-(`:2740`). Both rebase, so they cannot lose unrelated fields, but they can
-interleave with Auto Learn's two-file application.
+### The coverage index is data-dependent, and the fallback size is the thing to watch
 
-### Three swallowed snapshot failures turn a toggle destructive
+Live split is 401 indexed / 22 fallback, which is why the pass is 6 ms. The
+residual cost is O(n x fallback), because a rule with a glob inside a token cannot
+be found by lookup and must be checked against every candidate. Measured on a
+synthetic pool with roughly half the entries unindexable: n=841 36.7 ms, n=1600
+157.6 ms — better than the old scan at every size, but not linear.
 
-Same shape in three places: a best-effort state write whose failure is discarded,
-followed by a destructive operation that assumed it succeeded.
+In this tool's steady state almost everything is a trailing-scope wildcard, so
+this is comfortable. **Trigger: revisit if the fallback share passes ~20% of the
+list**, which would mean either an influx of quoted-path entries or a starter-pack
+change. `createCoverIndex(...).stats()` reports the split.
 
-- **MAX-on can lose the entire allow list.** `src/permissions.js:361-366` and
-  `:424`. `writeMaxState` swallows its error, `enableMaxAllow` proceeds
-  unconditionally, and processAllowList then prunes all 423 specific entries
-  under `Bash(*)`. On MAX-off, `disableMaxAllow` reads `state.allowSnapshot`;
-  with no snapshot `Array.isArray(snap)` is false, `restored = kept`, and the
-  user is left with the 7 blanket entries. The "best-effort" comment is borrowed
-  from `writeBypassState:250`, where the stated consequence is genuinely benign;
-  here it is total. CLI-only users have no second copy.
-- **`writeCodexMaxState` is the one state write not using an atomic helper**
-  (`src/codex-max.js:118-124`), while every sibling uses `writeFileAtomicSync` or
-  `atomicWrite`. Interrupted mid-write, `readCodexMaxState` catches the parse
-  error and returns `{}`, `priorApproval` is undefined, and
-  `applyCodexMax(..., false)` calls `clearApproval` — **removing
-  `approval_policy` entirely instead of restoring the user's prior value**.
-- **`ensureApproveScript()`'s failure is discarded** (`permissions.js:464`, and
-  `:480` ignores the return), so `registerApproveHook` registers the PreToolUse
-  entry regardless and `--max status` prints `approve-hook=on` with no
-  `approve-all.js` on disk. Fail-safe in direction (prompts still appear) but
-  `maxLayers`' own comment sets the opposite standard: "Reporting `hook: true` in
-  that case would claim a control that is not running".
+### Codex: the non-nested `exec_command` shape is still unrecognized
 
-### The backup can drop entries it legitimately owns
+`parseCodexJsonl` accepts only `shell_command` / `functions.shell_command` and
+reads `args.command`. If Codex emits the unified-exec tool as a plain
+`function_call` carrying `{cmd: ...}`, it yields no observation — the same defect
+class as the nested extractor bug, on the other path. Left alone because there is
+no verified sample of that shape; the fix is a name-set entry plus an `args.cmd`
+fallback, two lines.
 
-- **`_remove` prunes the backup before the write that may fail**
-  (`extension.js:2750-2751`). `forgetFromBackup` runs first; if `writeAllow` then
-  throws — and `SETTINGS_UNREADABLE_CODE` is routine, the file is rewritten in
-  place on every approval — the entry is still live in settings.json but gone
-  from the high-water mark, so a later wipe will not restore it. Swap the order,
-  or roll the forget back in the catch.
-- **MAX-off purges the full MAX set from the backup** (`extension.js:2084`):
-  `Read(*)`, `Edit`, `Write`, `WebFetch(*)`, `WebSearch` and every
-  `mcp__<server>__*`. This contradicts `restoreFromBackup`'s own comment ~1600
-  lines earlier (`:473-478`): "The full MAX set is legitimately used outside MAX
-  too, so only the two markers that uniquely signal MAX-on are excluded." A user
-  who had `Read(*)` before ever touching MAX keeps it in settings.json (restored
-  from the sidecar) but loses it from the backup. Use `MAX_MARKERS` here, or
-  forget only what is absent from `state.allowSnapshot`.
+### Cursor pruning lost its only mechanism in one case
 
-### Codex evidence past 256 KB is silently discarded
+`state.cursors = {}` followed by repopulation WAS how cursors for deleted
+transcripts got pruned. The blind-scan guard suspends that when a scan enumerates
+zero files, which also covers a legitimately emptied root, so stale cursors linger
+until a scan enumerates at least one file again. Harmless — they are consulted
+only for files that exist — but the state file will not shrink in that case, and
+there is no explicit pruning pass anywhere.
 
-`src/history-adapters.js:686-702` with `src/auto-learn-manager.js:1367`.
-Verified empirically 2026-09-09, including against a real session file on this box.
+### sanitizeState has no version migration hook at all
 
-Codex records `cwd` only in the head-of-file `session_meta`, and
-`parseCodexJsonl` carries it forward in `state.cwd`. In `append` mode the scanner
-reads from `max(0, prior.size - 256 KB)`, so once a session exceeds the overlap
-window the head is not in the buffer, `state.cwd` stays undefined, and the scan
-drops the observation at `within(workspaceRoot, undefined) === false`.
-`workspaceRoot` is always set from the CLI (`--workspace` defaults to cwd) and for
-any normal VS Code window.
+`src/auto-learn-manager.js` never reads `raw.version`, so `VERSION` is write-only.
+Whoever next needs a state reset will find the mechanism absent. This is not
+hypothetical: it is why the Codex `session` fix accepted one bounded round of
+re-counting rather than bumping the version — a bump resets nothing without new
+migration code, and resetting `observationHashes` while keeping `counts` makes the
+over-count worse.
 
-    size=423227
-    PASS1 mode=full    obs=[{"cmd":"git status","cwd":"D:/work/repo"}]
-    PASS2 mode=append  obs=[{"cmd":"git log"}]      <- cwd absent, dropped
+### scan() does not report that it went blind
 
-On the real `~/.codex/sessions/.../rollout-*.jsonl`: **2 of 32 records carry cwd,
-both at the head.** Real Claude transcripts carry it on ~83% of records
-(1524/1833) spread throughout, so Claude is unaffected in practice. This is a
-plausible mechanical explanation for the handoff's "Codex gap was 30 of 6,870
-observations". `rebuildManagedHits` is immune because it forces `cursors: {}` and
-reads in full — which is why a rebuild and a scan disagree.
+The error count is now non-zero when a root fails, but nothing says "the cursor
+map was preserved because nothing was enumerated". A consumer tuning retry
+backoff has to infer it. Related and pre-existing:
+`lastScanStats.prunedObservations` is written by `scan()` and dropped by
+`sanitizeState`, so it vanishes on reload.
 
-Secondary: `session` is lost the same way and is part of `identityParts` in
-`createObservation`, so the same call gets a **different observation id** in
-append vs full mode. With `workspaceRoot` null — an empty VS Code window, since
-`extension.js:860` uses `workspaceFolders?.[0]` — an append-counted observation
-is counted again after a transcript rewrite forces a full re-read, inflating
-`counts.success`, which is the number that gates auto-safe application.
+### Killing a child can orphan its grandchild
 
-### A junctioned transcript directory is invisible, with no error
+`deactivate()` now kills the four tracked `execFile` children, but `recall.py`
+re-execs itself into the toolbox venv (`RECALL_REEXEC=1`), so killing the
+immediate child can leave the process that actually does the embedding running. A
+process-group kill (`taskkill /T` on Windows) is what would make this certain.
 
-`src/history-adapters.js:816-846`. The comment claims junctions are handled
-("Use a real-path set and an iterative walk so either a cycle or extreme nesting
-is harmless"), but `:841` queues children on `entry.isDirectory()`, and a Dirent
-for a Windows junction reports `isSymbolicLink() === true`,
-`isDirectory() === false`, `isFile() === false`. The directory is never queued,
-the real-path cycle guard never fires from that direction, and every transcript
-under it is skipped silently. Verified:
+### More module state survives deactivate
 
-    linked isDirectory=false isFile=false isSymbolicLink=true
-    files found: []
+`deactivate()` now resets 4 of 25 module-level mutables rather than 1. Still
+surviving: `autoLearnManager` (reused when its key is unchanged, which it is
+across a same-realm re-activate, so a re-activated extension inherits the old
+manager's in-memory state — the same class of bug as the worker runner, just not
+yet observed to bite), `autoLearnNextRetryAt` (a backoff that persists across a
+reload), `lockedRetries`, `localDrainRetries`, `recallRebuildAt`, `policyLock`,
+`statusBar`.
 
-**This bears directly on the corpus-protection item above.** Junctioning a
-directory under `~/.claude` to a git repo on `D:` is the natural move on a box
-laid out across two drives, and for a *transcript* directory it would silently
-zero the evidence base. Before recommending that protection, confirm which
-discovery paths follow a junction: `memoryLint.discoverDirs` happens to be safe
-because it tests `existsSync(<dir>/MEMORY.md)`, which follows the link, but
-`findJsonlFiles` is not, and `recall.py`'s own discovery has not been checked.
-Fix is to queue on `isDirectory() || isSymbolicLink()` and let the existing
-realpath set handle cycles — which is what it was written for.
+### Test harnesses can silently assert against a frozen home
 
-### One unreadable transcript root wipes every cursor and reports a clean scan
+`src/*` modules capture `os` at require time and their exported helpers default
+to `os.homedir()` at call time, so the SECOND harness in a test file resolves the
+FIRST one's mocked home unless the file purges repo `src/` from `require.cache`.
+Two files do (`local-drain-extension.test.js`, and now `dashboard-view.test.js`);
+the others do not.
 
-`src/auto-learn-manager.js:1415` replaces `state.cursors` wholesale from the scan
-result, and `src/history-adapters.js:824,835,838` has three `catch { continue; }`
-covering statSync, realpathSync and readdirSync. If `~/.claude/projects` is
-momentarily inaccessible — EACCES from antivirus, a locked directory —
-`findJsonlFiles` returns zero files with no error, so every file's byte offset is
-lost and `lastScanStats` reports `{files: 0, observations: 0, errors: 0}`,
-indistinguishable from "nothing to do". The per-file catch at `:1057-1068`
-reasons carefully about not "claiming progress we did not make"; the root-level
-enumeration failure sits outside that reasoning and produces the outcome it was
-written to prevent. Skip the cursor replacement when zero files are found but
-prior cursors existed, and surface a root-level error.
+This already cost a real assertion. When the rebasing writer moved into
+`src/settings-write.js`, the dashboard harness's scripted-read seam stopped
+reaching it, and the affected test did not fail loudly — its precondition
+silently became unreachable and the assertion after it went vacuous. **Audit the
+remaining multi-harness test files for the same shape**; a test that cannot fail
+is worse than one that does.
+
+### restoreFromBackup still recomputes the pass twice
+
+It runs its own `processAllowList` and then calls `refresh()`, which recomputes
+it. Left alone when the watcher path was fixed, because this one is user-initiated
+and rare rather than fired by a file watcher. Now cheap anyway at 6 ms, so this is
+tidiness rather than performance.
+
 
 ### Managed-block removal can fuse the user's own lines
 
@@ -282,118 +290,6 @@ overwrite the good copy with the bad one.
 - **`mirrorBackupPath()` accepts `~` alone** (`extension.js:213-223`):
   `path.join(homedir(), '')` is the home directory itself, and the write then
   fails EISDIR and is swallowed. Cosmetic, but a configured `~` reads as valid.
-
-### processAllowList is quadratic, and it is now the whole hook cost
-
-Measured 2026-09-09 on the 423-entry live list. The hook is **141.9 ms median**
-(n=12), decomposing as ~50 ms bare node + 21.5 ms module load + **55.9 ms
-processAllowList** + ~0.2 ms file I/O. Of that 55.9 ms the generalize+dedupe step
-is **0.109 ms** and the two coverage scans are **~52 ms** —
-`src/permissions.js:204-207` (prunePermissions) and `:214-220` (the generalize
-gate), together **348,588 RegExp.test() calls per pass**.
-
-The v1.4.0 memoization fixed *compilation* (423 compilations for 423 unique
-rules, verified still holding). Execution was never touched and is now 99.8% of
-the pass. It is textbook quadratic on a list that only grows — 316 to 423
-historically — measured: n=100: 3.0 ms, 200: 10.7, 423: 52.7, 600: 111.6,
-841: 254.2. Worse, the live list is already a fixed point (the pass deep-equals
-its input), so the common hook call spends 56 ms proving nothing changed.
-
-A prefix-index fix was prototyped and measured: 396 of 423 entries have the shape
-`Tool(prefix *)`, which covers a specific iff it is a string prefix, so no regex
-is needed. Index those in a Map, walk the candidate's own token prefixes, fall
-back to the existing scan for the other 27 shapes. **55.94 ms to 4.31 ms (13x),
-0 of 423 cover-set mismatches** against the full scan, no new state, no change to
-the match-cache key. One subtlety to preserve: prunePermissions uses index
-inequality `i !== j`, which only equals string inequality because the pass dedupes
-through a Set first. The same helper serves the two other `isCoveredBy` pools
-(`local-settings.js:73`, `policy-guard.js:117`).
-
-**Deliberately NOT done in this session.** This is the coverage algorithm that
-decides which of the user's permissions get pruned, in a tool whose whole job is
-writing a security boundary. It was escalated to the owner rather than landed
-alongside eleven other changes, and it wants its own change with an exhaustive
-old-vs-new equivalence test over the real list plus generated shapes.
-
-**Correctness constraints, established empirically 2026-09-09 against the real
-`ruleMatches` — read these before implementing.** The "0 of 423 mismatches"
-figure was measured on today's list and does not by itself prove the approach
-generalizes; these four probes are what it rests on:
-
-    no     Bash(gi *)     vs Bash(git status)
-    MATCH  Bash(git *)    vs Bash(git status)
-    MATCH  Bash(git *)    vs Bash(git)
-    MATCH  Bash(g* *)     vs Bash(git status)
-    MATCH  Bash(mkfs* *)  vs Bash(mkfs.ext4 /dev/sda)
-
-1. Matching is **token-aware, not raw glob** — `Bash(gi *)` does NOT match
-   `Bash(git status)`. This is what makes a token-boundary prefix index sound;
-   a raw-substring index would have to enumerate every character prefix.
-2. `Bash(git *)` matches `Bash(git)`, so the trailing `*` matches **empty** and
-   the separating space is not required. An index keyed on `"git "` misses it.
-3. A glob **inside** a token still matches: `Bash(g* *)` and `Bash(mkfs* *)`
-   both match. These cannot be found by any literal-prefix lookup, so the
-   fallback pool must be defined as "the pre-`*` text contains a glob
-   character", not merely "the rule is not `Tool(word *)`-shaped". `mkfs* *` is
-   a real shape — it ships in the starter pack's deny half — so this is not
-   hypothetical.
-4. Identity is not coverage, and `Tool(cmd:*)` and `Tool(cmd *)` are the same
-   rule rather than one covering the other (`isCoveredBy` defers to `sameRule`
-   first). The index must not turn a rule into its own coverer.
-
-The differential test therefore needs generated adversarial shapes — globs mid
-token, the `:*` spelling, empty-tail cases, single-token rules — and not just
-the live list, precisely because the live list contains none of case 3 in its
-allow half.
-
-### The extension recomputes the same quadratic pass twice per settings write
-
-`vscode-extension/extension.js:2145` (runWildcarding) computes processAllowList,
-then `dashboard?.refresh()` at 2159/2163/2174/2193 reaches `:2674`, which
-computes the identical value again: **2 x 56 ms per settings.json write**, on the
-extension-host thread.
-
-Same function, separate point: `refresh()` is the **only** handler in that file
-with no bounce timer — memBounce, gatesBounce, policyBounce, localDrainBounce and
-autoLearnBounce all exist — and it has ~35 call sites, several from watcher pairs
-that fire together (codexWatcher onDidChange + onDidCreate at 1748-1749,
-bundleWatcher x3 at 1762-1764). Each call also does ~10 synchronous file reads
-and, via `localCardData()` at 2316, a full drain dry-run per workspace folder
-holding a settings.local.json.
-
-### The stat-keyed policy cache is paid per candidate, not per call
-
-`src/auto-learn-manager.js:700` — `clone(item, known)` calls `managedPolicy()`,
-and `candidatesFrom` (`:716`) maps clone over every candidate, so one
-`status()`/`list()` does N stats where 1 would do. `apply()` calls it twice per
-selected item (`:1117`, `:1120`). statSync measured at **36.2 us** here, so
-~10.3 ms per listing at the historical 285 candidates, 1.8 ms at today's 50.
-
-The stat-keying itself is correct and deliberate — it fixed a stale-verdict bug
-in this same session. This is only about paying it once: hoist `managedPolicy()`
-into candidatesFrom and pass the policy into clone.
-
-### Scan re-reads and re-hashes the same 8 KB per unchanged file
-
-`src/history-adapters.js:995-997`. `safeContinuation` reads head+tail (4096 B
-each) and hashes both against the prior cursor; `cursorForFile` then calls
-`fingerprintFile`, which reads **the same two ranges again and re-hashes them**.
-On the unchanged path `stat.size === prior.size` and the hashes just matched, so
-the new fingerprint is provably identical to the prior one and can be built from
-it plus the stat already in hand, with zero I/O. Measured **131.3 us per file**,
-so ~93 ms per scan at the 710-file corpus that used to exist. Runs on the
-5-minute timer, every debounced transcript write, and every `--learn scan`.
-
-### Buffer.byteLength per line is 30% of the JSONL parse
-
-`src/history-adapters.js:120`, the hottest frame in the profile (26.0% self,
-198 ms of a 764 ms scan). `parseJsonlRecords` already accepts a Buffer (`:113`)
-and immediately stringifies it, discarding the byte-exact offsets it then spends
-27 ms recovering. Splitting the Buffer on byte 10 makes offsets free and skips
-decoding blank or unparseable lines: measured 90.8 ms to 60.1 ms over 19.5 MB /
-8,148 lines. A contained subset of the deferred streaming-parser item (trigger: a
-200 MB transcript), not a new direction, and it also cuts the peak retention
-behind the 4x-RSS note.
 
 ### Smaller measured perf items, none urgent
 
@@ -555,26 +451,6 @@ commands registered, 4 of 4 menu entries resolve, 16 of 16 config keys read, 8 o
   the identical problem correctly for Python via a two-path probe. Low impact —
   no `.vscode/launch.json` exists, so a fresh checkout has no F5 path — but it is
   literally a require of a path absent from a clean clone.
-
-### The release harness is gitignored, so its fixes are unversioned
-
-`.gitignore:32` excludes `scripts/verify-release.ps1` because it hardcodes this
-machine's corpus paths. Consequences, all realised: it had never been run for
-v1.3.0, v1.4.0 or v1.4.1; nobody else can run it; and the four fixes made to it
-on 2026-09-09 — an unreachable lint check, a self-contradicting SessionStart
-note, a **crash** on a 0-byte compiled-gates file, and a stale eyes-only
-expectation — live only on this box. Parameterize the machine-specific paths
-(corpus root, the two probe repos, the gated-memory filename) and commit it.
-
-### The dashboard has no test coverage at all
-
-No test calls resolveWebviewView. WildcardingViewProvider is not exported
-(`extension.js:3213` exports only activate/deactivate), and refresh() pulls in
-processAllowList, a MEMORY.md read per store and a per-folder drain dry-run, so
-it cannot be driven cheaply. That is a class with ~35 refresh call sites and
-every user-facing control in it, verified only by eye. Exporting the provider (or
-a factory) purely for test is the cheap unlock; the webview-disposal fix landed
-2026-09-09 had to go in untested for exactly this reason.
 
 ### The memory convention and this project's lint disagree about `scope:`
 
