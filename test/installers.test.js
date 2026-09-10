@@ -325,3 +325,22 @@ test('the uninstaller counts hooks, not entries', (t) => {
   assert.equal(after.hooks.PostToolUse.length, 1);
   assert.deepEqual(after.hooks.PostToolUse[0].hooks, [{ type: 'command', command: 'neighbour' }]);
 });
+
+test('the two package manifests report the same version', () => {
+  // Both ship inside the same VSIX — the extension manifest drives the sidebar
+  // badge, and the root one is what `wildcard-perms --version` prints. Nothing
+  // asserted they agreed, so they drifted: the extension went 1.4.2 -> 1.4.3 ->
+  // 1.4.4 while the root manifest stayed at 1.4.2, and a user with 1.4.4
+  // installed saw "Active v1.4.4" in the sidebar and 1.4.2 from the CLI.
+  //
+  // .github/workflows/release.yml defaults its version input to
+  // vscode-extension/package.json, so that one is authoritative and the root
+  // follows it.
+  const root = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+  const ext = JSON.parse(fs.readFileSync(
+    path.join(repoRoot, 'vscode-extension', 'package.json'), 'utf8'));
+
+  assert.equal(root.version, ext.version,
+    `root package.json is ${root.version} but the extension manifest is ${ext.version}; `
+    + 'release.yml treats the extension manifest as authoritative, so bump the root to match');
+});

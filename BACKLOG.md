@@ -840,16 +840,30 @@ and not ours.
 
 | Item | Measured | Frequency |
 |---|---|---|
-| ~~`require('./managed-policy')` is eager~~ **DONE 2026-09-10.** The figure here was wrong twice: 0.61 ms recorded, 2.3 ms predicted by a stub harness that also pre-cached `permission-match`. Measured after the change: `require('src/permissions')` 4.803 -> 3.529 ms, i.e. **1.27 ms** per hook call | 1.27 ms | per hook call |
+| ~~`require('./managed-policy')` is eager~~ **DONE 2026-09-10.** The figure was wrong three times: 0.61 ms recorded, 2.3 ms predicted by a stub harness that also pre-cached `permission-match`, then 1.27 ms claimed here. Two independent second-party measurements — 30 interleaved repo-resident pairs (**0.889 ms**, min 0.858) and 40 pairs across materialized `33612fe` vs `cd1f50c` trees (**1.01 ms** p50/min) — put it at **0.86–1.04 ms**. The 1.27 was 20–35% high. **The retracted 2.3 ms figure still ships in a code comment at `src/permissions.js:686-687`**, in the very commit whose message retracts it | ~0.9 ms | per hook call |
 | A fixed-point cache keyed on a CONTENT HASH of settings.json lets the hook skip the read, the module load and the pass | our-code p50 11.80 -> 2.46 ms; wall 62.3 -> 53.6 ms; 30/30 hits | per hook call |
 | ~~`memoryReport()` runs TWICE per dashboard refresh~~ **DONE 2026-09-10.** "11.22 ms" was the COMBINED cost of both calls, not the saving — the second is much cheaper because the file cache and the JIT are warm. Measured directly, 11 interleaved fresh processes: one call 6.99 ms, two 9.92 ms, so hoisting saves **2.93 ms** and 25 fs syscalls | 2.93 ms | per refresh |
 | `runWildcarding` takes the policy lock even on the unchanged path; the CLI hook was deliberately changed not to | lock cycle 3.72 ms of 9.60 ms, plus contention with Auto Learn | per settings.json write |
 
 Two notes worth keeping. The fixed-point cache **needs a decision, not just
 work**: it adds a new cache file on the hook path. Use a pure-JS hash, not
-`crypto` — `require('crypto')` alone is 3.5 ms and ate 40% of the win. Every
-failure mode is "miss -> full pass", and a forced-miss run measured 15.72 vs
-18.28 ms, so there is no cold-path regression.
+`crypto` — `require('crypto')` alone is 3.5 ms and ate 40% of the win
+(re-measured 2026-09-10 by a second party at 4.65 p50 / 3.40 min cold, so this
+is conservative). Every failure mode is "miss -> full pass".
+
+**CORRECTED 2026-09-10.** The sentence that used to end this paragraph — "a
+forced-miss run measured 15.72 vs 18.28 ms, so there is no cold-path regression"
+— is **wrong, with the sign backwards**, and those two numbers are not the same
+quantity. Against a purpose-built no-cache variant, two independent runs agree
+that the **miss path costs 2.4–3.9 ms MORE** than having no cache at all
+(n=41: +3.90 p50 / +2.44 min; n=21: +4.81 / +2.54). In-process accounting
+agrees: module load 1.97 + stamp 0.53 + hash 0.72 + failed key read 0.23 + key
+write 1.07.
+
+It is still clearly the right trade — saving 9.2 against a cost of 3.9 puts
+break-even at a **30% hit rate** and the real rate is near 100% — but the claim
+must be *restated*, not deleted. Every settings.json change now costs a few ms
+more than it did before the cache existed.
 
 And the opposite conclusion for the extension, recorded so nobody applies the
 hook's lesson by analogy: its eager requires are **not** worth making lazy.
@@ -1037,3 +1051,200 @@ MAX switches to.
 
 Turning the same measurement on a real ~300-entry list to report which entries
 are broader than the evidence supports. Offered and deferred.
+
+
+---
+
+## Audit of 2026-09-10, second pass
+
+Five read-only agents over the day's work, plus my own verification of each
+claim. Recorded with the measurement method, because several earlier entries in
+this file were wrong in ways that only the method explains.
+
+**Two agent findings I DISPROVED rather than actioned** — recorded so nobody
+re-opens them:
+
+- *"`test/extension-managed-blocked.test.js` writes into the real `~/.claude` on
+  every `npm test`, because a module-scope require resolves `POLICY_LOCK_PATH`
+  against the real home."* **False.** `src/auto-learn-manager.js` computes **no**
+  paths at module scope, and the test passes `home: tempHome` explicitly. An `fs`
+  wrapper over `writeFileSync`/`mkdirSync`/`openSync`/`unlinkSync`/`rmSync`/
+  `rmdirSync`/`renameSync`/`appendFileSync`/`copyFileSync`, installed via
+  `--require` so it precedes every module, recorded exactly **one** path under the
+  real home across all 405 tests: npm's own debug log.
+- *"The root/extension version skew defeats the version badge's purpose."*
+  **False as stated.** `extensionVersion()` reads `./package.json` relative to
+  `extension.js`, i.e. the extension manifest, so the badge was always correct.
+  The skew was real but the consequence was the other way round: **`wildcard-perms
+  --version` printed 1.4.2 while the badge said 1.4.4**, both shipping in the same
+  VSIX. Fixed, and pinned by a parity test in `test/installers.test.js`.
+
+### Fixed in this pass
+
+- **`writeTransform` could destroy the whole settings.json and report success.**
+  `absent -> {}` was treated as the legitimate first run on *every* attempt,
+  including retries. Reproduced end to end: `--max on` with one external delete
+  inside the transform replaced 432 allow entries plus `model`, `effortLevel` and
+  `agentPushNotifEnabled` with 7 blanket entries, recorded an **empty** allow
+  snapshot, and exited 0. Now refuses on the read, ahead of a second transform
+  call, so `applyMax` never snapshots `{}`.
+- **`deniesLost` gated on `Array.isArray`,** so `deny: "Bash(rm -rf *)"` was
+  written away with `wrote: true`. Now compared by value for non-array shapes.
+- **`deactivate()` nulled its retainers after the awaited drain,** so a same-realm
+  re-activate had its `dashboard` and `memoryLint` nulled by the old teardown's
+  continuation — 0 pushes reached the successor's live webview and all ~35
+  `dashboard?.refresh()` call sites were permanent no-ops.
+- **Three post-teardown writers** (`ensureGuidance`, `scheduleAutoLearn`,
+  `resetAutoLearnTimer`) now carry the `deactivated` guard.
+- **Test isolation:** `delete require.cache[extensionPath]` left every `src/`
+  module holding the first harness's `os` stub, so later tests resolved
+  `home = os.homedir()` defaults to an earlier test's deleted temp home. Suite-wide
+  temp-dir leak 3/run -> 0.
+- **`SETTINGS_CONTENDED_CODE` now has a production consumer** — the vanish
+  refusal above. The earlier entry calling it unconsumed is resolved.
+
+### Open, ranked by frequency x cost
+
+All figures below are second-party measurements, cold for the hook (one fresh
+process per sample, interleaved arms) and warm for the extension (a long-lived
+host is the real regime). `min / p50`.
+
+| # | Item | Cost | Frequency |
+|---|---|---|---|
+| 1 | **The dashboard refreshes while nobody can see it.** `_push()` guards `deactivated \|\| !this.view` but never `this.view.visible`, so all ~50 `refresh()` sites pay the full main-thread sync fs cost with the sidebar collapsed. The handler that makes skipping safe already exists (`view.onDidChangeVisibility`), so this is a `visible` check plus a dirty flag | 19.6 / 22.7 ms per push, avoidable entirely | ~50 sites, per settings change |
+| 2 | **`fullReport` re-reads the whole memory corpus every push.** 16 separate `.md` reads, versus 0.74 ms to `statSync` all 16 or 0.70 ms for one concatenated read. An mtime-keyed cache cuts ~32% of `_push()`. **This is a growth axis with no ceiling** — the corpus gained a file *during* the audit and `_push()` grew by 3 syscalls; at 50 memories it is ~25 ms per refresh | 6.98 / 7.96 ms | every push |
+| 3 | **`runWildcarding` takes the policy lock before it knows there is work.** The extension already holds the bytes it just read, so an in-memory last-bytes compare answers the same question for ~0.005 ms. Read outside the lock, compare, lock only when a write is due — worth ~6.5 of its 9.3 ms, plus removing needless Auto Learn contention. A **file** cache is the wrong tool here | 3.39 / 3.72 ms lock (46% of it `fsyncSync`) + 2.38 / 2.76 ms redundant pass | per settings.json write |
+| 4 | **44 KB of verb bodies compiled on every hook call.** A minimal 0.9 KB hook doing only the hit path beats the real `bin/wildcard-perms` by this much (n=51, both signs agree). Splitting hook mode into a small entry that lazily requires `cli-verbs.js` is the only remaining hit-path win anyone demonstrated | 1.12 / 2.50 ms | **every Bash/PowerShell tool call** |
+| 5 | **`gates.generated.md` read 5x per push** — `gatesStatus` calls `readCompiled` for both `makeGatesBlock().body()` and `compiled:`, times 2 targets. My earlier deferral called this "sub-millisecond"; it is not | 1.55 / 1.69 ms | every push |
+| 6 | **`coverLookupKeys` scans per character and is not memoized across the two sweeps.** The two `covers()` sweeps are 73% of `processAllowList`, and inside them the dominant cost is key generation, not matching: stage 3 makes 431 `covers()` calls but only 407 `sameRule` + 3 `ruleMatches`, so almost all of its 3.89 ms is walking 8018 arg chars to build 1479 keys — twice per pass, over the same 431 strings. A prototype using one native global-regex scan plus per-rule memoization was **differentially identical on 83 cases with every axis asserted non-degenerate** (probe fired in 18, fallback non-empty in 31, pruning in 20, generalizing in 28) | 1.62 / 1.84 ms of a 9.1 ms pass | every miss + every hintless push |
+| 7 | **`recallIndexStatus` is a second per-corpus-file loop** inside every push: 16 `statSync`, a 122 KB `recall_index.json` read, 3 `existsSync` probes. Should share the pass `memoryReport` already does | ~1.6 ms | every push |
+| 8 | **`CLAUDE.md` and `~/.codex/AGENTS.md` read twice each** — two `installedGuidanceTargets()` walks. Also not sub-millisecond in aggregate | ~0.89 ms | every push |
+| 9 | **The hook computes its key twice on a miss** — `isFixedPoint(bytes)` then `fixedPointKey(bytes)` again, so it stats both code files twice and hashes 17 KB twice. The fix was built and verified to write an identical key, and measured at **+0.57 / −0.39 ms, i.e. unmeasurable.** Worth doing as tidiness, not as performance | ~1.2 ms in-process, **0 end-to-end** | per settings change |
+| 10 | `settings.json` read and parsed 3x per push | 0.21 / 0.20 ms | every push |
+
+### The launcher hazard, worth a test on its own
+
+`cmd /c node …` adds **17.6 / 13.5 ms** to the hook. `powershell.exe -Command
+node …` adds **1059 ms p50** — a factor of 18 on the whole hook. If anything in
+the installers ever registers the hook command through PowerShell instead of as
+a bare `node "…"`, that is a **1.1-second-per-tool-call** regression hiding in
+plain sight, and nothing currently asserts the registered `command` string's
+shape. `scripts/verify-installers.ps1` is the right home for it.
+
+This also explains a standing discrepancy: measured directly from node the hook
+is 58.8 hit / 71.9 miss p50, well under the ~88/106 recorded earlier. The
+launcher is most of the gap.
+
+### Retracted figures that still ship inside code comments
+
+Each of these is a number this file already corrected, still asserted in a
+tracked comment where the next reader will believe it:
+
+- `src/permissions.js:686-687` — "4.803 ms with this eager, 2.476 ms stubbed,
+  so the hook was paying ~2.3 ms per tool call". Retracted by its own commit
+  message; the real figure is ~0.9 ms.
+- `src/fixed-point-cache.js:9` — "the ~4.8 ms require chain". Measured 3.32 p50
+  / 2.56 min.
+- `bin/wildcard-perms:253-254` — "13.2 ms of the hook's own work … against ~1 ms
+  to key the file". The total is right **by coincidence**; both terms are wrong
+  (require 3.43 not 4.8; pass 9.96 not 8.1) and "~1 ms" omits the cache module's
+  own require, so the real consult is 3.19 ms. That omission is precisely the
+  methodological error `86d2da2` criticises in its own stub harness.
+- `memoryReport`'s saving is recorded as 2.93 ms and 25 syscalls. Re-measured
+  the same day: **5.00 min / 5.23 p50 ms and 35 syscalls** (17 `readFileSync` +
+  16 `existsSync` + 2 `readdirSync`). The corpus grew, so this *understates*.
+  The number is corpus-dependent and will keep drifting — it should be described
+  as a range, not a constant.
+
+A pattern worth stating plainly: **every performance figure in this project that
+was not re-measured cold, in fresh interleaved processes, against a
+purpose-built "before" variant, has been wrong** — usually overstating the
+saving, occasionally understating it, once with the sign reversed. The
+consistent cause is measuring a warm loop, or reporting a combined cost as
+though it were a delta.
+
+### Refuted optimizations — do not retry
+
+Each was built and measured, not reasoned about:
+
+- **`NODE_COMPILE_CACHE`**: 1.88 p50 / 2.73 min **worse** on a hit, 2.86 / 2.06
+  worse on a miss.
+- **Doing the fs work before installing the stdin listeners**, so the 5.68 ms
+  pipe wait overlaps our sync work: **1.27 p50 worse**. The stdin wait is not
+  overlappable.
+- **Inlining the cache module** to remove a whole module load: −0.14 p50 /
+  −0.02 min. Zero.
+- **`utf8` instead of a Buffer read** for settings.json: −0.56 / −0.41 ms, below
+  the noise floor.
+
+And the governing measurement fact: **the end-to-end noise floor for a ~60 ms
+spawn on this machine is roughly ±2 ms in min and ±5 ms in p50**, so any
+in-process saving under ~2 ms is unmeasurable at the process level. Three
+candidates whose in-process cost measured 1–2 ms each came out at exactly zero
+end-to-end. In-process stage timings do **not** add up to end-to-end deltas.
+
+### The scope probe is a safety mechanism, not dead weight
+
+Recorded because it reads as removable and is not. Stages 1–3 of
+`processAllowList` are 54% of the pass and `coveredByScope` returns 0 on the
+live list — but dropping the probe diverges on 1 of 83 differential cases, and
+the divergence is a permission **widening**: on
+`['Bash(rm -rf /*)', 'Bash(rm -rf /home)', 'Bash(rm -rf /home/x)']` the shipped
+pass yields `['Bash(rm -rf /*)']` and the probe-free version yields
+**`['Bash(rm *)']`**, because `Bash(rm -rf /home)` generalizes to `Bash(rm *)`
+and only the probe keeps it specific long enough for prune to drop it.
+
+It reads as dead weight on the live list *precisely because* that list is
+already a fixed point, which is the only state in which it must fire zero times.
+
+### Claims from today's commits that do not hold
+
+- **`f041031`'s `preMax`/`wroteOnto` change is behaviour-neutral and completely
+  untested.** Its message calls it a correctness fix — "both halves now come from
+  ONE read" — but the old code was `applyMax(settings, turningOn)`, whose
+  `res.settings` was computed **in memory from `settings`**. There was one read
+  then and one now. Two mutants at `extension.js:2254` (`preMax` = the post-MAX
+  list; `preMax = []`) both **SURVIVED** the full 400-test suite. The four purge
+  assertions in `test/policy-backup.test.js` guard the filter and the
+  `MAX_ALLOW_CORE` constant; the only thing that varies with the argument is
+  `detectMcpServers`, and no test asserts an `mcp__*` blanket entry leaves the
+  backup. Control: restoring the top-level `require('../src/permissions')` **is**
+  caught, so that guard is real and this one is not.
+- **`if (!res.changed)` in `toggleMax` is unreachable,** and the commit has it
+  backwards: deriving `turningOn = !isMaxOn(latest)` from the same `latest` is
+  exactly what makes it un-reachable. 65 shapes of `latest` enumerated (5 allow
+  sets x 3 hook states x 4 modes, plus `{}`, `null`, non-array allow, bare
+  `hooks`): **0 yielded `changed: false`**. `extension.js:2235`'s wording also
+  reads backwards — "MAX is already OFF" in response to a click asking for ON.
+- **The version badge's degradation claim is false for the case it names.** For a
+  **malformed** manifest the catch never runs: Node refuses to load
+  `extension.js` at all (`ERR_INVALID_PACKAGE_CONFIG` at
+  `getNearestParentPackageJSON`), so there is no dashboard to degrade. The guard
+  does work for a manifest that is absent or valid-but-versionless.
+- **`compiledGateCount`'s bullet fallback is unreachable** on any corpus
+  `recall.py` can emit (0 of 8 gate sections has more than one top-level bullet).
+  Kept as defensive, but it is not a tested path.
+
+### Structural notes carried forward
+
+- **The `writeTransform` shape and deny guards judge the transform's OUTPUT,** so
+  unlike the `SETTINGS_UNREADABLE` refusal they cannot run before it. By the time
+  either throws, `applyMax`'s snapshot and approve script have landed. Tolerable
+  only because both transforms are idempotent overwrites, so the leftovers are
+  inert. **A future transform whose side effects are not idempotent must not use
+  this writer** — now stated in the code as well.
+- **The fixed-point code stamp covers `permissions.js` and `permission-match.js`
+  but not `bin/wildcard-perms:278`,** where the allow-array extraction lives.
+  Changing *which* field feeds the pass would not invalidate existing keys.
+- **12 module-level frozen-home constants**, not the 8 recorded earlier: 6 in
+  `extension.js` (`SETTINGS`, `BACKUP_DIR`, `MIRROR_BACKUP_DEFAULT`,
+  `PROJECTS_DIR`, `CODEX_SESSIONS_DIR`, `RECALL_MODEL_HOME`) and 6 in `src/`
+  (`codex-max.js` x3, `permissions.js` x3 — `BYPASS_STATE_FILE`,
+  `MAX_STATE_FILE`, `APPROVE_DIR` — plus `policy-lock.js`'s `POLICY_LOCK_PATH`).
+  The `require.cache` purge is now consistent across the four extension-harness
+  test files, which is what made the frozen homes harmless; the constants remain
+  a trap for the next harness.
+- **~6650 leftover temp directories** had accumulated in `%TEMP%` on the dev
+  machine from the leak fixed above. The leak is closed; clearing the historical
+  residue is a one-time manual step, deliberately not automated.
+

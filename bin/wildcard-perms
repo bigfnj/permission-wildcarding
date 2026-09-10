@@ -250,8 +250,14 @@ function run(input) {
 
   // The cache answers exactly one question: are THESE bytes already known to be
   // a fixed point of processAllowList? A hit skips the parse, the pass, and the
-  // whole `../src/permissions` require chain — 13.2 ms of the hook's own work,
-  // measured cold, against ~1 ms to key the file.
+  // whole `../src/permissions` require chain.
+  //
+  // What that is worth, re-measured cold against a purpose-built no-cache variant
+  // rather than against this code's own forced-miss path: 8.93 min / 9.23 p50 ms
+  // of process wall. The earlier "13.2 ms against ~1 ms to key the file" was an
+  // in-process sum whose total happened to be right while both of its terms were
+  // wrong (require 3.43 not 4.8, pass 9.96 not 8.1), and "~1 ms" omitted this
+  // cache module's own require, which is 1.97 ms of a 3.19 ms consult.
   //
   // Its own module pulls nothing but fs/path/os, which is why the hash is
   // hand-rolled: `require('crypto')` plus the first createHash plus a digest is

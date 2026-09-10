@@ -682,10 +682,18 @@ function maxLayers(settings, options = {}) {
   // Required here, not at module scope. This is the ONLY function in the file that
   // touches managed policy, and nothing on the hook's common path calls it — the
   // callers are `--max status` and three sites in the extension, which is a
-  // long-lived process where the load is paid once. Measured cold in fresh
-  // interleaved processes: requiring src/permissions.js costs 4.803 ms with this
-  // eager, 2.476 ms with it stubbed out, so the hook was paying ~2.3 ms per tool
-  // call for a module it never used.
+  // long-lived process where the load is paid once.
+  //
+  // Worth ~0.9 ms per tool call. That figure has now been measured four times and
+  // the first three were all wrong: 0.61 ms originally recorded, then 2.3 ms from
+  // a stub harness that also pre-cached permission-match (so it measured this
+  // file's marginal cost, not the chain's), then 1.27 ms. Two independent
+  // second-party runs settle it — 30 interleaved repo-resident pairs at 0.889 ms
+  // (min 0.858) and 40 pairs across materialized trees at 1.01 ms p50/min.
+  //
+  // The lesson is the method, not the number: only a cold measurement in fresh
+  // interleaved processes, against a purpose-built variant with the change
+  // removed, has ever been right in this project.
   //
   // At the top of the function rather than inside the `else` below: readPolicy is
   // conditional, but hookEventAllowed two lines down is not.

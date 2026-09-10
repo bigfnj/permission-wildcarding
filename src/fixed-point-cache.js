@@ -6,9 +6,18 @@
 // The PostToolUse hook runs after every single tool call, and the overwhelmingly
 // common answer is "yes, nothing to do": the allow list was generalized on some
 // earlier call, and reprocessing it returns the identical list. Proving that costs a
-// ~8 ms processAllowList pass plus the ~4.8 ms require chain that reaches it. This
+// ~10 ms processAllowList pass plus the ~3.4 ms require chain that reaches it. This
 // module answers the same question from one short file read, so the hook can skip
 // both whenever the bytes have not moved.
+//
+// Measured end to end against a purpose-built no-cache variant: a hit saves
+// 8.93 min / 9.23 p50 ms of wall, and a MISS costs 2.4-3.9 ms MORE than having no
+// cache at all. Break-even is a ~30% hit rate; the real rate is near 100%. Both
+// halves of that belong here — the miss cost is real and was originally recorded
+// with the sign backwards.
+//
+// (The "~4.8 ms require chain" this comment used to claim was a figure its own
+// commit series had already retracted.)
 //
 // Two rules govern everything below.
 //
