@@ -49,12 +49,20 @@ class FakeWorker extends EventEmitter {
 // busy latch set, which is what the re-activate test needs. `release()` lets the
 // test settle it at the end so teardown can complete instead of hanging.
 class WedgedWorker extends EventEmitter {
+  constructor() {
+    super();
+    // Whether the runner that owns this worker ever tore it down. A runner
+    // dropped from the module slot without deactivate() never terminates its
+    // worker, and a leaked thread is otherwise invisible from outside.
+    this.terminated = false;
+  }
+
   release() {
     this.emit('message', { ok: true, result: {} });
     this.emit('exit', 0);
   }
 
-  terminate() { return Promise.resolve(0); }
+  terminate() { this.terminated = true; return Promise.resolve(0); }
 }
 
 function harness(tempHome, options = {}) {
@@ -692,6 +700,65 @@ test('a re-activate releases a busy latch that a wedged scan left set', async (t
     // Let every wedged job settle so teardown completes rather than hanging.
     for (const worker of app.workers) if (typeof worker.release === 'function') worker.release();
     await Promise.allSettled([wedged, teardown, second]);
+  } finally {
+    for (const worker of app.workers) if (typeof worker.release === 'function') worker.release();
+    await app.dispose();
+  }
+});
+
+
+test('a wedged predecessor does not steal the successor\u2019s worker runner', async (t) => {
+  // The other side of the re-activate fix, and a hazard that fix introduced.
+  //
+  // activate() now drops a stranded runner so a wedged drain cannot leave the
+  // successor with a dead one. Correct and required — but it means the slot may
+  // hold the SUCCESSOR's live runner by the time the predecessor's post-drain
+  // continuation resumes. Unguarded, that continuation nulls it.
+  //
+  // Finding the right observable took two attempts. Termination is NOT it:
+  // autoLearnWorkerRunner.deactivate() terminates only "completed workers that
+  // failed to exit", so a worker that exits cleanly is never terminated by
+  // design, and asserting on it fails against correct code.
+  //
+  // What actually breaks is that the successor can no longer DRAIN its own
+  // runner: with the slot nulled, its deactivate() has nothing to await and
+  // returns immediately, abandoning an in-flight worker instead of waiting for
+  // it. So the observable is whether the successor's teardown still blocks on
+  // its own wedged job.
+  const home = tempHome(t);
+  const app = harness(home, { settings: { 'autoLearn.enabled': true }, wedgeWorker: true });
+  try {
+    const wedged = app.commands.get('permission-wildcarding.autoLearnScan')();
+    await tick(200);
+    const predecessorWorker = app.workers[0];
+
+    const teardown = app.extension.deactivate();
+    app.reactivate();
+
+    const second = app.commands.get('permission-wildcarding.autoLearnScan')();
+    await tick(200);
+    assert.ok(app.workers.length > 1, 'precondition: the successor built its own worker');
+    const successorWorker = app.workers[app.workers.length - 1];
+
+    // The wedged job finally answers, so the predecessor's drain completes and
+    // its continuation resumes — into a realm the successor now owns.
+    predecessorWorker.release();
+    await Promise.allSettled([wedged, teardown]);
+    await tick(200);
+
+    // The successor tears down while ITS worker is still wedged. That must
+    // block on the drain; if its runner was stolen there is nothing to await.
+    let settled = false;
+    const successorTeardown = app.extension.deactivate().then(() => { settled = true; });
+    await tick(400);
+
+    assert.equal(settled, false,
+      'the predecessor\u2019s post-drain continuation nulled the successor\u2019s live '
+      + 'runner, so the successor\u2019s own teardown had nothing to await and '
+      + 'abandoned an in-flight worker');
+
+    successorWorker.release();
+    await Promise.allSettled([second, successorTeardown]);
   } finally {
     for (const worker of app.workers) if (typeof worker.release === 'function') worker.release();
     await app.dispose();

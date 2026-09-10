@@ -4034,9 +4034,13 @@ async function deactivate() {
   // while getAutoLearnWorkerRunner() only builds one when the slot is empty — so
   // a retained instance made every Auto Learn op after a same-realm re-activate
   // reject "Auto Learn is deactivating", permanently. Nulling it is correct
-  // whether or not a successor exists: the successor could not have created its
-  // own while this slot was full, so it would inherit this dead one.
-  autoLearnWorkerRunner = null;
+  // whether or not a successor exists -- EXCEPT that it now can. activate()
+  // drops a stranded runner itself, precisely so a wedged drain cannot leave the
+  // successor with a dead one, so by the time this continuation resumes the slot
+  // may hold the SUCCESSOR's live runner. Nulling that without deactivating it
+  // leaks a worker thread per occurrence. Same generation test as the busy latch
+  // below: only clear the slot if it is still ours.
+  if (generation === activationGeneration) autoLearnWorkerRunner = null;
   // The busy latch is different: a successor's in-flight scan can legitimately
   // hold it, so only clear it if no re-activate happened while we awaited.
   // `activate()` bumps the generation, which is the cheapest way to tell.
