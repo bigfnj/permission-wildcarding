@@ -2421,7 +2421,16 @@ function runWildcarding(manual = false) {
   // And the lock never protected this read from the file's highest-frequency
   // writer anyway: Claude Code does not take it (see toggleMax's note above).
   const settings = readSettings();
-  if (!settings) { dashboard?.refresh(); return; }
+  if (!settings) {
+    // Reset here too. Before the probe moved out of the lock, this path ran
+    // AFTER the lock cycle and so reached the reset below; now it returns first.
+    // I claimed in the commit that the budget "is now also reset on the early
+    // return" — true for the already-optimal return, not for this one, which is
+    // an absent or mid-write settings.json.
+    lockedRetries = 0;
+    dashboard?.refresh();
+    return;
+  }
   const before = settings?.permissions?.allow ?? [];
   const after = processAllowList(before);
 
@@ -3205,7 +3214,15 @@ class WildcardingViewProvider {
     // Scope note, because an audit oversold this one: it is NOT worth ~22 ms x 50
     // sites, because the dominant collapsed-sidebar case was already handled. It
     // is worth the one line as robustness.
-    if (deactivated || !this.view || !this.view.visible) return;
+    // `!== false`, not `!`. A view object with no `visible` member at all — an
+    // older host, or a test double written before this guard existed — reads as
+    // `undefined`, which is falsy, so `!this.view.visible` treats it as
+    // permanently hidden and the dashboard silently never renders. That also
+    // defeats fakeView()'s stated contract that a new dependency on the real
+    // WebviewView API surfaces as a TypeError rather than a silent pass:
+    // reading a missing property is not a TypeError. Only an explicit `false`
+    // means hidden.
+    if (deactivated || !this.view || this.view.visible === false) return;
     const hint = this.hint;
     this.hint = null;
     const settings = readSettings();

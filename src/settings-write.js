@@ -39,24 +39,29 @@ const SETTINGS_UNREADABLE_CODE = 'SETTINGS_UNREADABLE';
 // let its next trigger retry, not treat it as a hard failure.
 const SETTINGS_CONTENDED_CODE = 'SETTINGS_CONTENDED';
 
-// readSettingsState's classification, applied to bytes the caller already has.
-// Exists so writeTransform can use ONE read for both the transform's input and
-// its compare-and-swap baseline instead of two reads that can disagree.
+// THE classifier for settings.json bytes. Both entry points below delegate to
+// it, and that is load-bearing rather than tidy: they each used to carry their
+// own copy and they DISAGREED. `stateOfText` rejected a JSON scalar or array;
+// `readSettingsState` accepted it as PRESENT. Measured, with a comment directly
+// above claiming the two could not diverge:
 //
-// `text === null` means rawSettingsText could not read the file, and that lumps
-// ENOENT together with a transient EACCES/EBUSY. Distinguished here with an
-// existsSync rather than left ambiguous: treating "I could not read it" as
-// "it is not there" would hand the transform an empty object and then write over
-// a file that does exist.
-function stateOfText(settingsPath, text) {
-  if (text === null) {
-    return fs.existsSync(settingsPath)
-      ? { state: SETTINGS_UNREADABLE, settings: null }
-      : { state: SETTINGS_ABSENT, settings: {} };
-  }
+//   settings.json        readSettingsState   writeAllow then wrote
+//   null                 present, null       TypeError reading 'permissions'
+//   "hello"              present             {"0":"h","1":"e",...}
+//   ["Bash(rm -rf *)"]   present             {"0":"Bash(rm -rf *)",...}
+//   42 / true            present             {"permissions":{...}}
+//
+// The TypeError was also UNCODED, so every caller branching on
+// SETTINGS_UNREADABLE_CODE missed it and the extension surfaced
+// "write failed - Cannot read properties of null".
+//
+// Same defect shape as coverIndexKey/coverLookupKeys: two functions that must
+// agree, with nothing checking that they do. One function is the only durable
+// fix, which is why this is not just an added guard in each.
+function classifyText(text) {
   try {
     const parsed = JSON.parse(text);
-    // A JSON scalar or array parses fine and is not a settings object.
+    // A JSON scalar, null or array parses fine and is not a settings object.
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
       return { state: SETTINGS_UNREADABLE, settings: null };
     }
@@ -67,29 +72,45 @@ function stateOfText(settingsPath, text) {
   }
 }
 
-function readSettingsState(settingsPath) {
-  let raw;
-  try {
-    raw = fs.readFileSync(settingsPath, 'utf8');
-  } catch (err) {
-    return err?.code === 'ENOENT'
+// The classifier applied to bytes the caller already has, so writeTransform can
+// use ONE read for both the transform's input and its compare-and-swap baseline
+// instead of two reads that can disagree.
+//
+// `code` is the read's error code, and only ENOENT means absent. This used to be
+// an `fs.existsSync`, which is strictly WEAKER: existsSync returns false for ANY
+// error, so an EMFILE under handle exhaustion in the extension host classified a
+// present file as absent, handed the transform `{}`, and the compare-and-swap
+// then compared null against null and let a stump through. Reproduced: a
+// 10,445-byte / 431-entry settings.json replaced by 64 bytes, `wrote: true`.
+// readSettingsState always had this right; the existsSync was a regression
+// introduced by substituting a second syscall taken at a different instant.
+function stateOfText(settingsPath, text, code) {
+  if (text === null) {
+    return code === 'ENOENT'
       ? { state: SETTINGS_ABSENT, settings: {} }
       : { state: SETTINGS_UNREADABLE, settings: null };
   }
-  try {
-    return { state: SETTINGS_PRESENT, settings: JSON.parse(raw) };
-  } catch {
-    // Includes the zero-byte window of a truncate-then-write.
-    return { state: SETTINGS_UNREADABLE, settings: null };
-  }
+  return classifyText(text);
+}
+
+function readSettingsState(settingsPath) {
+  const { text, code } = rawSettingsRead(settingsPath);
+  return stateOfText(settingsPath, text, code);
+}
+
+// The raw bytes plus the error code, so a caller can classify without a second
+// syscall. `rawSettingsText` stays for the compare-and-swap, which wants only
+// the bytes.
+function rawSettingsRead(target) {
+  try { return { text: fs.readFileSync(target, 'utf8'), code: null }; }
+  catch (err) { return { text: null, code: err?.code ?? 'UNKNOWN' }; }
 }
 
 // The raw bytes, for the compare-and-swap in writeTransform. Deliberately not a
 // parse: two different byte sequences can parse equal, and for a whole-object
 // write any byte change at all means someone else got there first.
 function rawSettingsText(target) {
-  try { return fs.readFileSync(target, 'utf8'); }
-  catch { return null; }
+  return rawSettingsRead(target).text;
 }
 
 // Deny rules present in `before` that `after` would not carry. Used to refuse a
@@ -154,12 +175,35 @@ function createSettingsWriter({ settingsPath, onWrite } = {}) {
     const rebasedAllow = [...new Set([...latestAllow.filter((entry) => !removed.has(entry)), ...added])];
     // deny is only ever added to, never rebased away: it is the safety boundary
     // every other feature defers to, so a concurrent writer's rule must survive.
-    const latestDeny = Array.isArray(latest?.permissions?.deny) ? latest.permissions.deny : [];
+    const rawDeny = latest?.permissions?.deny;
+    // A non-array deny is malformed, but it is still the user's stated boundary,
+    // and the guard-shaped code below is what used to destroy it. With
+    // `deny: "Bash(rm -rf *)"` on disk and any non-empty `denyAdditions`,
+    // `latestDeny` came out `[]`, the union produced the additions ALONE, and the
+    // assignment then replaced the string — reported as `{addedDeny: 1}`, i.e. as
+    // success. Reproduced. Without additions the string rode through on the
+    // spread, so the bug needed the one caller that passes them: the extension's
+    // restoreFromBackup, whose own `Array.isArray` check makes `missingDeny` the
+    // ENTIRE backup deny list precisely when the live deny is a non-array. So
+    // "Re-assert them" on the managed-policy prompt was the trigger, and the
+    // toast said "restored from backup — +N allow, +M deny rules" while the
+    // boundary was gone.
+    //
+    // deniesLost() exists for exactly this and is called only from
+    // writeTransform; its own comment describes this defect verbatim. Rather than
+    // bolt the guard on here, the merge itself is now non-destructive: a
+    // malformed deny is carried through VERBATIM and nothing is added to it,
+    // because there is no defined way to merge into a shape we cannot parse.
+    // `addedDeny: 0` then keeps the caller's report honest.
+    const denyMalformed = rawDeny !== undefined && rawDeny !== null && !Array.isArray(rawDeny);
+    const latestDeny = Array.isArray(rawDeny) ? rawDeny : [];
     const additions = Array.isArray(denyAdditions) ? denyAdditions : [];
-    const rebasedDeny = additions.length ? [...new Set([...latestDeny, ...additions])] : latestDeny;
-    const permissions = { ...latest.permissions, allow: rebasedAllow };
+    const rebasedDeny = denyMalformed
+      ? rawDeny
+      : (additions.length ? [...new Set([...latestDeny, ...additions])] : latestDeny);
+    const permissions = { ...latest?.permissions, allow: rebasedAllow };
     // Don't introduce an empty deny key where the user never had one.
-    if (rebasedDeny.length || Array.isArray(latest?.permissions?.deny)) permissions.deny = rebasedDeny;
+    if (denyMalformed || rebasedDeny.length || Array.isArray(rawDeny)) permissions.deny = rebasedDeny;
     const updated = { ...latest, permissions };
     // Atomic write with Windows-safe rename retry + in-place fallback. The naive
     // renameSync raced Claude Code's own settings.json writes → intermittent EPERM.
@@ -172,7 +216,10 @@ function createSettingsWriter({ settingsPath, onWrite } = {}) {
       allow: rebasedAllow,
       deny: rebasedDeny,
       addedAllow: rebasedAllow.filter((entry) => !latestAllow.includes(entry)).length,
-      addedDeny: rebasedDeny.filter((entry) => !latestDeny.includes(entry)).length,
+      // Zero for a malformed deny: nothing was added, and saying otherwise is
+      // what made the restore toast a lie.
+      addedDeny: Array.isArray(rebasedDeny)
+        ? rebasedDeny.filter((entry) => !latestDeny.includes(entry)).length : 0,
     };
   }
 
@@ -218,8 +265,8 @@ function createSettingsWriter({ settingsPath, onWrite } = {}) {
       // transform had already been handed a stale object, and the verbatim write
       // then discarded that concurrent change. That is the exact loss this
       // writer exists to prevent, reintroduced in a smaller window.
-      const beforeText = rawSettingsText(target);
-      const before = stateOfText(target, beforeText);
+      const { text: beforeText, code: beforeCode } = rawSettingsRead(target);
+      const before = stateOfText(target, beforeText, beforeCode);
       // Refuse BEFORE running the transform, never after. applyMax writes the
       // allow-list snapshot as a side effect, so transforming first would clobber
       // a real snapshot with one taken from a file we then refuse to write.

@@ -476,3 +476,117 @@ test('a transform that carries a malformed deny through is allowed', (t) => {
   assert.deepEqual(onDisk.permissions.deny, { Bash: ['rm'] });
   assert.equal(onDisk.permissions.defaultMode, 'plan');
 });
+
+
+test('writeAllow preserves a malformed deny instead of replacing it', (t) => {
+  // A P0, reproduced by an audit. writeAllow's deny handling looked like a guard
+  // and was the thing that destroyed the boundary: with `deny: "Bash(rm -rf *)"`
+  // on disk and any non-empty denyAdditions, `latestDeny` came out `[]`, the
+  // union produced the ADDITIONS ALONE, and the assignment replaced the string —
+  // returning `{addedDeny: 1}`, i.e. reporting success.
+  //
+  // Without additions the string rode through on the spread, so the bug needed
+  // the one caller that passes them: the extension's restoreFromBackup. Its own
+  // Array.isArray check makes `missingDeny` the ENTIRE backup deny list exactly
+  // when the live deny is a non-array, so the "Re-assert them" button on the
+  // managed-policy prompt was the trigger — and the toast said
+  // "restored from backup — +N allow, +M deny rules" while the boundary was gone.
+  //
+  // deniesLost() exists for this and is called only from writeTransform; its own
+  // comment describes this defect verbatim.
+  const env = tempSettings(t, {
+    model: 'opus',
+    permissions: { allow: ['Bash(ls)'], deny: 'Bash(rm -rf *)' },
+  });
+
+  const out = env.writer().writeAllow(env.read(), ['Bash(ls)', 'Bash(git *)'], ['Bash(curl *)']);
+
+  const after = env.read();
+  assert.equal(after.permissions.deny, 'Bash(rm -rf *)',
+    'the user\u2019s stated safety boundary was replaced by the additions alone');
+  assert.equal(out.addedDeny, 0,
+    'nothing was added to a shape we cannot merge into, and saying otherwise is '
+    + 'what made the restore toast a lie');
+  // The allow half must still work — this is a preservation fix, not a refusal.
+  assert.deepEqual(after.permissions.allow, ['Bash(ls)', 'Bash(git *)']);
+  assert.equal(after.model, 'opus', 'and unrelated keys still ride through');
+});
+
+test('the two classifiers agree on every non-object JSON shape', (t) => {
+  // readSettingsState and stateOfText each carried their own copy of the
+  // classification and DISAGREED: stateOfText rejected a JSON scalar or array,
+  // readSettingsState accepted it as PRESENT. A comment directly above claimed
+  // they could not diverge. Measured consequences before the fix:
+  //
+  //   null                 -> writeAllow threw an UNCODED TypeError, so every
+  //                           caller branching on SETTINGS_UNREADABLE_CODE missed
+  //                           it and the extension surfaced
+  //                           "write failed - Cannot read properties of null"
+  //   "hello"              -> wrote {"0":"h","1":"e",...}
+  //   ["Bash(rm -rf *)"]   -> wrote {"0":"Bash(rm -rf *)",...}
+  //   42 / true            -> wrote {"permissions":{...}}
+  //
+  // Same shape as coverIndexKey/coverLookupKeys: two functions that must agree,
+  // with nothing checking that they do. They are now one function, and this is
+  // the check that was missing.
+  for (const body of ['null', '"hello"', '["Bash(rm -rf *)"]', '42', 'true', '{ not json']) {
+    const env = tempSettings(t);
+    fs.writeFileSync(env.file, body);
+
+    assert.equal(readSettingsState(env.file).state, SETTINGS_UNREADABLE,
+      `${body} is not a settings object and must not classify as present`);
+
+    // And the writer must REFUSE rather than crash or write garbage over it.
+    assert.throws(() => env.writer().writeAllow({}, ['Bash(ls)']),
+      (err) => {
+        assert.equal(err.code, SETTINGS_UNREADABLE_CODE,
+          `${body} must fail with a CODED refusal, not an uncoded TypeError`);
+        return true;
+      });
+    assert.equal(fs.readFileSync(env.file, 'utf8'), body, `${body} is left untouched`);
+  }
+});
+
+test('a settings.json that vanishes between reads is absent, but an unreadable one is not', (t) => {
+  // stateOfText used fs.existsSync to tell "could not read" from "not there".
+  // That is strictly WEAKER than the ENOENT check readSettingsState always had,
+  // because existsSync returns false for ANY error — so an EMFILE under handle
+  // exhaustion classified a present file as absent, handed the transform `{}`,
+  // and the compare-and-swap then compared null against null and let a stump
+  // through. Reproduced by an audit: a 10,445-byte / 431-entry settings.json
+  // replaced by 64 bytes, wrote: true.
+  const env = tempSettings(t);
+  assert.equal(readSettingsState(env.file).state, SETTINGS_ABSENT,
+    'a genuinely missing file is absent');
+
+  // A directory at the path reads as EISDIR, not ENOENT — present but unusable.
+  const dirEnv = tempSettings(t);
+  fs.mkdirSync(dirEnv.file);
+  assert.equal(readSettingsState(dirEnv.file).state, SETTINGS_UNREADABLE,
+    'a non-ENOENT read error must never be classified as absent');
+
+  // The case that actually distinguishes ENOENT from existsSync, simulated
+  // because handle exhaustion cannot be produced on demand. Under EMFILE the
+  // read fails AND existsSync returns false — existsSync returns false for ANY
+  // error — so an existsSync classifier says "absent", hands the transform an
+  // empty object, and the compare-and-swap then compares null against null and
+  // lets a stump through. Without this the ENOENT preference has no killing
+  // mutation: a directory trips EISDIR, but statSync succeeds there so
+  // existsSync answers true and both spellings agree.
+  const busy = tempSettings(t);
+  const realRead = fs.readFileSync;
+  const realExists = fs.existsSync;
+  fs.readFileSync = (file, ...rest) => {
+    if (file === busy.file) { const e = new Error('EMFILE'); e.code = 'EMFILE'; throw e; }
+    return realRead(file, ...rest);
+  };
+  fs.existsSync = (file) => (file === busy.file ? false : realExists(file));
+  try {
+    assert.equal(readSettingsState(busy.file).state, SETTINGS_UNREADABLE,
+      'EMFILE must classify as unreadable; existsSync answers false for every '
+      + 'error, so classifying on it writes a stump over a file that exists');
+  } finally {
+    fs.readFileSync = realRead;
+    fs.existsSync = realExists;
+  }
+});

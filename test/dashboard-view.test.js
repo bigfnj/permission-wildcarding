@@ -791,27 +791,40 @@ test('a concurrent write inside the lock is not flattened by a stale delta', asy
   // pass prunes the specific entries; `--max off` then deliberately restores them;
   // replaying `removed` deletes them for good.
   //
+  // FIXTURE CORRECTED. My first choice of inputs killed the mutants that revert
+  // the in-lock RECOMPUTE, but not the one that reverts only the SNAPSHOT
+  // ARGUMENT — `writeAllow(settings, lockedAfter)`, i.e. exactly reinstating the
+  // bug this test names. Two independent audits found that hole. With the old
+  // inputs the stale and correct replays coincide, so the test was green either
+  // way; a search over the interleaving space with the real processAllowList
+  // found 4140 inputs where they diverge.
+  //
+  // What the shape has to satisfy: an entry the IN-LOCK pass derives that was
+  // already in the probe's read and is absent from the concurrent write's read.
+  // It lands in neither `removed` nor `added`, so the stale replay drops it.
+  //
   // Measured against the real functions:
-  //   probe    ['Bash(npm *)', 'Bash(npm run build)'] -> ['Bash(npm *)']
-  //            removed = ['Bash(npm run build)'], added = []
-  //   latest   ['Bash(npm run build)']      (the broad entry dropped, as --max off does)
-  //   correct  fresh recompute -> ['Bash(npm run *)']
-  //   stale    replay          -> []        <-- the allow list is EMPTIED
+  //   probe    ['Bash(git status *)', 'Bash(git status)']
+  //   latest   ['Bash(git status)', 'Bash(git diff)']   (concurrent write)
+  //   correct  ['Bash(git status *)', 'Bash(git diff *)']
+  //   stale    ['Bash(git diff)', 'Bash(git diff *)']   <-- Bash(git status *)
+  //            is dropped, and Bash(git status) ends up neither present nor
+  //            covered: an approval silently revoked.
   const env = setup(t);
   env.write({ permissions: { allow: FIFTEEN, deny: [] } });   // quiet activation
   const app = harness(env.tempHome);
   try {
     await settle();
-    env.write({ permissions: { allow: ['Bash(npm *)', 'Bash(npm run build)'], deny: [] } });
+    env.write({ permissions: { allow: ['Bash(git status *)', 'Bash(git status)'], deny: [] } });
 
     let injected = false;
     app.locks.insideLock = () => {
       if (injected) return;
       injected = true;
-      // The broad entry goes away while we hold the lock — exactly what a
-      // concurrent `--max off` does. The specific entry must survive.
+      // A concurrent write lands while we hold the lock: the wildcard entry is
+      // gone and an unrelated one has arrived.
       fs.writeFileSync(env.settingsPath, JSON.stringify(
-        { permissions: { allow: ['Bash(npm run build)'], deny: [] } }, null, 2) + '\n');
+        { permissions: { allow: ['Bash(git status)', 'Bash(git diff)'], deny: [] } }, null, 2) + '\n');
     };
 
     await app.commands.get('permission-wildcarding.runNow')();
@@ -819,10 +832,11 @@ test('a concurrent write inside the lock is not flattened by a stale delta', asy
 
     assert.ok(injected, 'precondition: the lock was taken, so the injection ran');
     const allow = env.read().permissions.allow;
-    assert.notDeepEqual(allow, [],
-      'the write replayed the probe\u2019s stale `removed` onto the fresh read and '
-      + 'emptied the allow list');
-    assert.deepEqual(allow, ['Bash(npm run *)'],
+    assert.ok(allow.includes('Bash(git status *)'),
+      'the write replayed the probe\u2019s stale delta onto the fresh read, dropping an '
+      + 'entry that was in neither `removed` nor `added` — Bash(git status) is now '
+      + 'neither present nor covered, i.e. an approval silently revoked');
+    assert.deepEqual(allow.slice().sort(), ['Bash(git diff *)', 'Bash(git status *)'],
       'the guarded work must recompute from the read taken INSIDE the lock');
   } finally {
     await app.dispose();
