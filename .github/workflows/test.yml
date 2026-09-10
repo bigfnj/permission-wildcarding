@@ -51,3 +51,39 @@ jobs:
       # drifted in the log rather than only that something did.
       - name: Starter pack mirror check
         run: node scripts/mirror-pack.js
+
+  # A separate job, because it needs a shell the matrix above cannot give it.
+  #
+  # install.ps1 once replaced the user's whole settings.json with nothing but its
+  # own hook entry: `ConvertFrom-Json -AsHashtable` is PowerShell 6+ only, so
+  # under Windows PowerShell 5.1 it threw, the catch merely warned, and the write
+  # went ahead. README names `.\install.ps1  # Windows PowerShell` with no version
+  # requirement, so 5.1 is a supported shell.
+  #
+  # Nothing in the matrix job can catch that. GitHub's default shell on
+  # windows-latest is `pwsh` (PowerShell 7), which is exactly the edition where
+  # the parameter works and the bug does not exist — and both installers PARSE
+  # clean under 5.1, so a syntax check sees nothing either. `shell: powershell` is
+  # GitHub's alias for powershell.exe, i.e. Windows PowerShell 5.1.
+  #
+  # test/installers.test.js covers install.sh and uninstall.sh behaviourally on
+  # every platform and guards the .ps1 pair statically. This is the behavioural
+  # half of the .ps1 story.
+  installers:
+    name: installers on Windows PowerShell 5.1
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: install.ps1 / uninstall.ps1 behaviour
+        shell: powershell
+        run: |
+          $PSVersionTable.PSVersion.ToString()
+          if ($PSVersionTable.PSVersion.Major -ne 5) {
+            throw "expected Windows PowerShell 5.1; got $($PSVersionTable.PSVersion). This job is worthless under pwsh."
+          }
+          .\scripts\verify-installers.ps1

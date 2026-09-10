@@ -193,18 +193,28 @@ test('no PowerShell script uses a PowerShell 7-only JSON parameter', () => {
   // config at run time. README.md names `.\install.ps1  # Windows PowerShell`
   // with no version requirement, so 5.1 is a supported shell and this parameter
   // is banned. If it is ever needed, add `#Requires -Version 6` first.
-  // Comment lines are stripped before the check. The ban is on CALLING it;
-  // explaining why it is banned, in a comment next to the replacement, is the
-  // whole point of the fix — and an earlier version of this test failed on
-  // exactly that comment.
-  const code = (body) => body.split('\n')
+  // Comments are stripped before the check. The ban is on CALLING it; explaining
+  // why it is banned, next to the replacement, is the whole point of the fix.
+  // BOTH comment forms: `<# ... #>` blocks go first, because their interior lines
+  // do not start with `#` and a line-only filter sails straight past them. Two
+  // earlier versions of this test failed on their own explanatory prose — once on
+  // a line comment, once on a block comment.
+  const code = (body) => body
+    .replace(/<#[\s\S]*?#>/g, ' ')
+    .split('\n')
     .filter((line) => !line.trimStart().startsWith('#'))
     .join('\n');
 
-  const scripts = fs.readdirSync(repoRoot)
+  // Repo root AND scripts/. The scan used to be root-only, which left a hole the
+  // moment a .ps1 landed anywhere else — scripts/verify-installers.ps1 now does,
+  // and it is precisely a file about this parameter.
+  const dirs = [repoRoot, path.join(repoRoot, 'scripts')];
+  const scripts = dirs.flatMap((dir) => (fs.existsSync(dir) ? fs.readdirSync(dir) : [])
     .filter((name) => name.endsWith('.ps1'))
-    .map((name) => [name, fs.readFileSync(path.join(repoRoot, name), 'utf8')]);
-  assert.ok(scripts.length >= 2, `expected the installers, found ${scripts.length}`);
+    .map((name) => [path.relative(repoRoot, path.join(dir, name)),
+      fs.readFileSync(path.join(dir, name), 'utf8')]));
+  assert.ok(scripts.length >= 4,
+    `expected both installers plus the scripts/ pair, found ${scripts.length}: ${scripts.map(([n]) => n).join(', ')}`);
 
   for (const [name, body] of scripts) {
     if (/#Requires\s+-Version\s+[6-9]/i.test(body)) continue;
@@ -214,9 +224,15 @@ test('no PowerShell script uses a PowerShell 7-only JSON parameter', () => {
 });
 
 test('both PowerShell installers fail closed on an unreadable settings.json', () => {
-  // The behavioural version of this runs under PowerShell in
-  // scripts/verify-release.ps1; this is the part that can run on a POSIX CI
-  // runner. It pins the refusal, not the wording of the message.
+  // The behavioural version of this is scripts/verify-installers.ps1, which
+  // drives both installers as children under powershell.exe and is run by the
+  // `installers` job in .github/workflows/test.yml and by
+  // scripts/verify-release.ps1. This is the part that can run on a POSIX runner:
+  // it pins the refusal, not the wording of the message.
+  //
+  // (That cross-reference was a promise before it was a fact — it named
+  // verify-release.ps1 while verify-release.ps1 contained no installer check at
+  // all. Both halves exist now.)
   for (const name of ['install.ps1', 'uninstall.ps1']) {
     const body = fs.readFileSync(path.join(repoRoot, name), 'utf8');
     assert.match(body, /could not be parsed/,

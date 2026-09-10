@@ -120,6 +120,29 @@ if ($testFiles.Count -eq 0) {
     Check 'node --test (all files)' $ok "$($testFiles.Count) files, exit $LASTEXITCODE"
 }
 
+# ----------------------------------------------------------- installer safety
+Section 'Installer safety'
+# npm test drives install.sh and uninstall.sh for real, but can only guard the
+# .ps1 pair STATICALLY -- and the defect those guards exist for is invisible
+# under pwsh, which is what CI runs. This is the behavioural half: it spawns each
+# installer as a child under powershell.exe (Windows PowerShell 5.1) against a
+# sandbox home. Folded into one Check on the exit code, same shape as the suite
+# above; the script prints its own per-case board.
+$installerSuite = Join-Path $PSScriptRoot 'verify-installers.ps1'
+if (-not (Test-Path $installerSuite)) {
+    Check 'installer suite found' $false "missing: $installerSuite"
+} elseif (-not (Get-Command 'powershell.exe' -ErrorAction SilentlyContinue)) {
+    Note 'installer safety' 'skipped -- powershell.exe (Windows PowerShell 5.1) not on this platform'
+} else {
+    $instOut = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installerSuite 2>&1) | Out-String
+    $instOk = ($LASTEXITCODE -eq 0)
+    $tally = [regex]::Match($instOut, '(\d+) pass, (\d+) fail')
+    $detail = if ($tally.Success) { "$($tally.Groups[1].Value) pass, $($tally.Groups[2].Value) fail" }
+              else { "exit $LASTEXITCODE" }
+    Check 'install.ps1 / uninstall.ps1 behave under Windows PowerShell 5.1' $instOk $detail
+    if (-not $instOk) { $instOut.TrimEnd() -split "`n" | ForEach-Object { Write-Host "          $_" } }
+}
+
 # ------------------------------------------------------- managed block state
 Section 'Managed blocks in the instruction files'
 foreach ($pair in @(@{ n = 'claude'; p = $claudeMd }, @{ n = 'codex'; p = $agentsMd })) {
