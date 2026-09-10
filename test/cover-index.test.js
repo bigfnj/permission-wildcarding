@@ -57,6 +57,16 @@ const ADVERSARIAL = [
   'PowerShell(dotnet *)',   // the other command tool
   'PowerShell(& *)',        // the call-operator form
   'Read(*)',                // a non-command tool
+  // Colon-form scope on tools where `:` is NOT normalised to a space. This is
+  // the class that shipped broken: coverIndexKey treats `:` as a token boundary
+  // and coverLookupKeys did not, so the rule was indexed under a key no lookup
+  // could generate — and being indexed, it was not in the linear fallback
+  // either. Bash/PowerShell hid it because matching rewrites their `:*` to ` *`.
+  'Skill(dataviz:*)',       // ships in patterns/starter-pack.json
+  'Skill(claude-api:*)',    // ditto
+  'WebFetch(domain:*)',     // documented Claude Code syntax
+  'mcp__server__tool(a:*)', // an MCP tool with an argument
+  'Skill(a:b:*)',           // two colons, so the boundary is the LAST one
   'WebSearch',              // no argument at all
   'mcp__server__tool',      // no parentheses
   'Bash("C:\\Program Files\\x.exe" *)',       // quoted path with a space
@@ -71,6 +81,12 @@ const CANDIDATES = [
   'WebSearch', 'mcp__server__tool', 'Bash("C:\\Program Files\\x.exe" verify)',
   'Bash("C:\\Program  Files\\x.exe" verify)', 'Bash(./build.sh --release)',
   'Bash()', 'Bash( )', 'Bash(git  status)',
+  // The colon-form candidates. `Skill(other:report)` and `Skill(dataviz)` are
+  // the negatives — a fix that made `:` a boundary too eagerly would start
+  // reporting those as covered, and the oracle says they are not.
+  'Skill(dataviz:report)', 'Skill(claude-api:messages)', 'Skill(other:report)',
+  'Skill(dataviz)', 'Skill(dataviz:)', 'Skill(a:b:c)', 'Skill(a:bb:c)',
+  'WebFetch(domain:github.com)', 'WebFetch(domain:)', 'mcp__server__tool(a:b)',
 ];
 
 test('the index agrees with the full scan on adversarial shapes', (t) => {
@@ -103,6 +119,25 @@ test('the index agrees with the full scan over the starter pack', (t) => {
   const pack = JSON.parse(fs.readFileSync(packPath, 'utf8'));
   assert.ok(pack.length > 300, `expected a real pack, got ${pack.length}`);
   assertAgrees(t, pack, pack, 'starter pack');
+
+  // The pack against itself is not enough, and that is why it stayed green
+  // while five oracle-confirmed false negatives shipped: it holds
+  // `Skill(dataviz:*)` but no `Skill(dataviz:report)` for that rule to cover,
+  // so the only key ever exercised is the tool-wide one. Every scope wildcard
+  // in the pack now gets a candidate SYNTHESISED under it, in both spellings,
+  // which is what a real user's list accumulates.
+  const derived = [];
+  for (const rule of pack) {
+    const parts = /^([A-Za-z][A-Za-z0-9:_-]*)\((.*)\)$/s.exec(rule);
+    if (!parts) continue;
+    const [, tool, arg] = parts;
+    if (!/\*\s*$/.test(arg)) continue;
+    const literal = arg.replace(/\*\s*$/, '').replace(/[\s:]+$/, '');
+    if (literal === '') continue;
+    derived.push(`${tool}(${literal} probe)`, `${tool}(${literal}:probe)`, `${tool}(${literal})`);
+  }
+  assert.ok(derived.length > 100, `expected many derived candidates, got ${derived.length}`);
+  assertAgrees(t, pack, derived, 'starter pack + synthesised candidates');
 });
 
 test('the index agrees with the full scan over a generated corpus', (t) => {
@@ -111,16 +146,24 @@ test('the index agrees with the full scan over a generated corpus', (t) => {
   const rand = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
   const roots = ['git', 'gh', 'npm', 'rg', 'fd', 'mkfs', 'g', 'dotnet', 'python'];
   const subs = ['status', 'push', 'run', 'build', 'install', ''];
+  // Both halves of the tool space. Only Bash and PowerShell have their `:*`
+  // rewritten to ` *` before matching, so a corpus of just those two makes the
+  // separator axis vacuous — 300 cases, 20% of them colons, and not one could
+  // reach the false negative that shipped. The non-command tools carry it.
+  const tools = ['Bash', 'PowerShell', 'Skill', 'WebFetch', 'mcp__server__tool', 'Read'];
   const pool = [];
   const candidates = [];
   for (let i = 0; i < 300; i += 1) {
-    const tool = rand() < 0.5 ? 'Bash' : 'PowerShell';
+    const tool = tools[Math.floor(rand() * tools.length)];
     const root = roots[Math.floor(rand() * roots.length)];
     const sub = subs[Math.floor(rand() * subs.length)];
     const glob = rand() < 0.25 ? '*' : '';        // glob mid-token
-    const sep = rand() < 0.2 ? ':' : ' ';
-    pool.push(`${tool}(${root}${glob}${sub ? ` ${sub}` : ''}${sep}*)`);
-    candidates.push(`${tool}(${root}${sub ? ` ${sub}` : ''}${rand() < 0.5 ? ' --flag' : ''})`);
+    const sep = rand() < 0.4 ? ':' : ' ';
+    // Separated the same way in the rule and the candidate, so a colon-scoped
+    // rule actually gets a colon-scoped candidate to be tested against.
+    const join = rand() < 0.5 ? ':' : ' ';
+    pool.push(`${tool}(${root}${glob}${sub ? `${join}${sub}` : ''}${sep}*)`);
+    candidates.push(`${tool}(${root}${sub ? `${join}${sub}` : ''}${rand() < 0.5 ? `${join}--flag` : ''})`);
   }
   assertAgrees(t, pool, candidates, 'generated corpus');
 });

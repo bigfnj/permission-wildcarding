@@ -44,12 +44,26 @@ const hookPath = (value) => {
 };
 
 const target = hookPath(hookCmd);
-const ours = (entry) => Array.isArray(entry?.hooks)
-  && entry.hooks.some((hook) => hookPath(hook?.command) === target);
+const isOurs = (hook) => hookPath(hook?.command) === target;
 
 const installed = Array.isArray(cfg.hooks?.PostToolUse) ? cfg.hooks.PostToolUse : [];
-const kept = installed.filter((entry) => !ours(entry));
-const removed = installed.length - kept.length;
+
+// Removed PER HOOK, not per entry. Dropping the whole entry took any hook that
+// happened to share its `hooks` array with ours — somebody else's tool, deleted
+// silently by our uninstaller. src/permissions.js:unregisterApproveHook already
+// filters per hook; these two scripts were the ones that did not.
+let removed = 0;
+const kept = [];
+for (const entry of installed) {
+  if (!Array.isArray(entry?.hooks)) { kept.push(entry); continue; }
+  const mine = entry.hooks.filter(isOurs).length;
+  if (!mine) { kept.push(entry); continue; }
+  removed += mine;
+  const survivors = entry.hooks.filter((hook) => !isOurs(hook));
+  // An entry that held only ours goes; one that held a neighbour keeps it,
+  // with its matcher and any other fields intact.
+  if (survivors.length) kept.push({ ...entry, hooks: survivors });
+}
 
 // The write and the "hook removed" message both used to sit OUTSIDE this check, so
 // an uninstall that matched nothing still rewrote settings.json and still reported

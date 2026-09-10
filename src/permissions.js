@@ -253,13 +253,24 @@ function coverIndexKey(rule) {
 // whitespace and quoted paths keep their exact bytes — rebuilding with single
 // spaces would miss `Bash("C:\Program  Files\x.exe" *)` and a miss is the one
 // error class that matters here.
+//
+// A COLON is a token boundary here for the same reason it is one in
+// coverIndexKey: `Skill(dataviz:*)` indexes under `Skill\0dataviz`, so a lookup
+// that only broke at whitespace generated `Skill\0` and `Skill\0dataviz:report`
+// and never reached that bucket. The two functions have to agree on what a
+// boundary is, or the rule is both indexed AND unreachable — it is not in the
+// linear fallback either, so nothing else looks at it. That shipped: five
+// oracle-confirmed false negatives, including the three colon-form Skill
+// wildcards in patterns/starter-pack.json and the documented
+// `WebFetch(domain:*)`. Extra keys cost only a bucket probe, because
+// isCoveredBy still decides every answer; a MISSING key changes the answer.
 function coverLookupKeys(specific) {
   const parts = RULE_SHAPE.exec(specific);
   if (!parts) return [];
   const [, tool, arg] = parts;
   const keys = [`${tool}${KEY_SEP}`];
   for (let i = 0; i <= arg.length; i += 1) {
-    if (i === arg.length || /\s/.test(arg[i])) {
+    if (i === arg.length || /[\s:]/.test(arg[i])) {
       keys.push(`${tool}${KEY_SEP}${arg.slice(0, i).replace(/[\s:]+$/, '')}`);
     }
   }

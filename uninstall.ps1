@@ -40,31 +40,85 @@ if (-not (Test-Path $settingsPath)) {
     exit 0
 }
 
+# ConvertFrom-Json -AsHashtable is PowerShell 6+ ONLY, so under Windows
+# PowerShell 5.1 — the shell README.md names for this script — this threw on a
+# perfectly healthy file and reported "could not be parsed". It failed CLOSED,
+# so nothing was ever lost here (unlike install.ps1, which failed open and ate
+# the config), but the Windows uninstall was simply unavailable in the
+# documented shell while claiming the file was corrupt.
+#
+# Duplicated from install.ps1 rather than shared: these two scripts have to run
+# from a bare checkout with nothing loaded, which is why they are standalone.
+function ConvertTo-OrderedDict {
+    param($InputObject)
+    if ($null -eq $InputObject) { return $null }
+    # IDictionary before IEnumerable: a hashtable is both, and enumerating one
+    # yields DictionaryEntry rather than its values.
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        $out = [ordered]@{}
+        foreach ($key in @($InputObject.Keys)) { $out[$key] = ConvertTo-OrderedDict $InputObject[$key] }
+        return $out
+    }
+    if ($InputObject -is [System.Management.Automation.PSCustomObject]) {
+        $out = [ordered]@{}
+        foreach ($prop in $InputObject.PSObject.Properties) { $out[$prop.Name] = ConvertTo-OrderedDict $prop.Value }
+        return $out
+    }
+    # A string is IEnumerable too, and must stay a scalar.
+    if ($InputObject -is [System.Collections.IEnumerable] -and $InputObject -isnot [string]) {
+        # The comma keeps a one-element result an array instead of unwrapping it.
+        return ,@(foreach ($item in $InputObject) { ConvertTo-OrderedDict $item })
+    }
+    return $InputObject
+}
+
+$raw = Get-Content $settingsPath -Raw
+if ([string]::IsNullOrWhiteSpace($raw)) {
+    # Present but empty is somebody else's mid-write window, not "no hooks".
+    Write-Host "[FAIL] $settingsPath is present but empty - left untouched." -ForegroundColor Red
+    Write-Host "       That is usually a file being written right now. Re-run in a moment." -ForegroundColor Red
+    exit 1
+}
 try {
-    $cfg = Get-Content $settingsPath -Raw | ConvertFrom-Json -AsHashtable
+    $cfg = ConvertTo-OrderedDict ($raw | ConvertFrom-Json)
 } catch {
     Write-Host "[FAIL] $settingsPath could not be parsed - left untouched." -ForegroundColor Red
+    Write-Host "       Nothing was changed. Fix or move the file, then re-run." -ForegroundColor Red
     exit 1
 }
 
 $installed = @()
-if ($cfg -is [System.Collections.IDictionary] -and $cfg.ContainsKey("hooks") `
+if ($cfg -is [System.Collections.IDictionary] -and $cfg.Contains("hooks") `
         -and $cfg["hooks"] -is [System.Collections.IDictionary] `
-        -and $cfg["hooks"].ContainsKey("PostToolUse")) {
+        -and $cfg["hooks"].Contains("PostToolUse")) {
     $installed = @($cfg["hooks"]["PostToolUse"])
 }
 
 $target = ConvertTo-HookPath $hookCmd
 $kept = @()
 $removed = 0
+# Removed PER HOOK, not per entry. Dropping the whole entry took any hook that
+# happened to share its `hooks` array with ours — somebody else's tool, deleted
+# silently by our uninstaller. src/permissions.js:unregisterApproveHook already
+# filters per hook; these two scripts were the ones that did not.
 foreach ($entry in $installed) {
-    $isOurs = $false
-    if ($entry -is [System.Collections.IDictionary] -and $entry.ContainsKey("hooks")) {
-        foreach ($h in $entry["hooks"]) {
-            if ((ConvertTo-HookPath $h.command) -eq $target) { $isOurs = $true }
-        }
+    if (-not ($entry -is [System.Collections.IDictionary]) -or -not $entry.Contains("hooks")) {
+        $kept += $entry
+        continue
     }
-    if ($isOurs) { $removed += 1 } else { $kept += $entry }
+    $mine = @()
+    $survivors = @()
+    foreach ($h in @($entry["hooks"])) {
+        if ((ConvertTo-HookPath $h.command) -eq $target) { $mine += $h } else { $survivors += $h }
+    }
+    if ($mine.Count -eq 0) { $kept += $entry; continue }
+    $removed += $mine.Count
+    # An entry that held only ours goes; one that held a neighbour keeps it,
+    # with its matcher and any other fields intact.
+    if ($survivors.Count -gt 0) {
+        $entry["hooks"] = $survivors
+        $kept += $entry
+    }
 }
 
 # Report what happened rather than success regardless: another checkout's hook, or a
@@ -84,6 +138,9 @@ if ($cfg["hooks"].Keys.Count -eq 0) {
 }
 
 $cfgJson = ConvertTo-Json $cfg -Depth 100
+# A copy before an unlocked, non-atomic write to the file the whole project
+# treats as fragile. An uninstall is exactly when a user wants a way back.
+Copy-Item $settingsPath ($settingsPath + ".pre-uninstall-backup") -Force
 [System.IO.File]::WriteAllText($settingsPath, $cfgJson + "`n")
 Write-Host "[OK] removed $removed wildcard-perms PostToolUse hook(s) from ~/.claude/settings.json" -ForegroundColor Green
 Write-Host "Allow-list entries stay as they are - this removes the hook, not your permissions." -ForegroundColor Cyan
