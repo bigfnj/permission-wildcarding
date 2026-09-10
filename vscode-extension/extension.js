@@ -945,6 +945,21 @@ function getAutoLearnWorkerRunner() {
 }
 
 function runAutoLearnWorker(operation, ...args) {
+  // The `deactivated` check has to live HERE, not in the runner. deactivate()
+  // nulls `autoLearnWorkerRunner` so a same-realm re-activate can get a working
+  // one — which means a late call arriving after teardown finds an empty slot,
+  // and getAutoLearnWorkerRunner() cheerfully builds a FRESH runner with
+  // `deactivating: false`. Its own guard cannot see the teardown that already
+  // happened. So the caller that used to be refused forever ("Auto Learn is
+  // deactivating") would instead start a real Worker post-teardown and let it
+  // write settings.json, the claims registry and the Codex rules file.
+  //
+  // Rejecting rather than resolving: every caller treats this as an operation
+  // that either produced a result or failed, and a silent success would be read
+  // as "the scan found nothing".
+  if (deactivated) {
+    return Promise.reject(new Error('Auto Learn is deactivating'));
+  }
   return getAutoLearnWorkerRunner().run(operation, ...args);
 }
 

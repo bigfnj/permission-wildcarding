@@ -33,7 +33,16 @@ function harness(tempHome, overrides = {}) {
     Range: class Range { constructor(a, b, c, d) { Object.assign(this, { a, b, c, d }); } },
     Diagnostic: class Diagnostic { constructor(range, message) { Object.assign(this, { range, message }); } },
     DiagnosticSeverity: { Warning: 1, Information: 2 },
-    commands: { registerCommand: (id) => { registered.push(id); return disposable(); } },
+    commands: {
+      // Throws on a duplicate id, because the real API does. The empty stub that
+      // was here let a double registration pass unnoticed while it broke
+      // activate() on the default configuration.
+      registerCommand: (id) => {
+        if (registered.includes(id)) throw new Error(`command '${id}' already exists`);
+        registered.push(id);
+        return disposable();
+      },
+    },
     languages: { createDiagnosticCollection: () => ({ set() {}, clear() {}, dispose() {} }) },
     window: {
       createOutputChannel: () => ({ appendLine() {}, clear() {}, show() {}, dispose() {} }),
@@ -255,6 +264,44 @@ test('lintMemory stays registered when the lint is disabled, and says so', () =>
     assert.doesNotThrow(() => lint.showReport());
     assert.match(h.info.join(' '), /memory lint is off/,
       'it has to name the reason, not fail silently or report an empty index');
+  } finally {
+    h.restore();
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  }
+});
+
+// The ENABLED path, which is the default and was the one left broken. Moving the
+// command registration above the `enabled` check left the original in place, and
+// VS Code throws on a duplicate id — so activate() threw partway through, the
+// caller logged it to the console, and the reconcile timer, the watcher disposer
+// and the initial refresh never ran. The gauge and the diagnostics never
+// appeared, in the configuration almost everyone uses.
+//
+// The sibling test above only drove memory.enabled=false, where the second
+// registration is unreachable. That is why it passed while this was broken.
+test('activate completes on the default configuration, registering the command once', () => {
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'memory-lint-enabled-'));
+  const dir = path.join(tempHome, '.claude', 'projects', 'd---on', 'memory');
+  writeStore(dir, '# Memory Index\n\n- [one](one.md) — hook\n');
+  fs.writeFileSync(path.join(dir, 'one.md'), 'body\n', 'utf8');
+
+  const h = harness(tempHome); // no overrides, so memory.enabled defaults to true
+  try {
+    const lint = new h.loaded.MemoryLint();
+    const subscriptions = [];
+    // The whole point: this must not throw.
+    assert.doesNotThrow(() => lint.activate({ subscriptions }),
+      'a duplicate command registration makes VS Code throw and aborts activate');
+
+    assert.equal(
+      h.registered.filter((id) => id === 'permission-wildcarding.lintMemory').length, 1,
+      'registered exactly once — twice throws, zero leaves the palette entry dead',
+    );
+    // Everything after the throw point, which is what silently never ran.
+    assert.equal(h.intervals.length, 1, 'the reconcile timer is armed');
+    assert.ok(lint.diags, 'the diagnostic collection exists');
+    assert.equal(lint.watchers.size, 1, 'the initial refresh ran and built a watcher');
+    assert.ok(h.statusText.length > 0, 'and the status-bar gauge was painted');
   } finally {
     h.restore();
     fs.rmSync(tempHome, { recursive: true, force: true });

@@ -48,6 +48,10 @@ function harness(tempHome, options = {}) {
   const commands = new Map();
   const watchers = [];
   const spawns = [];
+  // Every worker the extension asks for, so a test can assert that one was NOT
+  // built. "Did it refuse" is not observable from the error message alone:
+  // the runner's own guard produces the same text.
+  const workers = [];
   const statuses = [];
   const errors = [];
   const infos = [];
@@ -131,7 +135,8 @@ function harness(tempHome, options = {}) {
       const real = originalLoad.call(this, request, parent, isMain);
       return {
         createAutoLearnWorkerRunner: (runnerOptions) => real.createAutoLearnWorkerRunner({
-          ...runnerOptions, workerFactory: () => new FakeWorker(),
+          ...runnerOptions,
+          workerFactory: () => { const worker = new FakeWorker(); workers.push(worker); return worker; },
         }),
       };
     }
@@ -181,6 +186,7 @@ function harness(tempHome, options = {}) {
     settings,
     spawns,
     statuses,
+    workers,
     watcherFor(name) {
       const hit = watchers.find((watcher) => watcher.pattern?.pattern === name);
       assert.ok(hit, `no watcher registered for ${name}`);
@@ -357,6 +363,34 @@ test('a same-realm re-activate gets a fresh Auto Learn worker runner', async (t)
       'a retained runner rejects every later operation, forever');
     assert.ok(app.infos.some((message) => message.startsWith('Auto Learn:')),
       'the scan after re-activation actually ran');
+  } finally {
+    await app.dispose();
+  }
+});
+
+test('an Auto Learn operation arriving after deactivate does not start a worker', async (t) => {
+  const home = tempHome(t);
+  const app = harness(home, { settings: { 'autoLearn.enabled': true } });
+  try {
+    await app.extension.deactivate();
+    app.errors.length = 0;
+    app.workers.length = 0;
+
+    // The late arrival. A bounce timer that had already fired, a watcher
+    // callback mid-flight, or a webview message all reach this the same way.
+    await app.commands.get('permission-wildcarding.autoLearnScan')();
+
+    // The whole point. deactivate() nulls the runner so a same-realm
+    // re-activate can get a working one, which means the runner's own sticky
+    // `deactivating` flag is GONE by the time a late call arrives — the empty
+    // slot just gets refilled with a fresh runner that has never heard of the
+    // teardown. Without a guard at the extension level, this starts a real
+    // Worker that writes settings.json, the claims registry and the Codex
+    // rules file, against a host that is no longer there.
+    assert.equal(app.workers.length, 0,
+      'a worker was started after teardown');
+    assert.ok(app.errors.some((message) => /deactivating/.test(message)),
+      'and the caller is told why, rather than seeing a silent empty result');
   } finally {
     await app.dispose();
   }

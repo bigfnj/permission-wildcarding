@@ -168,9 +168,16 @@ class MemoryLint {
     this.status.command = 'permission-wildcarding.lintMemory';
     context.subscriptions.push(this.diags, this.channel, this.status);
 
-    context.subscriptions.push(
-      vscode.commands.registerCommand('permission-wildcarding.lintMemory', () => this.showReport())
-    );
+    // NOTE: the command is registered ONCE, above the enabled check. A second
+    // registration used to sit here, and moving the first one above that check
+    // left both — which VS Code answers by THROWING on the duplicate id. With
+    // memory.enabled at its default of true, activate() therefore threw right
+    // here, extension.js's try/catch logged it to the console, and everything
+    // below never ran: no reconcile timer, no watcher disposer, no initial
+    // refresh. The status-bar gauge and the diagnostics simply never appeared.
+    // The test that was supposed to cover the change only drove the DISABLED
+    // path, where this line is unreachable, so it passed while the normal
+    // configuration was broken.
 
     // External writes (an agent editing MEMORY.md outside the editor) + in-editor saves/opens.
     // The per-dir watchers are (re)built from discovery inside refresh(), not once here:
