@@ -5,7 +5,11 @@ const os = require('os');
 const path = require('path');
 
 const { ruleMatches, sameRule } = require('./permission-match');
-const { readPolicy, hookEventAllowed } = require('./managed-policy');
+// NOTE: `./managed-policy` is deliberately NOT required here. It is reachable from
+// exactly one function, maxLayers(), and requiring it at module scope cost the
+// PostToolUse hook 2.3 ms on EVERY tool call for a module the hook never reaches.
+// See the lazy require inside maxLayers, and the same reasoning written out at
+// bin/wildcard-perms:11-26.
 
 // Rename codes that are transient on Windows: another process (Claude Code
 // writing settings.json, Defender/Search indexer scanning the temp file, or a
@@ -666,6 +670,17 @@ function isMaxOn(settings) {
 // has changed across policy versions, so confirm with a canary before relying
 // on it in either direction.
 function maxLayers(settings, options = {}) {
+  // Required here, not at module scope. This is the ONLY function in the file that
+  // touches managed policy, and nothing on the hook's common path calls it — the
+  // callers are `--max status` and three sites in the extension, which is a
+  // long-lived process where the load is paid once. Measured cold in fresh
+  // interleaved processes: requiring src/permissions.js costs 4.803 ms with this
+  // eager, 2.476 ms with it stubbed out, so the hook was paying ~2.3 ms per tool
+  // call for a module it never used.
+  //
+  // At the top of the function rather than inside the `else` below: readPolicy is
+  // conditional, but hookEventAllowed two lines down is not.
+  const { readPolicy, hookEventAllowed } = require('./managed-policy');
   const policy = options.managedPolicy !== undefined
     ? options.managedPolicy
     : readPolicy({ home: options.home, policyPath: options.managedPolicyPath });
