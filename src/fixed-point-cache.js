@@ -76,6 +76,34 @@ function cachePath({ home = os.homedir(), cacheFile } = {}) {
 // is write-only with no migration hook. A stat also self-invalidates on an in-place
 // `git checkout`, which is exactly what someone bisecting the generalizer does and
 // exactly what a constant cannot see. Measured ~0.03 ms per statSync.
+// WARNING for anyone extending this beyond the CLI.
+//
+// The stamp is a `statSync` of code ON DISK, and it is only sound for a
+// short-lived process. In a long-lived host Node caches modules by resolved
+// filename, so the code that RUNS and the code that gets stat-ed can diverge:
+// activate pins the generalizer, `scripts/package.mjs` then rewrites
+// `vscode-extension/src/`, and the host would stamp bytes it is not executing —
+// minting a key that the CLI, genuinely running the new code, would honour.
+//
+// Two facts make that worse than it sounds. `scripts/package.mjs` copies with
+// `cpSync`, which on Windows preserves the source mtime, so the root copy and the
+// generated mirror produce an IDENTICAL stamp by construction rather than by
+// luck — while on a Linux runner `copy_file_range` does not preserve it, so the
+// behaviour is platform-dependent. And an INSTALLED copy can never match a
+// checkout even for byte-identical files, because VSIX zips carry 2-second DOS
+// timestamps: three installed versions on one machine plus the CLI would be four
+// writers of a one-key file, thrashing rather than hitting.
+//
+// So: if the extension ever adopts this, give it an IN-MEMORY cache. Do not
+// point a long-lived host at the shared file. Also note no test can currently
+// reproduce the divergence — `test/extension-activation.test.js` redirects the
+// extension's `./src/*` to the ROOT copy, so under test both always stat the
+// same files.
+//
+// The one accepted blind spot even in the CLI: a code change that preserves BOTH
+// mtime and size is invisible. `git checkout` sets a fresh mtime, which covers
+// the motivating case (bisecting the generalizer); hashing the ~43 KB of source
+// would close it for ~0.1 ms plus I/O.
 function codeFiles() {
   return [
     path.join(__dirname, 'permissions.js'),

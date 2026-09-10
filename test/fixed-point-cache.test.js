@@ -23,7 +23,7 @@ const { spawnSync } = require('node:child_process');
 const MODULE = path.join(__dirname, '..', 'src', 'fixed-point-cache.js');
 const {
   fnv1a32, fixedPointKey, readFixedPoint, writeFixedPoint, isFixedPoint,
-  cachePath, CACHE_VERSION,
+  cachePath, codeFiles, CACHE_VERSION,
 } = require('../src/fixed-point-cache');
 
 // Stands in for settings.json. Only its bytes matter to this module.
@@ -309,4 +309,31 @@ test('requiring the module does not load crypto in a fresh process', () => {
   assert.equal(report.api, 'function', 'the probe really did load the module');
   assert.deepEqual(report.added.filter((entry) => /crypto/i.test(entry)), [],
     `requiring the module loaded: ${report.added.join(', ')}`);
+});
+
+
+test('codeFiles names both generalizer sources, which nothing else asserts', () => {
+  // The whole "a spurious hit is impossible" argument rests on the version
+  // segment changing when the generalizer changes, and that rests entirely on
+  // this list. Every other test in this file INJECTS options.codeFiles with its
+  // own fixture paths, so they exercise the stamping loop and not the file SET —
+  // proven by mutation: deleting the permission-match.js entry from codeFiles()
+  // leaves this suite at 9 pass / 0 fail.
+  //
+  // Consequence of that mutation shipping: every permission-match.js change
+  // becomes invisible to the key, so the hook honours a fixed-point verdict
+  // minted by the old matcher. Nothing fails; the allow list just quietly stops
+  // being generalized.
+  //
+  // permission-match.js belongs here because isCoveredBy defers to ruleMatches
+  // and sameRule for every covering question processAllowList asks.
+  const names = codeFiles().map((f) => path.basename(f)).sort();
+  assert.deepEqual(names, ['permission-match.js', 'permissions.js']);
+
+  // And they must be the files that actually exist next to the module, not
+  // strings that happen to look right — a stat of a missing path yields no key
+  // at all, which would disable the cache silently rather than loudly.
+  for (const file of codeFiles()) {
+    assert.equal(fs.existsSync(file), true, `${file} must exist for the stamp to work`);
+  }
 });

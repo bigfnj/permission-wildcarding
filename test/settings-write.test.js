@@ -276,3 +276,96 @@ test('an absent settings.json is the legitimate first run, not a refusal', (t) =
   assert.equal(out.wrote, true);
   assert.equal(env.read().permissions.defaultMode, 'bypassPermissions');
 });
+
+
+test('a transform that returns no settings object is refused, not written', (t) => {
+  // JSON.stringify(undefined, null, 2) + '\n' is the ten bytes "undefined\n".
+  // Without a shape guard, a transform returning { changed: true } and nothing
+  // else atomically REPLACES settings.json with that and throws nothing — total
+  // loss, no diagnostic. Same for a string, a number, or an array, which all
+  // stringify to valid JSON of a shape Claude Code rejects.
+  //
+  // No current transform can do this. It is here because this writer is
+  // documented as having none of writeAllow's protections, and until now its one
+  // guard was the deny check, which no current transform can trip either.
+  const shapes = [undefined, null, 'a string', 42, ['an', 'array']];
+  for (const shape of shapes) {
+    const env = tempSettings(t, { model: 'A', permissions: { allow: ['Bash(rg *)'] } });
+    const before = fs.readFileSync(env.file, 'utf8');
+    assert.throws(
+      () => env.writer().writeTransform(() => ({ changed: true, settings: shape })),
+      /no settings object/,
+      `refused for ${JSON.stringify(shape) ?? 'undefined'}`,
+    );
+    assert.equal(fs.readFileSync(env.file, 'utf8'), before,
+      `and nothing was written for ${JSON.stringify(shape) ?? 'undefined'}`);
+  }
+});
+
+test('the transform input and the swap baseline are the SAME read', (t) => {
+  // The subtle version of the bug this writer exists to fix. Originally `latest`
+  // came from a readSettingsState() call and the CAS baseline from a second read
+  // taken after it — so a write landing BETWEEN those two reads left the CAS
+  // satisfied (its own before and after agreed) while the transform had already
+  // been handed stale bytes, and the verbatim write discarded the concurrent
+  // change.
+  //
+  // Reproduced by counting reads and mutating the file after the first one.
+  const env = tempSettings(t, { model: 'A', permissions: { allow: [] } });
+  const realRead = fs.readFileSync;
+  let reads = 0;
+  fs.readFileSync = function counted(target, ...rest) {
+    const isSettings = typeof target === 'string' && target.endsWith('settings.json');
+    if (isSettings) {
+      reads += 1;
+      // Land a concurrent write immediately after the writer's first read.
+      if (reads === 1) {
+        const out = realRead.call(this, target, ...rest);
+        realRead.call(fs, target); // keep the handle warm; no behavioural need
+        fs.writeFileSync(target, JSON.stringify(
+          { model: 'B', effortLevel: 'high', permissions: { allow: [] } }, null, 2) + '\n');
+        return out;
+      }
+    }
+    return realRead.call(this, target, ...rest);
+  };
+  t.after(() => { fs.readFileSync = realRead; });
+
+  let seen = null;
+  let threw = null;
+  try {
+    env.writer().writeTransform((latest) => {
+      seen = latest;
+      return { changed: true, settings: { ...latest, permissions: { ...latest.permissions, defaultMode: 'plan' } } };
+    }, { attempts: 1 });
+  } catch (err) { threw = err; }
+
+  // Either outcome is correct, and both are safe. What must NOT happen is a
+  // write that lands while `seen` is the pre-mutation object: that is the
+  // two-reads-disagree bug.
+  const disk = env.read();
+  if (!threw && disk.permissions.defaultMode === 'plan') {
+    assert.equal(seen.model, 'B',
+      'if the write landed, the transform must have seen the newest bytes');
+    assert.equal(disk.model, 'B', 'and the concurrent change survived');
+    assert.equal(disk.effortLevel, 'high');
+  } else {
+    assert.equal(disk.model, 'B', 'the concurrent write was left intact');
+    assert.equal('defaultMode' in disk.permissions, false, 'and the stale write was refused');
+  }
+});
+
+test('a JSON scalar or array on disk is unreadable, not an empty object', (t) => {
+  // `JSON.parse('[1,2]')` succeeds, so a naive parse hands the transform an
+  // array and the write then produces a settings.json Claude Code cannot use.
+  for (const body of ['[1, 2, 3]', '"a string"', '42', 'null']) {
+    const env = tempSettings(t);
+    fs.writeFileSync(env.file, body);
+    assert.throws(
+      () => env.writer().writeTransform((latest) => ({ changed: true, settings: latest })),
+      (err) => err.code === SETTINGS_UNREADABLE_CODE,
+      `refused for ${body}`,
+    );
+    assert.equal(fs.readFileSync(env.file, 'utf8'), body, `untouched for ${body}`);
+  }
+});

@@ -2198,9 +2198,20 @@ function toggleMax() {
         return;
       }
       if (!res.changed) {
-        // Reachable now that intent comes from the same read as the transform:
-        // another writer got the file into the requested state first. Say so
-        // rather than returning silently into no notification at all.
+        // Defensive, and the comment that was here had it exactly backwards.
+        //
+        // It claimed deriving `turningOn` inside the closure made this reachable.
+        // It does the opposite: because intent now comes from the SAME read the
+        // transform runs on, `isMaxOn(latest) === false` implies `turningOn` is
+        // true implies `enableMaxAllow` returns changed:true — or the single
+        // `max-snapshot-failed`, which the branch above already intercepts.
+        // Enumerating all four layer states leaves no path here.
+        //
+        // Kept rather than deleted: it is the difference between a silent return
+        // and a message if applyMax ever grows a second refusal, and that silent
+        // return is the bug the branch above exists to fix. The CLI's equivalent
+        // IS reachable, because there intent comes from argv rather than from the
+        // read — that asymmetry is the point.
         vscode.window.showInformationMessage(
           `permission-wildcarding: MAX is already ${turningOn ? 'OFF' : 'ON'} — nothing to change.`
         );

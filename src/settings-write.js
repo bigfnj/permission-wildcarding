@@ -39,6 +39,34 @@ const SETTINGS_UNREADABLE_CODE = 'SETTINGS_UNREADABLE';
 // let its next trigger retry, not treat it as a hard failure.
 const SETTINGS_CONTENDED_CODE = 'SETTINGS_CONTENDED';
 
+// readSettingsState's classification, applied to bytes the caller already has.
+// Exists so writeTransform can use ONE read for both the transform's input and
+// its compare-and-swap baseline instead of two reads that can disagree.
+//
+// `text === null` means rawSettingsText could not read the file, and that lumps
+// ENOENT together with a transient EACCES/EBUSY. Distinguished here with an
+// existsSync rather than left ambiguous: treating "I could not read it" as
+// "it is not there" would hand the transform an empty object and then write over
+// a file that does exist.
+function stateOfText(settingsPath, text) {
+  if (text === null) {
+    return fs.existsSync(settingsPath)
+      ? { state: SETTINGS_UNREADABLE, settings: null }
+      : { state: SETTINGS_ABSENT, settings: {} };
+  }
+  try {
+    const parsed = JSON.parse(text);
+    // A JSON scalar or array parses fine and is not a settings object.
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { state: SETTINGS_UNREADABLE, settings: null };
+    }
+    return { state: SETTINGS_PRESENT, settings: parsed };
+  } catch {
+    // Includes the zero-byte window of a truncate-then-write.
+    return { state: SETTINGS_UNREADABLE, settings: null };
+  }
+}
+
 function readSettingsState(settingsPath) {
   let raw;
   try {
@@ -166,7 +194,16 @@ function createSettingsWriter({ settingsPath, onWrite } = {}) {
     let lastLatest = null;
     let lastResult = null;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
-      const before = readSettingsState(target);
+      // ONE read serves both the transform's input and the compare-and-swap
+      // baseline. They must be the same bytes, and originally they were not:
+      // `latest` came from a readSettingsState() call and `beforeText` from a
+      // second read taken after it. A concurrent write landing between those two
+      // left the CAS satisfied — its own before and after agreed — while the
+      // transform had already been handed a stale object, and the verbatim write
+      // then discarded that concurrent change. That is the exact loss this
+      // writer exists to prevent, reintroduced in a smaller window.
+      const beforeText = rawSettingsText(target);
+      const before = stateOfText(target, beforeText);
       // Refuse BEFORE running the transform, never after. applyMax writes the
       // allow-list snapshot as a side effect, so transforming first would clobber
       // a real snapshot with one taken from a file we then refuse to write.
@@ -178,7 +215,6 @@ function createSettingsWriter({ settingsPath, onWrite } = {}) {
       }
       // `absent` yields {}, which is the legitimate first-run case.
       const latest = before.settings;
-      const beforeText = rawSettingsText(target);
       const result = transform(latest);
       lastLatest = latest;
       lastResult = result;
@@ -188,11 +224,35 @@ function createSettingsWriter({ settingsPath, onWrite } = {}) {
       // parse: any change at all invalidates a whole-object write.
       if (rawSettingsText(target) !== beforeText) continue;
 
+      // deny is guarded; `model`, `effortLevel`, `env` and `hooks` are NOT, and
+      // this module's own header calls those "the common casualty". A transform
+      // returning only `{ permissions: {...} }` is written verbatim and takes
+      // them with it — and dropping `hooks` un-registers this project's own
+      // PostToolUse hook, i.e. disables the tool silently. Not guarded here
+      // because a whole-object writer cannot tell a deliberate removal from an
+      // accidental one, which is exactly why the shape check above is the
+      // backstop and why `writeAllow` is the right writer for anything that only
+      // means to change the allow list.
+      //
       // deny is the safety boundary every other feature defers to. writeAllow
       // guarantees it additively; this writer cannot, so it refuses to be the
       // thing that drops one rather than doing it silently. Both current
       // transforms spread `permissions` through, so this never fires for them —
       // it is a guard for the next author.
+      // A shape guard before the deny guard, because its failure is worse.
+      // `JSON.stringify(undefined, null, 2) + '\n'` is the ten bytes
+      // "undefined\n", so a transform returning { changed: true } with no
+      // settings — or a string, a number, an array — atomically REPLACES
+      // settings.json with garbage and throws nothing. No current transform can
+      // do it, but this writer is documented as having none of writeAllow's
+      // protections, and the one guard it had was the one nothing could trip.
+      if (!result.settings || typeof result.settings !== 'object' || Array.isArray(result.settings)) {
+        throw new Error(
+          'refusing to write: the transform returned no settings object '
+          + `(got ${Array.isArray(result.settings) ? 'an array' : typeof result.settings})`,
+        );
+      }
+
       const lost = deniesLost(latest, result.settings);
       if (lost.length) {
         throw new Error(

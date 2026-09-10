@@ -236,7 +236,7 @@ test('--max and --bypass still work on an absent settings.json, which is the leg
 // in bin/wildcard-perms knows it is under test; the only coupling is "settings
 // .json is read via fs.readFileSync", which is true at src/settings-write.js and
 // at the CLI's own readSettings.
-function staleReadShim(t, stalePayload) {
+function staleReadShim(t, stalePayload, { poisonRead = 1 } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'permission-wildcarding-shim-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const shim = path.join(dir, 'stale-first-read.js');
@@ -244,13 +244,25 @@ function staleReadShim(t, stalePayload) {
     "const fs = require('fs');",
     "const real = fs.readFileSync;",
     `const stale = ${JSON.stringify(stalePayload)};`,
-    'let served = false;',
+    `const poisonRead = ${poisonRead};`,
+    'let seen = 0;',
     // Only readFileSync, and only for that basename, so the sidecar reads and
     // writeFileAtomicSync's own I/O are untouched.
+    //
+    // Targeting a specific read INDEX, not just the first. The first read of
+    // settings.json is readSettingsForWrite's preflight, whose parsed value is
+    // only tested against null and then discarded — poisoning it proves nothing
+    // about the window that matters. Traced order for --max/--bypass:
+    //   #1 readSettingsState  (preflight, discarded)
+    //   #2 rawSettingsText    (writeTransform: the transform's input AND the
+    //                          compare-and-swap baseline, one read for both)
+    //   #3 rawSettingsText    (the swap re-check)
     'fs.readFileSync = function patched(target, ...rest) {',
-    "  if (!served && typeof target === 'string' && target.endsWith('settings.json')) {",
-    '    served = true;',
-    "    return rest[0] === 'utf8' || rest[0]?.encoding === 'utf8' ? stale : Buffer.from(stale);",
+    "  if (typeof target === 'string' && target.endsWith('settings.json')) {",
+    '    seen += 1;',
+    '    if (seen === poisonRead) {',
+    "      return rest[0] === 'utf8' || rest[0]?.encoding === 'utf8' ? stale : Buffer.from(stale);",
+    '    }',
     '  }',
     '  return real.call(this, target, ...rest);',
     '};',
@@ -279,7 +291,8 @@ test('--bypass keeps a key that landed between its read and its write', (t) => {
   // What the verb's FIRST read returns: an older file, missing all of that.
   const stale = JSON.stringify({ permissions: { allow: ['Bash(git status *)'] } }, null, 2) + '\n';
 
-  const run = runVerbWithShim(home, staleReadShim(t, stale), ['--bypass', 'on']);
+  // Read #2 is the one writeTransform hands to the transform.
+  const run = runVerbWithShim(home, staleReadShim(t, stale, { poisonRead: 2 }), ['--bypass', 'on']);
   assert.equal(run.status, 0, run.stderr);
 
   const after = settingsOf(home);
@@ -300,7 +313,7 @@ test('--max on snapshots the list as it is now, not as its first read saw it', (
   });
   const stale = JSON.stringify({ permissions: { allow: ['Bash(git status *)'] } }, null, 2) + '\n';
 
-  const run = runVerbWithShim(home, staleReadShim(t, stale), ['--max', 'on']);
+  const run = runVerbWithShim(home, staleReadShim(t, stale, { poisonRead: 2 }), ['--max', 'on']);
   assert.equal(run.status, 0, run.stderr);
 
   // The snapshot is the only thing that can restore the list, so what it captured
@@ -391,38 +404,74 @@ test('a list that needed work is never recorded as a fixed point', (t) => {
   assert.equal(runHook(home, { cwd: home }).status, 0);
   assert.deepEqual(settingsOf(home).permissions.allow, ['Bash(git status *)'], 'it did the work');
 
-  // A key may exist now — but it must describe the POST-pass bytes, never the
-  // pre-pass ones that needed collapsing.
-  const key = fs.existsSync(cacheFileFor(home))
-    ? fs.readFileSync(cacheFileFor(home), 'utf8').trim() : null;
-  if (key !== null) {
-    const post = cache.fixedPointKey(fs.readFileSync(path.join(home, '.claude', 'settings.json')));
-    assert.notEqual(key, cache.fixedPointKey(Buffer.from(JSON.stringify(
-      { permissions: { allow: ['Bash(git status --short)', 'Bash(git status --long)'] } }, null, 2) + '\n')),
-      'the pre-pass bytes were not recorded');
-    assert.ok(key === post || key !== post, 'shape check only; the point is the line above');
-  }
+  // The actual invariant, in one line. `run()` writes a key only under
+  // `if (!pending)`, and this fixture is deliberately not a fixed point, so no
+  // key may exist at all.
+  //
+  // What was here before: a `if (key !== null)` block that could never execute
+  // for this fixture, containing among other things
+  // `assert.ok(key === post || key !== post, ...)` — true for every pair of
+  // values in JavaScript including NaN. Four of five assertions unreachable and
+  // one a tautology, in a test whose name promises the property below.
+  assert.equal(fs.existsSync(cacheFileFor(home)), false,
+    'a list that needed work must leave no key behind — writing one before '
+    + 'verifying would be a permanent false hit for content that always needs the pass');
 });
 
-test('the cache converges after one write, rather than rewriting every call', (t) => {
-  // writeAllow appends new entries at the END, so what lands is a PERMUTATION of
-  // the pass's output, not that output verbatim. If a permutation could fail to
-  // be a fixed point, every call would miss AND write — an unbounded write loop
-  // on the user's policy file. Verified separately as 0 of 400 permutations, but
-  // it holds for a non-obvious reason (map/Set/filter preserve first-occurrence
-  // order), so it is pinned here end to end.
+test('the cache converges in exactly three calls, and the third is a hit', (t) => {
+  // Convergence has a precise shape and it is not "one call". run() stamps only
+  // bytes it READ and verified, never bytes it believes it wrote — writeAllow
+  // re-reads and rebases inside itself and can fall back to a non-atomic write,
+  // so the post-write content is a file state this process never saw. So:
+  //
+  //   call 1  reads a non-fixed-point list, no key exists, runs the pass, WRITES
+  //           settings.json, and deliberately stamps nothing
+  //   call 2  reads the now-generalized list, still no key, runs the pass, finds
+  //           it is a fixed point, writes NOTHING and stamps the key
+  //   call 3  HITS, and touches neither file
+  //
+  // The load-bearing assertion is on the KEY file's mtime across calls 3+. That
+  // is what separates a hit from a miss that quietly redid the pass and reached
+  // the same answer — asserting only that settings.json stops changing passes
+  // with the cache deleted entirely, because a fixed point is not rewritten
+  // either way. This file makes exactly that criticism of a test 80 lines above,
+  // and the first version of this one inherited the flaw.
+  //
+  // It also pins the property without which the hook would write on EVERY call:
+  // writeAllow appends new entries at the end, so what lands is a permutation of
+  // the pass's output rather than that output verbatim. If a permutation could
+  // fail to be a fixed point there would be no call 3. Verified separately as
+  // 0 of 400 permutations of the live list, but it holds for a non-obvious reason
+  // (map/Set/filter all preserve first-occurrence order).
   const home = tempHome(t, { permissions: { allow: ['Bash(git status --short)', 'Bash(git status --long)'] } });
   const file = path.join(home, '.claude', 'settings.json');
 
+  // Call 1 — does the work, stamps nothing.
   assert.equal(runHook(home, { cwd: home }).status, 0);
   const afterFirst = fs.readFileSync(file, 'utf8');
-  const mtimeAfterFirst = fs.statSync(file).mtimeMs;
+  assert.deepEqual(JSON.parse(afterFirst).permissions.allow, ['Bash(git status *)'],
+    'call 1 generalized the pair');
+  assert.equal(fs.existsSync(cacheFileFor(home)), false,
+    'and stamped nothing, because it never read the bytes it wrote');
 
-  // Second and third calls must touch nothing at all.
+  // Call 2 — verifies the written bytes and stamps them.
+  assert.equal(runHook(home, { cwd: home }).status, 0);
+  assert.equal(fs.readFileSync(file, 'utf8'), afterFirst, 'call 2 wrote nothing');
+  assert.equal(fs.existsSync(cacheFileFor(home)), true,
+    'call 2 read a fixed point and stamped it — which is only possible because '
+    + 'what writeAllow left behind is itself a fixed point');
+  const key = fs.readFileSync(cacheFileFor(home), 'utf8').trim();
+  const keyMtime = fs.statSync(cacheFileFor(home)).mtimeMs;
+  const settingsMtime = fs.statSync(file).mtimeMs;
+
+  // Calls 3 and 4 — hits. Neither file may move.
   assert.equal(runHook(home, { cwd: home }).status, 0);
   assert.equal(runHook(home, { cwd: home }).status, 0);
-  assert.equal(fs.readFileSync(file, 'utf8'), afterFirst, 'bytes unchanged');
-  assert.equal(fs.statSync(file).mtimeMs, mtimeAfterFirst, 'and not rewritten');
+  assert.equal(fs.readFileSync(file, 'utf8'), afterFirst, 'settings bytes unchanged');
+  assert.equal(fs.statSync(file).mtimeMs, settingsMtime, 'and settings not rewritten');
+  assert.equal(fs.readFileSync(cacheFileFor(home), 'utf8').trim(), key, 'same key');
+  assert.equal(fs.statSync(cacheFileFor(home)).mtimeMs, keyMtime,
+    'and the key was not RE-earned, which is what proves those calls hit');
 });
 
 test('an unusable cache degrades to a miss, silently, in every shape', (t) => {
