@@ -2594,10 +2594,46 @@ function gatesEnabled() {
 
 // How many gates the compiled file holds. Counts the bullets the compiler emits rather than
 // parsing it, so a hand-mangled file reads as 0 instead of throwing.
+// The running extension's version, for the dashboard's status line — so "which
+// build am I looking at" is answerable without opening the Extensions view. This
+// is the question that costs real time when a fix is in the repo but the VSIX was
+// never reinstalled, which has happened repeatedly.
+//
+// Memoized rather than read per push: a version cannot change while the process
+// runs, and the whole point of the change above it is to stop doing avoidable fs
+// work on that path. `./package.json` resolves in BOTH layouts — beside
+// extension.js in the repo, and beside it again inside the packaged VSIX — and the
+// catch means a missing or unreadable manifest degrades to no badge rather than
+// to a broken dashboard.
+let extensionVersionMemo;
+function extensionVersion() {
+  if (extensionVersionMemo === undefined) {
+    try { extensionVersionMemo = require('./package.json').version || ''; }
+    catch { extensionVersionMemo = ''; }
+  }
+  return extensionVersionMemo;
+}
+
+// Read the count out of the header recall.py already writes, not out of the prose.
+//
+// This was `text.match(/^- \*\*/gm)`, which assumes every gate opens with a bold
+// lead-in. That was true of the pre-2026-09-09 corpus and of nothing since, so
+// with five gates installed the card read "0 active" — a number that flatly
+// contradicted the ON state beside it. recall.py's _compile_gates_text emits
+// "## Standing gates (N memories, managed)", which is the authoritative count and
+// is independent of how any gate happens to be worded.
+//
+// Same defect, same day, in scripts/verify-release.ps1, which reported
+// "0 gate(s)" for the same file. Fixed there first; this is the product half.
 function compiledGateCount() {
   try {
     const text = readCompiled();
-    return text ? (text.match(/^- \*\*/gm) || []).length : 0;
+    if (!text) return 0;
+    const header = text.match(/##\s+Standing gates\s+\((\d+)\s+memor/);
+    if (header) return Number(header[1]);
+    // Fall back to counting top-level bullets rather than to zero: an older
+    // compiled file with no header still has gates in it.
+    return (text.match(/^-\s/gm) || []).length;
   } catch {
     return 0;
   }
@@ -3001,6 +3037,7 @@ class WildcardingViewProvider {
       type: 'data',
       active: fs.existsSync(SETTINGS),
       settingsPath: SETTINGS.replace(os.homedir(), '~'),
+      version: extensionVersion(),
       codexWatching,
       total: allow.length,
       wildcardCount: wildcards.length,
@@ -3057,6 +3094,10 @@ class WildcardingViewProvider {
           border: 1px solid var(--vscode-widget-border, transparent);
           border-radius: 6px; padding: 10px 12px; margin-bottom: 10px; }
   .status { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+  /* Quiet and pushed to the right, so it answers "which build am I looking at"
+     without competing with the state it sits beside. */
+  .ver { margin-left: auto; font-weight: 400; font-size: 11px;
+         color: var(--vscode-descriptionForeground); }
   .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--vscode-charts-green, #3fb950);
          box-shadow: 0 0 6px var(--vscode-charts-green, #3fb950); flex: 0 0 auto; }
   .dot.idle { background: var(--vscode-charts-yellow, #d29922); box-shadow: 0 0 6px var(--vscode-charts-yellow, #d29922); }
@@ -3176,7 +3217,7 @@ class WildcardingViewProvider {
 </head>
 <body>
   <div class="hero">
-    <div class="status"><span id="dot" class="dot"></span><span id="statusText">Active</span></div>
+    <div class="status"><span id="dot" class="dot"></span><span id="statusText">Active</span><span id="version" class="ver"></span></div>
     <div class="muted sub" id="watching">watching settings.json</div>
 
     <div class="heronum"><span id="total">–</span> <small>approved</small></div>
@@ -3617,6 +3658,9 @@ class WildcardingViewProvider {
   function render(d) {
     $('dot').className = 'dot' + (d.active ? '' : ' idle');
     $('statusText').textContent = d.active ? 'Active' : 'Idle — settings.json not found';
+    // Empty string when the manifest could not be read, which renders as nothing
+    // rather than as 'v' or 'undefined'.
+    $('version').textContent = d.version ? 'v' + d.version : '';
     $('watching').textContent = 'watching ' + d.settingsPath + (d.codexWatching ? ' + Codex history' : '');
     renderMax(d.max);
     renderCodexMax(d.codexMax);
