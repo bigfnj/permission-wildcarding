@@ -4,7 +4,6 @@
 const fs = require('fs');
 const path = require('path');
 const os  = require('os');
-const { spawnSync } = require('child_process');
 const {
   processAllowList, writeFileAtomicSync, applyBypass, isBypassOn, currentMode,
   applyMax, isMaxOn, maxLayers,
@@ -12,13 +11,14 @@ const {
 const {
   createPolicyLock, POLICY_LOCK_CODE, POLICY_LOCK_PATH, POLICY_LOCK_BUSY_MESSAGE,
 } = require('../src/policy-lock');
-const {
-  CODEX_CONFIG, applyCodexMax, isCodexMaxOn, readApproval, sandboxMode,
-  readEnterpriseBundle, targetApproval,
-} = require('../src/codex-max');
 const { drainLocalSettings } = require('../src/local-settings');
-const { guidanceStatusAll, setGuidanceAll } = require('../src/agent-guidance');
-const { gatesStatusAll, setGatesAll } = require('../src/agent-gates');
+
+// codex-max, agent-guidance, agent-gates and child_process are used by exactly
+// one command verb each and by nothing on the hook path, which runs after every
+// single tool call. `learn()` below already lazy-requires the learner stack for
+// this reason; the same reasoning was never extended to these. Measured at the
+// process level: 50 ms for bare node, 58 ms with only what the hook needs,
+// 70 ms with all of it, so this is ~12 ms returned per tool call.
 
 const SETTINGS  = path.join(os.homedir(), '.claude', 'settings.json');
 const PACK_PATH = path.join(__dirname, '..', 'patterns', 'starter-pack.json');
@@ -223,6 +223,14 @@ function drainFromHook(input) {
   try { cwd = JSON.parse(String(input || '{}'))?.cwd; }
   catch { return; }
   if (typeof cwd !== 'string' || !cwd) return;
+  // Check for the file BEFORE taking the lock. The lock cycle is mkdir, an
+  // exclusive open, a write, an fsync, a close, a read and an unlink, measured
+  // at 3.7 ms, and it was paid on every single tool call to then discover that
+  // the project has no local approvals at all, which is the normal case: zero
+  // such files exist anywhere in the measured project tree. A missing file is
+  // not an error and never was, so this only reorders the cheap test ahead of
+  // the expensive one.
+  if (!fs.existsSync(path.join(cwd, '.claude', 'settings.local.json'))) return;
   try {
     createPolicyLock({ lockPath: POLICY_LOCK_PATH }).locked(() => {
       const report = drainWorkspace(cwd);
@@ -302,6 +310,7 @@ function drain(args) {
 // wildcarder can only generalize an approval that names one command, so this is
 // the half of the job that has to happen in the agent's instructions.
 function guidance(args) {
+  const { guidanceStatusAll, setGuidanceAll } = require('../src/agent-guidance');
   const cmd = (args[args.indexOf('--guidance') + 1] || 'status').toLowerCase();
 
   if (cmd === 'status') {
@@ -399,6 +408,8 @@ function guidance(args) {
 // separate switch: one is this repo's wording, the other is whatever recall.py last
 // compiled out of the memory corpus, so neither may turn the other off.
 function gates(args) {
+  const { spawnSync } = require('child_process');
+  const { gatesStatusAll, setGatesAll } = require('../src/agent-gates');
   const cmd = (args[args.indexOf('--gates') + 1] || 'status').toLowerCase();
 
   if (cmd === 'status') {
@@ -570,6 +581,10 @@ function bypass(args) {
 // No policy lock here: this writes Codex's config.toml, not Claude's
 // settings.json, so it shares no file with Auto Learn or the wildcarding pass.
 function codexMax(args) {
+  const {
+    CODEX_CONFIG, applyCodexMax, isCodexMaxOn, readApproval, sandboxMode,
+    readEnterpriseBundle, targetApproval,
+  } = require('../src/codex-max');
   const cmd = (args[args.indexOf('--codex-max') + 1] || 'status').toLowerCase();
   const text = fs.existsSync(CODEX_CONFIG) ? fs.readFileSync(CODEX_CONFIG, 'utf8') : null;
   const target = targetApproval(readEnterpriseBundle());
