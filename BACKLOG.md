@@ -74,25 +74,34 @@ windows x node 20 and 22.
 
 ## Open
 
-### `--max` and `--bypass` still spread from their own read
+### ~~`--max` and `--bypass` still spread from their own read~~ — FIXED 2026-09-10
 
-The TOTAL-LOSS half of this is fixed (2026-09-10): both now go through
-`readSettingsForWrite`, which refuses on present-but-unreadable instead of
-substituting `{}`. What remains is the original staleness exposure — they still
-compute a whole settings object from their own read and write it back, so they
-revert anything that landed in between. Lock-held, so safe against Auto Learn and
-each other; the exposure is against Claude Code, which never takes the lock and
-rewrites this file on every /model, /effort and approval. Lower frequency than the
-hook, same class of loss.
+Closed, and the entry was incomplete: it named two callers when there were
+**three**. The extension's `toggleMax` had the identical read-compute-write shape
+and is the one this entry missed.
 
-They do not fit `writeAllow` directly because their output is a whole settings
-object rather than an allow list. The fix is either a rebasing whole-object writer
-or reshaping them to return an allow list — and doing it would let `writeSettings`
-be deleted entirely, since these are its only two call sites.
+All three now go through `createSettingsWriter().writeTransform`, which re-reads,
+runs the transform against that read, and **compare-and-swaps on the raw bytes**
+with up to three attempts. The CAS is the part that matters and it is not what
+this entry would have led someone to build: a rebase alone closes nothing here,
+because the expensive work happens INSIDE the transform — `enableMaxAllow` runs
+`processAllowList`, measured 9.61 ms cold at 435 entries — so the read-to-write
+window survives any amount of rebasing. `auto-learn-manager` already used the CAS
+pattern for its own transactional write.
 
-Related, smaller: `--max status` and `--bypass status` still use
+`writeSettings` is deleted. Its two callers were these verbs, and removing the
+primitive matters as much as fixing them.
+
+Residual, deliberately left: `--max status` and `--bypass status` still use
 `readSettings() ?? {}` and so report `OFF` for a file they could not parse. Not
-destructive (no write), but a wrong answer stated confidently.
+destructive — no write — but a wrong answer stated confidently. One line each if
+someone wants it.
+
+**Do NOT file `auto-learn-manager`'s whole-object write as a fourth instance.**
+It is a different shape: it verifies `unchanged()` twice and throws rather than
+writing, holds the lock across read and write, and takes per-target backups.
+Rebasing it would break its transaction, because `updateClaudeClaims` computes
+the claims registry from the list it read.
 
 ### The coverage index's residual cost, and the trigger that replaced the old one
 
@@ -831,9 +840,9 @@ and not ours.
 
 | Item | Measured | Frequency |
 |---|---|---|
-| `require('./managed-policy')` is eager in `src/permissions.js:8` but only reachable from `maxLayers` (`--max status`, the MAX card) | module load 2.94 -> 2.33 ms | per hook call |
+| ~~`require('./managed-policy')` is eager~~ **DONE 2026-09-10.** The figure here was wrong twice: 0.61 ms recorded, 2.3 ms predicted by a stub harness that also pre-cached `permission-match`. Measured after the change: `require('src/permissions')` 4.803 -> 3.529 ms, i.e. **1.27 ms** per hook call | 1.27 ms | per hook call |
 | A fixed-point cache keyed on a CONTENT HASH of settings.json lets the hook skip the read, the module load and the pass | our-code p50 11.80 -> 2.46 ms; wall 62.3 -> 53.6 ms; 30/30 hits | per hook call |
-| `memoryReport()` runs TWICE per dashboard refresh — `extension.js:817` and the `gateSources` IIFE at `:2689`, in one `_push()` | 11.22 ms of a 21.57 ms refresh; hoisted 20.0 -> 14.7 ms, fs calls 82 -> 61 | per refresh |
+| ~~`memoryReport()` runs TWICE per dashboard refresh~~ **DONE 2026-09-10.** "11.22 ms" was the COMBINED cost of both calls, not the saving — the second is much cheaper because the file cache and the JIT are warm. Measured directly, 11 interleaved fresh processes: one call 6.99 ms, two 9.92 ms, so hoisting saves **2.93 ms** and 25 fs syscalls | 2.93 ms | per refresh |
 | `runWildcarding` takes the policy lock even on the unchanged path; the CLI hook was deliberately changed not to | lock cycle 3.72 ms of 9.60 ms, plus contention with Auto Learn | per settings.json write |
 
 Two notes worth keeping. The fixed-point cache **needs a decision, not just
@@ -928,6 +937,89 @@ Also still open: two webview switch arms nothing can reach — `autoLearnApply`
 - **`/cygdrive/d/...` is not normalized** by either uninstaller's path matcher.
   Every other spelling converges — I traced `node "D:/..."`, `/d/...`,
   backslashes and case. Cosmetic.
+
+## From the 2026-09-10 optimization and correctness pass
+
+Four phases landed (`1b41205..cd1f50c`): `managed-policy` off the hook path, the
+dashboard's doubled memory report, the last three whole-object writers, and the
+hook fixed-point cache. What follows is what was found and deliberately left.
+
+### The dashboard's remaining duplicate reads
+
+Deferred with a reason, not forgotten. `readSettings()` runs 3-4x per `_push`
+(`extension.js` at the push itself, in `autoLearnCardData`, in `frictionState`,
+and via `localCardData`'s `readUserSettings`) with the value already in hand at
+the top. Hoisting it needs signature changes in three more functions and would
+save ~0.3 ms — and `frictionState()` may legitimately want a fresh read, so
+threading a stale one trades a sub-millisecond gain for a possible correctness
+regression. Not worth it.
+
+Likewise `CLAUDE.md` and `~/.codex/AGENTS.md` are read 2x each because
+`guidanceCardData` and `gatesCardData` both walk `installedGuidanceTargets()`,
+and `gates.generated.md` is read 3-5x because `gatesStatus` (`src/agent-gates.js`)
+reads it twice in one expression when gates are installed.
+
+**The hazard that makes these riskier than they look:** `compiledGateCount()`
+calls `readCompiled()` with **no home argument** deliberately, per the
+no-singleton discipline documented in `agent-gates.js` and `agent-guidance.js` —
+paths are resolved at CALL time so a test with a mocked home reads the mocked
+file. A hoisted compiled-text value must be home-bound or a mocked-home test
+silently reads the real file and passes for the wrong reason.
+
+### The fixed-point cache's known limits
+
+Both accepted, both worth knowing before extending it.
+
+**A code change that preserves BOTH mtime and size is invisible.** The version
+segment stats `src/permissions.js` and `src/permission-match.js`. `git checkout`
+sets a fresh mtime so the motivating case (bisecting the generalizer) is covered;
+hashing the ~43 KB of source instead would close it for ~0.1 ms plus I/O.
+
+**The key covers `processAllowList` and nothing else.** Verified that the allow
+array plus the code in those two files is the complete input set —
+`patterns/starter-pack.json` is read at exactly one place, inside `--seed`, and
+no policy read feeds the pass. If the hit path is ever widened to skip anything
+else (the local-settings drain, managed policy, the MAX markers), those inputs are
+NOT in the key and a third stat is required. A hit currently skips only the
+generalization pass; `finish()` is still reached on all five of `run()`'s tails,
+so the drain gate is unaffected.
+
+**If the extension ever adopts it**, the cache belongs in memory, not in the
+shared file: the extension host is long-lived, and its copy of the generalizer is
+the generated mirror `vscode-extension/src/`, not the root path the version
+segment stats.
+
+### `writeFileAtomicSync` has two small defects of its own
+
+`src/permissions.js`: `lastErr` is assigned in the retry loop and **never read on
+any path**, so a non-retryable rename failure falls silently into the in-place
+write with the original error discarded. And the final `sleepSync(200)` is
+wasted — attempt 9 fails, it sleeps, then the loop ends with no rename following,
+so 200 ms of the 1100 ms worst case buys nothing.
+
+Worth stating plainly since it now has a second consumer's worth of scrutiny:
+that 1100 ms is `Atomics.wait`, an unyieldable thread block, and in the extension
+it blocks the extension-host thread. It is why the fixed-point cache uses a plain
+`fs.writeFileSync` instead.
+
+### Corpus hygiene, owned by concurrent sessions
+
+Not repo issues, recorded so the acceptance board's state is explained rather
+than mysterious. As of 2026-09-10 the board is 27 PASS / 2 FAIL, and both
+failures are in the shared memory corpus, edited by another session ~45 minutes
+before this run:
+
+- `ollama-api-gotchas.md` has `scope: global` with **no `<!-- gate -->` block**,
+  so it is resident-eligible and never compiled — the exact `no_gate` condition.
+  Either add a block or drop the scope.
+- Three files (`deletion-forensics-enabled.md`, `devtoolbox-shim-recovery.md`,
+  `pc-maintenance-deletion-history.md`) still link to
+  `[[pc-maintenance-is-report-only]]`, which was renamed to
+  `pc-maintenance-deletion-history`. A rename left the references behind.
+
+Deliberately NOT fixed here: those files were being actively edited, and writing
+into another session's in-flight work is the same class of defect this whole pass
+was about.
 
 ## Deferred by the maintainer
 
