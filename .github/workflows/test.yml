@@ -1,0 +1,53 @@
+name: Tests
+
+# Why this exists separately from "Release VSIX": that workflow runs the suite
+# only on `release: published`, and only on ubuntu. Both halves of that cost
+# this project a released defect. v1.4.1 was a one-fix patch for a lock-reclaim
+# boundary that compared `Date.now() - stat.mtimeMs <= staleMs` -- mtimeMs
+# carries sub-millisecond precision while Date.now() is whole milliseconds, so a
+# just-written file could read as being from the future. Windows hid it because
+# the intervening lock attempt burns more than a millisecond of file operations;
+# Linux did not. It reached a published release because nothing ran the suite
+# until release time, and 60 consecutive local runs of the broken code passed.
+#
+# So: run on every push and PR, and run on BOTH platforms. The suite has one
+# POSIX-only skip, which is expected on windows-latest.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: node ${{ matrix.node }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Never cancel the other platform on one failure: a platform-specific
+      # failure is the single most useful signal this matrix produces, and
+      # fail-fast would hide whether the other side agreed.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: ["20", "22"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # No install step on purpose: this project has no runtime dependencies and
+      # no devDependencies, so `npm ci` would fail for want of a lockfile. If a
+      # dependency is ever added, this is the line that has to change.
+      - name: Test
+        run: npm test
+
+      # The pack must stay closed under the Bash -> PowerShell mirroring rule.
+      # `npm test` already asserts this, but running the reporter surfaces WHAT
+      # drifted in the log rather than only that something did.
+      - name: Starter pack mirror check
+        run: node scripts/mirror-pack.js
