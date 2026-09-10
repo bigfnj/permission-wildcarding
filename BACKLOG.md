@@ -1105,20 +1105,22 @@ re-opens them:
 
 ### Open, ranked by frequency x cost
 
-All figures below are second-party measurements, cold for the hook (one fresh
-process per sample, interleaved arms) and warm for the extension (a long-lived
-host is the real regime). `min / p50`.
+**READ THE MEASUREMENT HAZARD BELOW BEFORE TRUSTING ANY fs FIGURE IN THIS
+TABLE.** Four of these ten items were re-measured on 2026-09-10 and three of them
+evaporated; the rows are annotated inline. Figures were second-party
+measurements, cold for the hook (one fresh process per sample, interleaved arms)
+and warm for the extension (a long-lived host is the real regime). `min / p50`.
 
 | # | Item | Cost | Frequency |
 |---|---|---|---|
-| 1 | **The dashboard refreshes while nobody can see it.** `_push()` guards `deactivated \|\| !this.view` but never `this.view.visible`, so all ~50 `refresh()` sites pay the full main-thread sync fs cost with the sidebar collapsed. The handler that makes skipping safe already exists (`view.onDidChangeVisibility`), so this is a `visible` check plus a dirty flag | 19.6 / 22.7 ms per push, avoidable entirely | ~50 sites, per settings change |
-| 2 | **`fullReport` re-reads the whole memory corpus every push.** 16 separate `.md` reads, versus 0.74 ms to `statSync` all 16 or 0.70 ms for one concatenated read. An mtime-keyed cache cuts ~32% of `_push()`. **This is a growth axis with no ceiling** — the corpus gained a file *during* the audit and `_push()` grew by 3 syscalls; at 50 memories it is ~25 ms per refresh | 6.98 / 7.96 ms | every push |
+| 1 | **The dashboard refreshes while nobody can see it** — but far less often than this row claims. **CORRECTED 2026-09-10:** `resolveWebviewView` installs `view.onDidDispose(() => { if (this.view === view) this.view = null; })`, and the view IS disposed when hidden (no `retainContextWhenHidden` in the manifest), so `refresh()`'s existing `!this.view` guard already covers a closed sidebar. What remains is the collapsed-but-not-disposed state and the lag before a disposal event is delivered. Still worth the one-line `!this.view.visible` guard as robustness, but NOT 22.7 ms x ~50 sites. Original text: `_push()` guards `deactivated \|\| !this.view` but never `this.view.visible`, so all ~50 `refresh()` sites pay the full main-thread sync fs cost with the sidebar collapsed. The handler that makes skipping safe already exists (`view.onDidChangeVisibility`), so this is a `visible` check plus a dirty flag | 19.6 / 22.7 ms per push, avoidable entirely | ~50 sites, per settings change |
+| 2 | ~~**`fullReport` re-reads the whole memory corpus every push.**~~ **REFUTED 2026-09-10 — 0.56 ms, not 7.96.** See the measurement hazard below: the 7.96 was measured in a temp `HOME`, where reads cost 6x what they cost in the real `~/.claude`. Measured properly, 17 files: read 1.46 ms p50 vs stat 0.90 ms, a **1.6x ratio, not 10.3x**. And the growth argument was wrong too — a stat stamp scales with the corpus exactly as the reads do, so it never removed the growth axis; it only shrinks the per-file constant from 0.086 to 0.053 ms. Original text: 16 separate `.md` reads, versus 0.74 ms to `statSync` all 16 or 0.70 ms for one concatenated read. An mtime-keyed cache cuts ~32% of `_push()`. **This is a growth axis with no ceiling** — the corpus gained a file *during* the audit and `_push()` grew by 3 syscalls; at 50 memories it is ~25 ms per refresh | 6.98 / 7.96 ms | every push |
 | 3 | **`runWildcarding` takes the policy lock before it knows there is work.** The extension already holds the bytes it just read, so an in-memory last-bytes compare answers the same question for ~0.005 ms. Read outside the lock, compare, lock only when a write is due — worth ~6.5 of its 9.3 ms, plus removing needless Auto Learn contention. A **file** cache is the wrong tool here | 3.39 / 3.72 ms lock (46% of it `fsyncSync`) + 2.38 / 2.76 ms redundant pass | per settings.json write |
-| 4 | **44 KB of verb bodies compiled on every hook call.** A minimal 0.9 KB hook doing only the hit path beats the real `bin/wildcard-perms` by this much (n=51, both signs agree). Splitting hook mode into a small entry that lazily requires `cli-verbs.js` is the only remaining hit-path win anyone demonstrated | 1.12 / 2.50 ms | **every Bash/PowerShell tool call** |
-| 5 | **`gates.generated.md` read 5x per push** — `gatesStatus` calls `readCompiled` for both `makeGatesBlock().body()` and `compiled:`, times 2 targets. My earlier deferral called this "sub-millisecond"; it is not | 1.55 / 1.69 ms | every push |
+| 4 | ~~**44 KB of verb bodies compiled on every hook call.**~~ **REFUTED 2026-09-10 — 0.00 ms.** Cold, one fresh process per sample, arms interleaved, all files in ONE directory on the repo's volume so the location effect below cannot favour either arm, n=61: the real 44.4 KB file (with `process.exit(0)` injected at the top, so only read+parse+compile is measured) is **min 43.87 / p50 48.54 ms**; a 1.8 KB stub is **44.00 / 48.73**; and a **212-byte** floor — nothing but the requires and one exit — is **43.01 / 48.48**. Going all the way to 212 bytes buys 0.86 ms at min and 0.06 ms at p50 against a ~48 ms process floor. V8 pre-parses and lazily compiles function bodies, so unexecuted verb code is free. A ~30 KB refactor of the most safety-critical file in the project, touching the dispatch branch that once silently rewrote the user's policy and exited 0, for nothing. **Do not re-derive this.** Original text: A minimal 0.9 KB hook doing only the hit path beats the real `bin/wildcard-perms` by this much (n=51, both signs agree). Splitting hook mode into a small entry that lazily requires `cli-verbs.js` is the only remaining hit-path win anyone demonstrated | 1.12 / 2.50 ms | **every Bash/PowerShell tool call** |
+| 5 | ~~**`gates.generated.md` read 5x per push**~~ **REFUTED 2026-09-10 — ~0.34 ms, not 1.69.** Same temp-`HOME` inflation. Original text: — `gatesStatus` calls `readCompiled` for both `makeGatesBlock().body()` and `compiled:`, times 2 targets. My earlier deferral called this "sub-millisecond"; it is not | 1.55 / 1.69 ms | every push |
 | 6 | **`coverLookupKeys` scans per character and is not memoized across the two sweeps.** The two `covers()` sweeps are 73% of `processAllowList`, and inside them the dominant cost is key generation, not matching: stage 3 makes 431 `covers()` calls but only 407 `sameRule` + 3 `ruleMatches`, so almost all of its 3.89 ms is walking 8018 arg chars to build 1479 keys — twice per pass, over the same 431 strings. A prototype using one native global-regex scan plus per-rule memoization was **differentially identical on 83 cases with every axis asserted non-degenerate** (probe fired in 18, fallback non-empty in 31, pruning in 20, generalizing in 28) | 1.62 / 1.84 ms of a 9.1 ms pass | every miss + every hintless push |
 | 7 | **`recallIndexStatus` is a second per-corpus-file loop** inside every push: 16 `statSync`, a 122 KB `recall_index.json` read, 3 `existsSync` probes. Should share the pass `memoryReport` already does | ~1.6 ms | every push |
-| 8 | **`CLAUDE.md` and `~/.codex/AGENTS.md` read twice each** — two `installedGuidanceTargets()` walks. Also not sub-millisecond in aggregate | ~0.89 ms | every push |
+| 8 | ~~**`CLAUDE.md` and `~/.codex/AGENTS.md` read twice each**~~ **REFUTED 2026-09-10 — ~0.17 ms, not 0.89.** Same temp-`HOME` inflation. Original text: — two `installedGuidanceTargets()` walks. Also not sub-millisecond in aggregate | ~0.89 ms | every push |
 | 9 | **The hook computes its key twice on a miss** — `isFixedPoint(bytes)` then `fixedPointKey(bytes)` again, so it stats both code files twice and hashes 17 KB twice. The fix was built and verified to write an identical key, and measured at **+0.57 / −0.39 ms, i.e. unmeasurable.** Worth doing as tidiness, not as performance | ~1.2 ms in-process, **0 end-to-end** | per settings change |
 | 10 | `settings.json` read and parsed 3x per push | 0.21 / 0.20 ms | every push |
 
@@ -1247,4 +1249,168 @@ already a fixed point, which is the only state in which it must fire zero times.
 - **~6650 leftover temp directories** had accumulated in `%TEMP%` on the dev
   machine from the leak fixed above. The leak is closed; clearing the historical
   residue is a one-time manual step, deliberately not automated.
+
+
+---
+
+## MEASUREMENT HAZARD: reads cost 6x more in `%TEMP%` than in `~/.claude`
+
+**Read this before benchmarking anything in this project, and before trusting any
+fs figure recorded in this file.**
+
+Byte-identical files, same count, same volume, both arms interleaved in one
+process with a rotating order, warm, n=31:
+
+| location | 17-file read | per file | 17-file stat | per file |
+|---|---|---|---|---|
+| `~/.claude/projects/.../memory` | **1.46 ms** p50 | 0.086 ms | 0.90 ms | 0.053 ms |
+| a `%TEMP%` copy of the same bytes | **8.54 ms** p50 | 0.502 ms | 0.83 ms | 0.049 ms |
+
+**Reads: 5.9x. Stats: unaffected.** So the ratio between "read every file" and
+"stat every file" is **1.6x in the real location and 10.3x in a temp dir** — which
+inverts the conclusion of any stat-stamp-versus-read optimization.
+
+I ruled out the obvious alternative explanation. A **fixed-path** `%TEMP%` corpus
+measured twice — once with the files freshly created, once with them established
+from the previous run — gave **7.69 ms and 7.72 ms**. Identical. It is not
+first-touch cost and not a Defender scan-on-create; it is the location,
+persistently. (Defender exclusions could not be read to confirm the mechanism —
+`Get-MpPreference` requires elevation — and the mechanism does not change the
+measurement.)
+
+**Why this mattered.** The 2026-09-10 optimization audit measured the extension
+"against a temp `HOME` mirroring the live corpus", so every fs figure it produced
+for the extension is inflated ~6x on its read component. That is the single cause
+of three refuted rows in the table above. The audit even observed the anomaly —
+"only `~/.claude/settings.json`, which every process on this box hammers, gets
+down to 0.159 ms" — and attributed it to that file being *frequently accessed*
+rather than to *where it lives*.
+
+**The rule:** any fs benchmark of this extension must run against a real
+`~/.claude`, or it will overstate every read by ~6x. A sandboxed `HOME` is correct
+for behaviour and required for isolation; it is invalid for timing. CPU-bound
+measurements (`processAllowList`, `coverLookupKeys`) are unaffected.
+
+## Whole-object settings.json writers: FIVE sites, not one
+
+The earlier entry naming `src/auto-learn-manager.js:1178-1218` as "a third
+unrebased whole-object writer" was right but incomplete, and the migration is
+harder than it looked.
+
+Sanctioned writers: `src/settings-write.js:166` (`writeAllow`, rebasing merge)
+and `:322` (`writeTransform`, CAS + verbatim).
+
+Unrebased whole-object writers still outstanding:
+
+| Site | Nature |
+|---|---|
+| `src/auto-learn-manager.js:1178-1181` → written `:1218` | The apply path. Has an `unchanged()` recheck at `:1213-1217`, so it is **check-then-act, not CAS** — a write landing between the check and the `renameSync` inside `atomicWrite` is undetected. When it *is* detected it **throws**, so a routine Claude Code `/model` write turns a legitimate apply into a user-visible error plus rollback churn. |
+| `src/auto-learn-manager.js:1500-1502` → written `:1546` | **A fourth site, previously unrecorded.** `releaseClaudeGrants`, for `undo()`. Same shape, and **weaker** — no `unchanged()` recheck before the write at all. |
+| `src/auto-learn-manager.js:1025` | `rollback()` writes back `change.before.content` — a full-file write of stale bytes, guarded only by an `afterHash` check at `:1021`. |
+| `src/auto-learn-manager.js:1565` | `undo()`'s inner rollback, same shape, `:1561` hash guard. |
+| `src/local-settings.js:245` | Different file (`.claude/settings.local.json`) but the same class — and **the widest read-to-write window in the repo**: `:201` read → `:245` write, spanning two `readUserSettings()` calls AND a full `writeAllow` to user settings. Claude Code writes this file too; it is where project-scoped "always approve" lands. `createSettingsWriter({ settingsPath: <local> })` would work here. |
+
+**Why the migration is blocked, and it is not a small thing.** `applyUnlocked`
+needs a **two-file atomic window**: `updateClaudeClaims` mutates `claims` in
+place, and both `nextManagedClaude` (persisted into `state.managedClaude`) and
+the claims *file* content are derived from that same read. Neither existing
+writer supports two files. `writeTransform`'s retry loop would re-run only the
+settings.json transform and leave attempt N-1's claims content — **a silently
+corrupt claims registry, which is worse than today's throw.**
+
+Three further blockers for whoever attempts it:
+- Neither writer takes a backup, and `undo()` depends on `beforeHash` and
+  `existed`. `change.afterHash` must be recorded from what the writer *actually
+  wrote*, not from `change.content`, or `undo()`'s `untouched` test misclassifies.
+- `rollback()` at `:1025` blindly restores `change.before.content`. If the writer
+  rebased onto fresher bytes, rollback reverts the concurrent change — the exact
+  bug, at the failure site.
+- The new vanish guard in `writeTransform` would make `rollback()` **re-create a
+  settings.json an external actor deliberately deleted.** That is a new defect
+  the migration would introduce, and no existing test would catch it.
+
+**Prerequisite, now being addressed:** `grep "Policy changed" test/` returns
+nothing. The entire "detect and throw" behaviour that justifies this writer's
+safety is unpinned, so swapping it for a retrying writer would pass the full
+suite silently.
+
+## `runWildcarding`'s lock: the constraint that decides any refactor
+
+Recorded because it is easy to get wrong and the failure is a data loss, not a
+slowdown. `writeAllow` replays a **delta computed against the caller's
+snapshot**, and its own note at `src/settings-write.js:145-152` names this
+caller: *"WRONG for one whose whole output is a function of the list it read …
+Such a caller must re-read and recompute first."*
+
+Today `runWildcarding` satisfies that **by accident of structure** — its
+`readSettings()` happens to sit inside the lock, so the snapshot is nearly
+`latest`. **Moving the read out of the lock without an authoritative in-lock
+re-read and recompute reintroduces the MAX / `Bash(npm test)` deletion bug**
+documented at `bin/wildcard-perms:354-368`.
+
+Two further traps for that refactor, both real:
+- **Key on file BYTES, not the parsed allow list.** The unchanged path is where a
+  hand-added deny rule first reaches the backup (`extension.js:2360-2363`); a
+  key on the allow list makes a deny-only edit a hit, and that rule never gets
+  backed up. Two byte sequences can also parse equal.
+- **Keep `backupPolicy` on the unchanged path.** It is the only thing that
+  rebuilds a *deleted* backup — not hypothetical: on 2026-09-09 every directory
+  under `~/.claude` was recreated and this path is what restored the mirror. It
+  self-short-circuits when the union is unchanged, so it costs a read, not a
+  write. Skipping it would also make five `test/policy-backup.test.js` tests go
+  **vacuous rather than fail**, which is the "one early return away from becoming
+  vacuous" hazard already recorded for that file.
+- `lockedRetries` is reset only on the lock-completed path, so an early return
+  that never reaches the lock strands the retry budget.
+
+An in-memory memo (skip the pass entirely, not just the lock) carries five
+further hazards and is deliberately NOT being done: a deleted backup never
+rebuilt, deny-only edits lost, poisoning the memo on a busy-lock-deferred pass
+(the one way to genuinely *miss* a generalization — only ever record a
+"no work due" verdict from the same read, never after a write, a busy lock, or a
+`SETTINGS_UNREADABLE`), the `lockedRetries` reset, and array aliasing
+(`processAllowList` returns its input array for an empty/non-array input).
+
+Also worth folding in eventually: activation takes **two** lock acquisitions
+back to back — `runWildcarding()` then `drainLocal()` — which is the shape
+`bin/wildcard-perms:311-329` was deliberately fixed away from for the hook.
+
+## `preMax` is misnamed, and the audit's read of it was wrong too
+
+`vscode-extension/extension.js:2254`. Two corrections:
+
+- **It cannot be reverted.** `f041031` deleted the `readSettings()` call
+  entirely, so there is no in-scope expression to revert to. The mutation that
+  would actually test the change — `preMax = <the earlier read's allow>` —
+  **cannot be written against the current code.** The audit's two surviving
+  mutants therefore do not test the change; they test whether `detectMcpServers`
+  matters.
+- **The name and its comment are both wrong.** When turning MAX *off*,
+  `wroteOnto?.permissions?.allow` is the **MAX-ON on-disk list**, not the pre-MAX
+  list — the pre-MAX list lives only in the sidecar snapshot and is re-unioned by
+  `disableMaxAllow`. The comment at `:2249-2252` repeats the error.
+
+Why both mutants survive, verified by running the real functions on both existing
+fixtures (byte-identical purge sets for all three variants):
+`buildMaxAllowSet`'s first seven elements are the `MAX_ALLOW_CORE` **constant**,
+so only the `mcp__*` tail varies — and `detectMcpServers` matches the *prefix*
+`mcp__S__`, so any specific `mcp__S__tool` surviving into the restored list still
+yields server `S`. The only discriminating input is an `mcp__<S>__*` blanket that
+lands **while MAX is on**, for a server with no other `mcp__S__`-prefixed entry.
+
+## Zero test coverage on two load-bearing branches
+
+Both found while scoping items that were then dropped:
+
+- **`bin/wildcard-perms:57-73`** — `--help`, `-h`, `--version`, `-V` and the
+  unrecognized-option guard have **no test anywhere**. That guard exists because
+  its absence once "silently rewrote the user's permission policy and exited 0".
+- **`src/auto-learn-manager.js:1207` and `:1216`** — see the whole-object writer
+  section above.
+
+Also unpinned and worth knowing: `fullReport` in `vscode-extension/memoryLint.js`
+has **no direct test at all**. Seven test files stub `memoryReport` to a zero-arg
+function and only `memory-lint-watchers.test.js` requires the real module, for
+its watcher behaviour. A function performing 17+ file reads per dashboard push
+is entirely uncovered.
 
