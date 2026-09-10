@@ -13,7 +13,47 @@ written with 43 `prefix_rule` entries, state `applied.claude` 23 and
 `applied.codex` 50, `lastApplication` set across `claude`, `claude-claims` and
 `codex`, Review count back to 0.
 
+The allow/deny backup is mirrored off-tree. Added 2026-09-09 after the event
+below: the primary copy at `~/.claude/backups/allow-list.latest.json` sits inside
+the directory it exists to survive the reset of, which is why the 423 live entries
+came back that day on the extension's in-memory copy rather than off disk. It now
+dual-writes to `~/.permission-wildcarding/allow-list.latest.json`, overridable via
+`permissionWildcarding.backupMirrorPath` for another volume; restore reads the
+primary and falls back to the mirror.
+
+Mutation-tested rather than merely green, since three of the four assertions are
+about a second file that a naive implementation writes anyway: dropping the mirror
+write kills 3 tests, dropping the read fallback kills exactly the recovery test,
+and replacing the fallback with a **union** kills exactly the stale-mirror test —
+that last one added because the fallback-not-union decision was initially
+untested, and a union would resurrect a deliberately pruned entry. Suite 290
+tests, 289 pass, 1 POSIX-only skip, 0 fail.
+
 ## Open
+
+### Nothing at all protects the transcript or memory corpora
+
+Same event, and this is the expensive half. `~/.claude/projects/**/*.jsonl` went
+to **7 files / 6 MB**, oldest 18:57 that day — and the sharpest measure of that
+is in this file: the `state.candidates` entry below recorded **710 cursors
+against exactly 710 files** on 2026-09-09, hours earlier. So 710 transcripts
+became 7. The corpus behind every measurement this project has published (largest
+single transcript 70.4 MB, 6,870 observations, 249 runs) is gone. The file-memory
+corpus went to one memory with zero standing orders, taking the 6 compiled gates
+with it.
+
+Two knock-on effects worth knowing before trusting anything derived from state:
+the learner rebuilt from what survives, so `candidates` is 50 where that entry
+says 285, and `observationHashes` is 352 where it was capped at 20,000. **Every
+numeric trigger in this file is now far from firing for the wrong reason** — not
+because the pressure eased, but because the evidence was deleted.
+
+`recall.py` already supports `RECALL_MEMORY_DIR`, so pointing the *reader* off-tree
+is supported. It does not solve it alone: Claude Code writes memories to
+`~/.claude/projects/<workspace>/memory/` and that path is not configurable, so
+durability needs the directory itself to live elsewhere (a junction to a git repo
+on `D:` keeps both defaults intact and survives a reset as data plus one junction
+to recreate). The corpus is private, so it must not go in this public repo.
 
 ### The claims registry can claim an entry the allow list no longer holds
 
