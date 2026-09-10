@@ -213,6 +213,51 @@ test('turning MAX off purges blanket entries from the backup', async (t) => {
   }
 });
 
+// The purge above is right about Bash(*) and PowerShell(*) and used to be wrong
+// about everything else in the MAX set. Read(*), Edit, Write, WebFetch(*),
+// WebSearch and every mcp__<server>__* are ordinary grants that people hold
+// without ever touching MAX — restoreFromBackup says so itself: "The full MAX set
+// (Read(*), Edit, Write, …) is legitimately used outside MAX too, so only the two
+// markers that uniquely signal MAX-on are excluded." One MAX round trip forgot
+// the user's copies of them, and a backup entry that is silently dropped is only
+// discovered on the day it was needed.
+test('MAX off forgets what MAX added, not the same entries the user already had', async (t) => {
+  const env = setup(t);
+  // Four of these overlap the MAX blanket set and belong to the user.
+  const held = ['Read(*)', 'Edit', 'WebSearch', 'mcp__context7__*'];
+  const userPerms = ['Bash(git status *)', 'Bash(rg *)', ...held];
+  env.write({ permissions: { allow: userPerms, deny: DENY } });
+
+  const app = harness(env.tempHome);
+  try {
+    await app.commands.get('permission-wildcarding.runNow')();
+    await app.commands.get('permission-wildcarding.toggleMax')();
+    // The watcher would do this; run the pass so the blanket set reaches the backup.
+    await app.commands.get('permission-wildcarding.runNow')();
+    const whileMax = JSON.parse(fs.readFileSync(env.backupPath, 'utf8')).allow;
+    assert.ok(whileMax.includes('Write'), 'precondition: MAX added Write and the backup caught it');
+
+    await app.commands.get('permission-wildcarding.toggleMax')();
+    const live = env.read().permissions.allow;
+    const saved = JSON.parse(fs.readFileSync(env.backupPath, 'utf8')).allow;
+
+    // MAX-off restores the pre-MAX snapshot, so these are live again — an entry
+    // that is live and absent from the high-water mark is unrecoverable.
+    for (const permission of held) {
+      assert.ok(live.includes(permission), `precondition: ${permission} is live after MAX off`);
+      assert.ok(saved.includes(permission), `${permission} is the user's and keeps its backup cover`);
+    }
+    // What MAX itself introduced is gone from settings.json, so it must be gone
+    // from the backup too or the guard re-asserts it and MAX comes back on.
+    for (const added of ['Bash(*)', 'PowerShell(*)', 'Write', 'WebFetch(*)']) {
+      assert.ok(!live.includes(added), `precondition: MAX off removed ${added}`);
+      assert.ok(!saved.includes(added), `${added} was MAX's, so it leaves the backup`);
+    }
+  } finally {
+    await app.dispose();
+  }
+});
+
 // Second layer of defense: even if Bash(*)/PowerShell(*) somehow end up in the
 // backup (stale file, pre-fix version), restoreFromBackup must never silently
 // write them back, because MAX is an explicit mode choice, not a permission.
