@@ -110,6 +110,17 @@ function fullReport(dir, conf) {
 
   const valid = new Set();
   let all = '';
+  // How many memories the gates compiler could actually take. Counted HERE
+  // because this loop already reads every body, so it costs nothing extra, and
+  // because the alternative was a UI that offers "Compile gates" on a corpus
+  // with nothing to compile — a modal, a compile and a warning toast to learn
+  // what a disabled button could have said.
+  //
+  // The rule mirrors recall.py's _compile_gates_text: selection is on `scope`
+  // (NOT type) plus the presence of a gate block. Kept deliberately literal so
+  // the two are easy to compare; recall.py stays the authority that actually
+  // compiles, and this is only ever used to decide whether to offer the action.
+  let gateSources = 0;
   for (const f of files) {
     let raw;
     try { raw = fs.readFileSync(path.join(dir, f), 'utf8'); } catch { continue; }
@@ -117,11 +128,12 @@ function fullReport(dir, conf) {
     valid.add(norm(f.slice(0, -3)));
     const nm = raw.slice(0, 400).match(/^\s*name:\s*(.+)$/m);
     if (nm) valid.add(norm(nm[1].trim().replace(/^["']|["']$/g, '')));
+    if (/^\s*scope:\s*global\s*$/m.test(raw) && raw.includes('<!-- gate -->')) gateSources += 1;
   }
   const unresolved = [...new Set(
     [...stripCode(all).matchAll(/\[\[([^\]]+)\]\]/g)].map((m) => m[1]).filter((l) => !valid.has(norm(l)))
   )].sort();
-  return { ...fast, fileCount: files.length, unresolved };
+  return { ...fast, fileCount: files.length, unresolved, gateSources };
 }
 
 class MemoryLint {

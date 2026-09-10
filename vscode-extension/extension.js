@@ -1817,6 +1817,13 @@ function activate(context) {
     vscode.commands.registerCommand('permission-wildcarding.restoreBackup', () => restoreFromBackup())
   );
 
+  // The full wildcard list with a filter box, for when the capped sidebar list
+  // is not the right shape — reachable from the palette and from the sidebar's
+  // "and N more" affordance.
+  context.subscriptions.push(
+    vscode.commands.registerCommand('permission-wildcarding.showWildcards', () => showWildcardPicker())
+  );
+
   // Keep the legacy command id as an alias; Auto Learn is the only history scanner.
   context.subscriptions.push(
     vscode.commands.registerCommand('permission-wildcarding.scanHistory', () => runAutoLearnScan(true)),
@@ -2633,6 +2640,13 @@ function gatesCardData() {
       readable: states.some((state) => state.readable),
       compiled: states.some((state) => state.compiled),
       count: compiledGateCount(),
+      // Whether compiling could produce anything at all, so the card can decline
+      // to offer an action that cannot succeed. Undefined when the memory report
+      // is unavailable, which renderGates treats as "unknown, so still offer it"
+      // rather than as zero.
+      gateSources: (() => {
+        try { return memoryReport().report?.gateSources; } catch { return undefined; }
+      })(),
       agents: states.filter((state) => state.on).map((state) => state.agent),
       targets: states.map((state) => state.agent),
       path: states.map((state) => state.path.replace(os.homedir(), '~')).join(', '),
@@ -2640,6 +2654,82 @@ function gatesCardData() {
   } catch {
     return null;
   }
+}
+
+// One removal path, shared by the dashboard's ✕ and the QuickPick below, so the
+// two can never diverge on the backup-first ordering that makes a prune stick.
+function removeAllowEntry(perm) {
+  if (!perm) return false;
+  const settings = readSettings();
+  if (!settings) return false;
+  const allow = (settings.permissions?.allow ?? []).filter((p) => p !== perm);
+  try {
+    // Drop it from the backup first. The backup is a high-water mark, so
+    // without this the entry would come straight back on the next restore and
+    // the policy guard would keep reporting it as missing — a deliberate prune
+    // must be an instruction, not damage to recover from.
+    forgetFromBackup([perm]);
+    writeAllow(settings, allow);
+    lastRun = Date.now();
+    vscode.window.setStatusBarMessage(`$(shield) permission-wildcarding: removed ${perm}`, 4000);
+    return true;
+  } catch (err) {
+    vscode.window.showErrorMessage(`permission-wildcarding: remove failed — ${err.message}`);
+    return false;
+  }
+}
+
+// The whole wildcard list, with a filter box. The sidebar shows the first dozen
+// and defers here, because the list is longest exactly when the tool is working:
+// 404 of 423 entries on the machine this was built for, the longest 137
+// characters, wrapping to three lines in a 320px column. A QuickPick is the
+// right shape — full window width, fuzzy filter, keyboard-first — and it is
+// already this extension's idiom for Review, derived guidance and the agent
+// pickers.
+async function showWildcardPicker() {
+  const settings = readSettings();
+  if (!settings) {
+    vscode.window.showWarningMessage(
+      'permission-wildcarding: settings.json is missing or unreadable.');
+    return;
+  }
+  const allow = Array.isArray(settings.permissions?.allow) ? settings.permissions.allow : [];
+  // The dashboard's own classification, so the sidebar count and the picker
+  // count can never disagree.
+  const wildcards = allow.filter((p) => p.includes('*')).sort();
+  if (!wildcards.length) {
+    vscode.window.showInformationMessage(
+      'permission-wildcarding: no wildcard entries yet — approve some commands first.');
+    return;
+  }
+  const pick = await vscode.window.showQuickPick(
+    wildcards.map((permission) => ({
+      label: permission,
+      // The tool name, so typing "powershell" narrows to that half of the list.
+      description: (/^([A-Za-z]+)\(/.exec(permission) || [, 'other'])[1],
+    })),
+    {
+      title: `Tracked wildcards (${wildcards.length} of ${allow.length} allow entries)`,
+      placeHolder: 'Filter by command or tool — pick one to remove it',
+      matchOnDescription: true,
+    });
+  if (!pick) return;
+
+  // Confirmed, unlike the sidebar's hover-revealed ✕, because Enter on a
+  // filtered list is easy to mis-hit and this is NOT recoverable: the prune
+  // deliberately drops the entry from the high-water-mark backup too, so
+  // "Restore prunes from backup" will not bring it back.
+  const choice = await vscode.window.showWarningMessage(
+    'Remove this wildcard?',
+    {
+      modal: true,
+      detail: `${pick.label}\n\nIt is dropped from settings.json and from the backup, so a `
+        + 'later restore will not reinstate it. Claude Code will prompt again for commands '
+        + 'this covered.',
+    },
+    'Remove');
+  if (choice !== 'Remove') return;
+  if (removeAllowEntry(pick.label)) dashboard?.refresh();
 }
 
 // ── dashboard (Activity Bar webview) ────────────────────────────────────────────
@@ -2673,6 +2763,7 @@ class WildcardingViewProvider {
         case 'drainLocal':   vscode.commands.executeCommand('permission-wildcarding.drainLocal'); break;
         case 'toggleGuidance': vscode.commands.executeCommand('permission-wildcarding.toggleGuidance'); break;
         case 'toggleGates': vscode.commands.executeCommand('permission-wildcarding.toggleGates'); break;
+        case 'showWildcards': vscode.commands.executeCommand('permission-wildcarding.showWildcards'); break;
         case 'refresh':      this.refresh(); break;
         case 'remove':       this._remove(msg.value); break;
       }
@@ -2754,22 +2845,7 @@ class WildcardingViewProvider {
 
   // Remove a single permission entry (the per-row prune button).
   _remove(perm) {
-    if (!perm) return;
-    const settings = readSettings();
-    if (!settings) return;
-    const allow = (settings.permissions?.allow ?? []).filter((p) => p !== perm);
-    try {
-      // Drop it from the backup first. The backup is a high-water mark, so
-      // without this the entry would come straight back on the next restore and
-      // the policy guard would keep reporting it as missing — a deliberate prune
-      // must be an instruction, not damage to recover from.
-      forgetFromBackup([perm]);
-      writeAllow(settings, allow);
-      lastRun = Date.now();
-      vscode.window.setStatusBarMessage(`$(shield) permission-wildcarding: removed ${perm}`, 4000);
-    } catch (err) {
-      vscode.window.showErrorMessage(`permission-wildcarding: remove failed — ${err.message}`);
-    }
+    removeAllowEntry(perm);
     this.refresh();
   }
 
@@ -2853,6 +2929,9 @@ class WildcardingViewProvider {
   li:hover .x { visibility: visible; }
   li .x:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-errorForeground); }
   .empty { color: var(--vscode-descriptionForeground); font-style: italic; padding: 6px; }
+  li.more { color: var(--vscode-textLink-foreground); cursor: pointer; font-size: 11px;
+            padding: 6px; }
+  li.more:hover { text-decoration: underline; }
   #memDir { word-break: break-all; }
   .memissues { margin: 8px 2px 6px; font-size: 11px; }
   .memlink { color: var(--vscode-textLink-foreground); cursor: pointer; text-decoration: none; }
@@ -3050,6 +3129,9 @@ class WildcardingViewProvider {
   // CLOSED deliberately: the collapsed summary on the right of each row already
   // answers "where does this stand?", so opening a row is for acting on it, not
   // for reading it. That is the whole reason the summaries exist.
+  // Enough to see the shape of the list without it becoming the panel.
+  const LIST_CAP = 12;
+
   const st = vscode.getState() || {};
   const openRows = new Set(Array.isArray(st.open) ? st.open : []);
   const bodyFor = (key) => $('body' + key.charAt(0).toUpperCase() + key.slice(1));
@@ -3329,12 +3411,18 @@ class WildcardingViewProvider {
         ? 'your standing orders, resident every session · ' + g.path
         : g.count + ' compiled gate' + (g.count === 1 ? '' : 's') + ' waiting to be installed';
     const btn = $('gatesBtn');
-    btn.disabled = !g.readable;
+    // Nothing compiled AND no memory the compiler could take: offering "Compile
+    // gates" here spent a modal, a compile and a warning toast to end up saying
+    // "nothing to install". Say it on the button instead. gateSources is only
+    // trusted when it is a number — undefined means the memory report was
+    // unavailable, and an unknown count must still offer the action.
+    const noSources = g.gateSources === 0;
+    btn.disabled = !g.readable || (!g.compiled && noSources);
     btn.classList.toggle('on', !!g.on);
     // Same treatment as guidance: installed-and-current is the resting state, so the button
     // stops shouting and the ellipsis warns that a confirm follows.
     btn.classList.toggle('managed', !!g.on && !!g.current);
-    btn.textContent = !g.compiled ? 'Compile gates'
+    btn.textContent = !g.compiled ? (noSources ? 'No gates to compile' : 'Compile gates')
       : g.on ? (g.current ? 'Remove gates…' : 'Refresh from memory')
         : 'Add to ' + g.targets.join(' + ') + ' instructions';
   }
@@ -3368,7 +3456,22 @@ class WildcardingViewProvider {
       li.textContent = 'No wildcards yet — approve some commands, or click Wildcard Now.';
       list.appendChild(li);
     } else {
-      for (const w of d.wildcards) {
+      // Capped, because this list is a symptom of the tool WORKING: on this
+      // machine it is 404 of 423 entries and the longest is 137 characters,
+      // which wraps to three lines in a 320px sidebar — 10,796 px of list
+      // inside a panel the wrong shape for it. The full set gets a QuickPick,
+      // where the window is wide and there is a filter box.
+      //
+      // Ordered for the PREVIEW, not alphabetically. The list arrives sorted,
+      // and quoted absolute paths sort ahead of letters, so a plain slice showed
+      // twelve quoted-absolute-path blobs — the least
+      // recognisable entries in the set, making the panel look like noise, which
+      // is the exact complaint the cap exists to answer. Bare command families
+      // first, everything else after, each half still alphabetical.
+      const simple = (p) => /^[A-Za-z]+\([A-Za-z][\w.-]*[ :]\*\)$/.test(p);
+      const preview = [...d.wildcards.filter(simple), ...d.wildcards.filter((p) => !simple(p))]
+        .slice(0, LIST_CAP);
+      for (const w of preview) {
         const li = document.createElement('li');
         const code = document.createElement('code');
         code.textContent = w;
@@ -3376,6 +3479,15 @@ class WildcardingViewProvider {
         x.className = 'x'; x.textContent = '✕'; x.title = 'Remove this entry';
         x.addEventListener('click', () => vscode.postMessage({ type: 'remove', value: w }));
         li.appendChild(code); li.appendChild(x);
+        list.appendChild(li);
+      }
+      const hidden = d.wildcards.length - LIST_CAP;
+      if (hidden > 0) {
+        const li = document.createElement('li');
+        li.className = 'more';
+        li.title = 'Open the full list with a filter box';
+        li.textContent = 'and ' + hidden + ' more — search all ' + d.wildcards.length + ' →';
+        li.addEventListener('click', () => vscode.postMessage({ type: 'showWildcards' }));
         list.appendChild(li);
       }
     }

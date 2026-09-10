@@ -47,6 +47,11 @@
         "icon": "$(history)"
       },
       {
+        "command": "permission-wildcarding.showWildcards",
+        "title": "Permission Wildcarding: Show all tracked wildcards",
+        "icon": "$(list-filter)"
+      },
+      {
         "command": "permission-wildcarding.scanHistory",
         "title": "Permission Wildcarding: Auto Learn - Scan now (compatibility command)",
         "icon": "$(search)"
