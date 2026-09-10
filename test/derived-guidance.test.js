@@ -11,7 +11,7 @@ const assert = require('node:assert/strict');
 
 const {
   deriveMitigations, markersFor, renderMitigation, DEFAULT_THRESHOLD, DEFAULT_LIMIT,
-  installedDerivedIds, reconcileDerived,
+  installedDerivedIds, reconcileDerived, cleanRule,
 } = require('../src/derived-guidance');
 const { GUIDANCE_BODY, BEGIN, END } = require('../src/agent-guidance');
 
@@ -254,4 +254,64 @@ test('a derived block never disturbs the static shell-style block', () => {
   assert.deepEqual(swept.removed, ['batch-file-edits']);
   assert.ok(swept.text.includes(shell.trimEnd()), 'and survives the sweep too');
   assert.deepEqual(installedDerivedIds(swept.text), []);
+});
+
+// ── The rule text is not this repo's ─────────────────────────────────────────
+// It is read from `~/.claude/remote-settings.json`, a local client-refreshed
+// cache, and it lands inside a code span in the user's own instruction file. The
+// two sources that feed `costliestRules` disagreed about sanitising it: the
+// managed-hits side cleans it (`auto-learn-manager.js:1391`), the inert-family
+// side reaches `addCost` at :787 as `String(rule)`. So any local process able to
+// write that cache could choose text that closed the code span, broke the block,
+// or forged a marker line.
+
+test('the rule text is cleaned before it can reach a code span', () => {
+  assert.equal(cleanRule('Edit(**/*.ps1)'), 'Edit(**/*.ps1)', 'an ordinary rule is untouched');
+  // Same transform the hit table already applies: control characters and
+  // whitespace runs collapse to one space, trimmed, 200 characters.
+  assert.equal(cleanRule('  Bash(a\nb\tc)  '), 'Bash(a b c)');
+  assert.equal(cleanRule('Bash(a\u0000b\u007fc)'), 'Bash(a b c)');
+  assert.equal(cleanRule('x'.repeat(400)).length, 200);
+  // Plus the two things a code span inside a marker-fenced block cares about: a
+  // backtick closes the span, so everything after it renders as instructions
+  // rather than as a quoted rule, and `<!--` opens a comment that swallows the
+  // text after it — including a marker line.
+  assert.equal(cleanRule('Bash(`whoami`)'), 'Bash(whoami)');
+  assert.equal(cleanRule(`Bash(${END})`),
+    'Bash(&lt;!-- END permission-wildcarding: shell style --&gt;)');
+  const hostile = `Edit(**/*.ps1 \`x\`\n${markersFor('batch-file-edits').end})`;
+  assert.equal(cleanRule(cleanRule(hostile)), cleanRule(hostile), 'idempotent');
+  for (const bad of [null, undefined, 42, {}, []]) assert.equal(cleanRule(bad), '');
+});
+
+test('a hostile rule reaches the instruction file defused, and the advice survives', () => {
+  const hostile = `Edit(**/*.ps1 \`x\`\n${markersFor('batch-file-edits').end})`;
+  const derived = deriveMitigations([
+    { rule: hostile, prompts: 300, decision: 'ask', tools: ['Edit'] },
+  ], { limit: 10 });
+
+  // Sanitising must not silently drop the advice: the shape is still an Edit.
+  assert.equal(derived.length, 1);
+  assert.equal(derived[0].id, 'batch-file-edits');
+  assert.doesNotMatch(derived[0].rule, /[`\r\n]/,
+    'no backtick to close the code span, no newline to break the block');
+  assert.doesNotMatch(derived[0].body, /[\r\n]/, 'the body stays one line');
+  assert.doesNotMatch(derived[0].body, /<!--|-->/,
+    'and carries no comment delimiter to swallow a marker line');
+  // The span closes where the rule ends, so nothing the rule carried is left
+  // rendering as instructions.
+  assert.ok(derived[0].body.startsWith(`\`${derived[0].rule}\` is a managed \`ask\``));
+  assert.match(derived[0].body, /Measured 300 prompts/);
+
+  const notes = '# my notes\n\nkeep these\n';
+  const { begin, end } = markersFor('batch-file-edits');
+  const installed = reconcileDerived(notes, derived, { accepted: ['batch-file-edits'] });
+  assert.equal(installed.text.split(begin).length - 1, 1, 'exactly one begin marker');
+  assert.equal(installed.text.split(end).length - 1, 1, 'and exactly one end marker');
+  assert.deepEqual(installedDerivedIds(installed.text), ['batch-file-edits']);
+  // Idempotent, so a forged marker cannot start the truncated-range accumulation.
+  assert.equal(reconcileDerived(installed.text, derived,
+    { accepted: ['batch-file-edits'] }).changed, false);
+  // And the user's own file comes back byte for byte.
+  assert.equal(reconcileDerived(installed.text, [], { accepted: [] }).text, notes);
 });

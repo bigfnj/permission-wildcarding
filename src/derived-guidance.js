@@ -31,6 +31,34 @@ const { writeFileAtomicSync } = require('./permissions');
 
 const DEFAULT_THRESHOLD = 50;
 const DEFAULT_LIMIT = 3;
+const RULE_LIMIT = 200;
+
+// The rule text is not this repo's, and it ends up interpolated into a code span in the
+// user's own instruction file. `~/.claude/remote-settings.json` is a local, client-refreshed
+// cache, so any local process that can write it picks that string — and only one of the two
+// sources that feed `costliestRules` sanitises it: the managed-hits side goes through
+// `clean(observation.managedRule, 200)` in `auto-learn-manager.js:1391`, while the
+// inert-family side reaches `addCost` at :787 as `String(rule)`. Sanitising here, at the
+// interpolation rather than at one of the suppliers, is what makes the block safe whichever
+// path produced the rule.
+//
+// Same transform the hit table already applies — control characters and whitespace runs
+// collapse to a single space, trimmed, 200 characters — plus the two things a code span
+// inside a marker-fenced block cares about. A backtick closes the span, so everything after
+// it renders as instructions rather than as a quoted rule; `<!--` opens an HTML comment that
+// swallows the text after it, including a marker line. Truncation happens first so it can
+// never cut one of the escapes in half.
+function cleanRule(value) {
+  if (typeof value !== 'string') return '';
+  return value
+    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, RULE_LIMIT)
+    .replace(/`/g, '')
+    .replace(/<!--/g, '&lt;!--')
+    .replace(/-->/g, '--&gt;');
+}
 
 // Fetch tools, which the docs recommend gating rather than allow-listing. Kept
 // separate from the generic command case because the advice is different: a
@@ -70,6 +98,10 @@ function preamble(entry) {
   const decision = entry.decision === 'deny' ? 'deny' : 'ask';
   const extra = Array.isArray(entry.rules) && entry.rules.length > 1
     ? `, plus ${plural(entry.rules.length - 1, 'more rule')} of the same shape` : '';
+  // This is the line that puts an outside string inside a code span, and `entry.rule` is
+  // already the sanitised text: `deriveMitigations` cleans every rule before it builds the
+  // entry this reads, and nothing else in the module renders a body. One boundary, so
+  // there is exactly one place to check — keep it that way rather than cleaning here too.
   return `\`${entry.rule}\` is a managed \`${decision}\`${extra}, which outranks every ` +
     `user allow entry, so no wildcard can stop it. Measured ${plural(entry.prompts, 'prompt')}.`;
 }
@@ -132,7 +164,9 @@ function deriveMitigations(costliestRules, options = {}) {
   const groups = new Map();
   const seenRules = new Set();
   for (const item of rules) {
-    const rule = typeof item?.rule === 'string' ? item.rule : '';
+    // Sanitised before anything keys on it, so the grouping, the emitted `rule`/`rules`
+    // and every rendered body all carry the same defended text.
+    const rule = cleanRule(item?.rule);
     const prompts = Number(item?.prompts) || 0;
     if (!rule || prompts < threshold || seenRules.has(rule)) continue;
     const tool = toolOf(rule);
@@ -320,7 +354,7 @@ function setDerivedGuidance(mitigations, accepted, {
 }
 
 module.exports = {
-  deriveMitigations, markersFor, renderMitigation,
+  deriveMitigations, markersFor, renderMitigation, cleanRule,
   mitigationBlock, installedDerivedIds, reconcileDerived,
   derivedStatus, setDerivedGuidance,
   DEFAULT_THRESHOLD, DEFAULT_LIMIT,
