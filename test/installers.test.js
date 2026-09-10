@@ -53,6 +53,22 @@ function embeddedModule() {
   return sh.slice(bodyStart, end);
 }
 
+// The hook command handed to install.sh's embedded module. Named, not inlined,
+// so `what came out is exactly what went in` can be an EXACT-EQUALITY assertion
+// below rather than a shape guess with a false-reject surface.
+const HOOK_CMD = '/repo/bin/wildcard-perms';
+
+// PowerShell source with its comments removed, for the static .ps1 guards below.
+// BOTH comment forms: `<# ... #>` blocks go first, because their interior lines
+// do not start with `#` and a line-only filter sails straight past them. Two
+// earlier versions of the -AsHashtable guard failed on their own explanatory
+// prose — once on a line comment, once on a block comment.
+const psCodeOnly = (body) => body
+  .replace(/<#[\s\S]*?#>/g, ' ')
+  .split('\n')
+  .filter((line) => !line.trimStart().startsWith('#'))
+  .join('\n');
+
 // Returns { code, stdout, stderr, after } — `after` being the bytes on disk.
 function runInstaller(settingsPath, source) {
   let code = 0;
@@ -60,7 +76,7 @@ function runInstaller(settingsPath, source) {
   let stderr = '';
   try {
     stdout = execFileSync(process.execPath, ['--input-type=module', '-e', source], {
-      env: { ...process.env, SETTINGS: settingsPath, HOOK_CMD: '/repo/bin/wildcard-perms' },
+      env: { ...process.env, SETTINGS: settingsPath, HOOK_CMD },
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -179,6 +195,51 @@ test('running twice does not register the hook twice', (t) => {
   assert.match(second.stdout, /already registered/);
 });
 
+test('install.sh registers the hook command bare, with no shell wrapper', (t) => {
+  // Nothing asserted the LAUNCHER of the registered command until now, on any of
+  // the three registrars. Two reasons it matters, weaker one first:
+  //
+  //   perf  — a wrapper is paid on EVERY tool call. Measured: `cmd /c node ...`
+  //           +17.6 ms, `powershell.exe -Command node ...` +1059 ms, which is 18x
+  //           the whole hook.
+  //   undo  — both uninstallers recover the hook path by unwrapping
+  //           `^node\s+(.+)$` (uninstall.ps1:28, uninstall.sh:36) and otherwise
+  //           compare the command verbatim against the bare path. A wrapped
+  //           registration matches NEITHER branch, so it is never recognised as
+  //           ours: the hook becomes UN-UNINSTALLABLE, `./uninstall.sh` reports
+  //           "nothing removed", and the hook keeps firing. That is the durable
+  //           reason — it is a correctness bug, not a slow path.
+  //
+  // Honest limit: this pins the SPELLING, not the resolved executable. A bare
+  // `node` that resolves to a node.cmd/node.bat shim (nvm-windows, Volta) still
+  // routes through cmd.exe and pays the ~17.6 ms behind a string this test
+  // accepts. Catching that would need a runtime probe, not a string check.
+  const settingsPath = sandbox(t);
+  fs.writeFileSync(settingsPath, HEALTHY);
+
+  // Non-degeneracy first: an identity assertion proves nothing if the input was
+  // itself already wrapped, so pin the fixture to a single bare token.
+  assert.equal(HOOK_CMD.trim().split(/\s+/).length, 1,
+    'the fixture must be an unwrapped command for the equality below to mean anything');
+
+  const run = runInstaller(settingsPath, embeddedModule());
+  assert.equal(run.code, 0, run.stderr);
+
+  // Exact equality, because runInstaller supplies HOOK_CMD itself: whatever
+  // install.sh registers must be that string and nothing else. No shape to guess,
+  // so no false-reject surface at all.
+  //
+  // And note what the POSIX shape IS — the bare path, with NO `node` prefix. The
+  // shebang plus install.sh:8's `chmod +x` carries it, and README.md documents
+  // the two spellings the two installers use. A repo-wide `^node ` requirement
+  // would reject this perfectly correct registration, which is why the predicate
+  // for each registrar is kept separate.
+  const registered = JSON.parse(run.after).hooks.PostToolUse[0].hooks[0].command;
+  assert.equal(registered, HOOK_CMD,
+    'install.sh must register the hook command unwrapped; a launcher prefix breaks '
+    + "both uninstallers' `^node\\s+(.+)$` parse and makes the hook un-uninstallable");
+});
+
 test('install.sh creates ~/.claude, as install.ps1 already did', () => {
   const sh = fs.readFileSync(path.join(repoRoot, 'install.sh'), 'utf8');
   // Without this, a fresh POSIX machine got ENOENT on the write and `set -e`
@@ -193,17 +254,9 @@ test('no PowerShell script uses a PowerShell 7-only JSON parameter', () => {
   // config at run time. README.md names `.\install.ps1  # Windows PowerShell`
   // with no version requirement, so 5.1 is a supported shell and this parameter
   // is banned. If it is ever needed, add `#Requires -Version 6` first.
-  // Comments are stripped before the check. The ban is on CALLING it; explaining
-  // why it is banned, next to the replacement, is the whole point of the fix.
-  // BOTH comment forms: `<# ... #>` blocks go first, because their interior lines
-  // do not start with `#` and a line-only filter sails straight past them. Two
-  // earlier versions of this test failed on their own explanatory prose — once on
-  // a line comment, once on a block comment.
-  const code = (body) => body
-    .replace(/<#[\s\S]*?#>/g, ' ')
-    .split('\n')
-    .filter((line) => !line.trimStart().startsWith('#'))
-    .join('\n');
+  // Comments are stripped before the check (see psCodeOnly). The ban is on
+  // CALLING it; explaining why it is banned, next to the replacement, is the
+  // whole point of the fix.
 
   // Repo root AND scripts/. The scan used to be root-only, which left a hole the
   // moment a .ps1 landed anywhere else — scripts/verify-installers.ps1 now does,
@@ -218,7 +271,7 @@ test('no PowerShell script uses a PowerShell 7-only JSON parameter', () => {
 
   for (const [name, body] of scripts) {
     if (/#Requires\s+-Version\s+[6-9]/i.test(body)) continue;
-    assert.ok(!/-AsHashtable/.test(code(body)),
+    assert.ok(!/-AsHashtable/.test(psCodeOnly(body)),
       `${name} uses -AsHashtable, which throws on Windows PowerShell 5.1`);
   }
 });
@@ -243,6 +296,79 @@ test('both PowerShell installers fail closed on an unreadable settings.json', ()
     assert.match(body, /exit 1/,
       `${name} must exit non-zero rather than continue with an empty config`);
   }
+});
+
+test('install.ps1 builds a bare `node` hook command, not a shell-wrapped one', () => {
+  // The behavioural twin is the `install: registers a bare node command` case in
+  // scripts/verify-installers.ps1, which reads the string install.ps1 really
+  // wrote. That harness exits 0 on non-Windows, so on the POSIX `node --test` CI
+  // leg it asserts nothing at all — hence this static guard, in the style of the
+  // two above.
+  //
+  // Banned: `cmd /c node ...` (+17.6 ms per tool call) and
+  // `powershell.exe -Command node ...` (+1059 ms, 18x the whole hook). The
+  // stronger reason is undo, not speed: both uninstallers recover the hook path
+  // with `^node\s+(.+)$` (uninstall.ps1:28, uninstall.sh:36), a wrapped command
+  // matches neither that nor the bare-path comparison, and the hook would become
+  // UN-UNINSTALLABLE while still firing on every tool call.
+  //
+  // Honest limit: SPELLING, not the resolved executable — a bare `node` that
+  // resolves to a node.cmd/node.bat shim (nvm-windows, Volta) still routes
+  // through cmd.exe and reintroduces the ~17.6 ms. That needs a runtime probe.
+  const body = psCodeOnly(fs.readFileSync(path.join(repoRoot, 'install.ps1'), 'utf8'));
+
+  // Anchored at the ASSIGNMENT, never searched for as a substring. install.ps1
+  // also contains `node "$hookCmd" --seed` — an interactive seed invocation with
+  // an un-normalized backslash path, NOT a registered string — and a naive grep
+  // cannot tell the two apart. Comments are stripped for the same reason: the
+  // lines above the assignment quote `node "<path>"` in prose.
+  const assignment = /^[^\S\n]*\$hookCommand\s*=\s*'([^']*)'/m.exec(body);
+  assert.ok(assignment,
+    "install.ps1's $hookCommand assignment moved, or no longer begins with a "
+    + 'single-quoted literal, so this guard can no longer see the launcher');
+
+  // FIRST TOKEN only. Never a substring test for `cmd`/`powershell`/`node`: a
+  // user's install path may legitimately contain any of them
+  // (C:/Users/x/powershell-tools/…, a checkout under node_modules). This repo's
+  // own path is clean, so a substring bug would pass here and fire on them.
+  assert.equal(assignment[1].trim().split(/\s+/)[0], 'node',
+    `install.ps1 starts its registered command with ${JSON.stringify(assignment[1])}; `
+    + 'the first token must be a bare `node`, because both uninstallers parse the '
+    + 'registration with `^node\\s+(.+)$` and a shell wrapper makes the hook '
+    + 'un-uninstallable as well as ~18x slower');
+});
+
+// ── the third registrar: src/permissions.js ──────────────────────────────────
+
+test('the MAX-mode PreToolUse hook command is a bare `node` invocation', () => {
+  // APPROVE_COMMAND is the PreToolUse hook (matcher '*') MAX mode registers, and
+  // it is written by BOTH the CLI and the installed VSIX. Nothing covered it at
+  // all before this test — and it is the one registration a pure-JS edit could
+  // wrap without touching a line of PowerShell. registerApproveHook pushes this
+  // constant verbatim (src/permissions.js:649), so pinning the constant pins what
+  // lands in settings.json.
+  //
+  // Same two reasons as the installers, and PreToolUse is the worse place to pay
+  // them: it fires BEFORE every tool call. Perf — `cmd /c node ...` +17.6 ms,
+  // `powershell.exe -Command node ...` +1059 ms. Undo — the tooling recognises
+  // our hooks by unwrapping `^node\s+(.+)$` (uninstall.ps1:28, uninstall.sh:36),
+  // so a wrapped command is one nothing can take back out again.
+  //
+  // Shape, not equality: the path is derived from os.homedir(), so no fixture can
+  // name it, and reconstructing it is the trap documented at
+  // verify-installers.ps1:96-103. `[^"]+` not `\S+`, because
+  // `C:/Users/My Name/.claude/wildcarding/approve-all.js` is legitimate. The `^`
+  // anchor is what keeps this a FIRST-TOKEN check rather than a substring one,
+  // which would pass for a user whose home sits under `powershell-tools` or
+  // `node_modules`.
+  //
+  // Honest limit: SPELLING, not the resolved executable. A bare `node` resolving
+  // to a node.cmd/node.bat shim (nvm-windows, Volta) still routes through cmd.exe
+  // and pays the ~17.6 ms behind a string this test happily accepts.
+  const { APPROVE_COMMAND } = require('../src/permissions');
+  assert.match(APPROVE_COMMAND, /^node "[^"]+\/approve-all\.js"$/,
+    `the MAX-mode PreToolUse hook is registered as ${JSON.stringify(APPROVE_COMMAND)}; `
+    + 'it must be a bare `node "<forward-slash path>/approve-all.js"` with no shell wrapper');
 });
 
 // ── uninstall.sh ─────────────────────────────────────────────────────────────

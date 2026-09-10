@@ -258,8 +258,40 @@ if (-not $uninstall) {
     }
     $box = New-UninstallBox -Content $withHook
     if (-not $box) {
+        Add-Result 'install: registers a bare node command' $false 'could not learn the installed hook command'
         Add-Result 'uninstall: removes only our hook' $false 'could not learn the installed hook command'
     } else {
+
+        # The registered command must be a BARE `node` invocation -- never
+        # `cmd /c node ...`, never `powershell.exe -Command node ...`.
+        #
+        # The durable reason is reversibility, not speed. Both uninstallers recover
+        # the hook path with `^node\s+(.+)$` -- ConvertTo-HookPath in uninstall.ps1
+        # and hookPath in uninstall.sh. A wrapped command does not match that
+        # anchor, so the whole wrapper string gets compared against the bare path,
+        # the registration is never recognised as ours, and the hook becomes
+        # UN-UNINSTALLABLE: installed by a script that ships its own undo, and the
+        # undo cheerfully reports "nothing removed". Then the performance cost on
+        # top: measured +17.6 ms per tool call for `cmd /c`, +1059 ms for
+        # `powershell.exe -Command` -- 18x the whole hook.
+        #
+        # Honest limit: this asserts the SPELLING, not the resolved executable. A
+        # bare `node` that resolves to a node.cmd/node.bat shim (nvm-windows,
+        # Volta) still routes through cmd.exe and reintroduces the ~17.6 ms behind
+        # a string this case happily accepts. Catching that needs a runtime probe.
+        #
+        # $box.real is what install.ps1 actually wrote in this sandbox (see
+        # Get-RealHookCommand), already fetched by New-UninstallBox -- so this case
+        # costs no extra process spawn. SHAPE plus the path TAIL, never a
+        # reconstructed path: on CI %TEMP% is an 8.3 short path while the installer
+        # canonicalises to the long form (see Get-RealHookCommand). `[^"]+` not
+        # `\S+`, because `node "C:/Users/My Name/repo/bin/wildcard-perms"` is
+        # legitimate. Case-insensitive on purpose: `-match` matches what both
+        # uninstallers do, and they accept `Node` too.
+        Add-Result 'install: registers a bare node command' `
+        ($box.real -match '^node "[^"]+/bin/wildcard-perms"$') `
+            "registered=$($box.real)"
+
         $r = Invoke-Box $box
         $after = Get-Content $box.settings -Raw | ConvertFrom-Json
         $ptu = @($after.hooks.PostToolUse)
