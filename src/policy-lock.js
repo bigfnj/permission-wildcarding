@@ -20,6 +20,21 @@ const POLICY_LOCK_PATH = path.join(os.homedir(), '.claude', 'wildcarding', 'auto
 const POLICY_LOCK_BUSY_MESSAGE =
   'Auto Learn is mid-scan — try again in a moment.';
 
+// How old a lock file is, never negative. `stat.mtimeMs` carries sub-millisecond
+// precision while `Date.now()` is whole milliseconds, so a file written moments
+// ago can read as being from the FUTURE: measured over 200 writes on this
+// machine, the raw difference ranged from -1.07 ms to +1.09 ms and was zero or
+// negative 111 times.
+//
+// That made the reclaim test a coin flip. The comparison was also `<=`, so
+// `staleMs: 0`, which must mean "reclaim immediately", instead meant "never
+// reclaim" for any lock whose age rounded to zero. Clamping and comparing
+// strictly makes `staleMs` read as "stale once older than this", so 0 reclaims
+// at once and the boundary is no longer a lottery.
+function lockAgeMs(stat) {
+  return Math.max(0, Date.now() - stat.mtimeMs);
+}
+
 function createPolicyLock(options = {}) {
   const lockPath = options.lockPath;
   if (!lockPath) throw new Error('A policy lock requires a lock path');
@@ -57,7 +72,7 @@ function createPolicyLock(options = {}) {
           else return false;
         }
         if (alive) return false;
-      } else if (Date.now() - stat.mtimeMs <= staleMs) {
+      } else if (lockAgeMs(stat) < staleMs) {
         return false;
       }
       const before = { text, size: stat.size, mtimeMs: stat.mtimeMs, ino: stat.ino };
