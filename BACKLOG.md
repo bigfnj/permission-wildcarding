@@ -74,41 +74,57 @@ windows x node 20 and 22.
 
 ## Open
 
-### Three writers still spread from their own read
+### `--max` and `--bypass` still spread from their own read
 
-Fixed for the hook, `--seed` and the drain's `mergeUserAllow`; NOT fixed for
-`--max` and `--bypass` (`bin/wildcard-perms`, the two remaining `writeSettings`
-call sites). Both compute a whole settings object from their own read and write it
-back, so they revert anything that landed in between. They are lock-held, so they
-are safe against Auto Learn and each other — the exposure is against Claude Code,
-which never takes the lock and rewrites this file on every /model, /effort and
-approval. Lower frequency than the hook, same class of loss. They do not fit
-`writeAllow` directly because their output is a whole settings object rather than
-an allow list; the fix is either a rebasing whole-object writer or reshaping them
-to return an allow list.
+The TOTAL-LOSS half of this is fixed (2026-09-10): both now go through
+`readSettingsForWrite`, which refuses on present-but-unreadable instead of
+substituting `{}`. What remains is the original staleness exposure — they still
+compute a whole settings object from their own read and write it back, so they
+revert anything that landed in between. Lock-held, so safe against Auto Learn and
+each other; the exposure is against Claude Code, which never takes the lock and
+rewrites this file on every /model, /effort and approval. Lower frequency than the
+hook, same class of loss.
 
-### The extension writes a MAX refusal it never reports
+They do not fit `writeAllow` directly because their output is a whole settings
+object rather than an allow list. The fix is either a rebasing whole-object writer
+or reshaping them to return an allow list — and doing it would let `writeSettings`
+be deleted entirely, since these are its only two call sites.
 
-`applyMax` now returns `{ changed: false, error: 'max-snapshot-failed' }` when the
-allow snapshot cannot be written, and `applyMax` stops the sequence so the approve
-hook is not registered for a MAX that was never established. The CLI reports it
-and exits 1. The extension's toggle does `if (!res.changed) return` and never
-inspects `error` (`vscode-extension/extension.js`, the `applyMax` call site), so
-the user clicks MAX, nothing happens, and nothing says why. Harmless — MAX stays
-off, which is the safe direction — but silent.
+Related, smaller: `--max status` and `--bypass status` still use
+`readSettings() ?? {}` and so report `OFF` for a file they could not parse. Not
+destructive (no write), but a wrong answer stated confidently.
 
-### The coverage index is data-dependent, and the fallback size is the thing to watch
+### The coverage index's residual cost, and the trigger that replaced the old one
 
-Live split is 401 indexed / 22 fallback, which is why the pass is 6 ms. The
-residual cost is O(n x fallback), because a rule with a glob inside a token cannot
-be found by lookup and must be checked against every candidate. Measured on a
-synthetic pool with roughly half the entries unindexable: n=841 36.7 ms, n=1600
-157.6 ms — better than the old scan at every size, but not linear.
+Live split is now 401 indexed / **3** fallback (2026-09-10), after star-free rules
+were dropped from the pool entirely — they cannot cover anything, and 20 of the
+previous 23 fallback entries were star-free. Cold `processAllowList` measured
+~12.5 -> ~9.3 ms in matched processes.
 
-In this tool's steady state almost everything is a trailing-scope wildcard, so
-this is comfortable. **Trigger: revisit if the fallback share passes ~20% of the
-list**, which would mean either an influx of quoted-path entries or a starter-pack
-change. `createCoverIndex(...).stats()` reports the split.
+The residual cost is O(n x fallback), because a rule with a glob INSIDE a token
+(`Bash(g* *)`, `Bash(mkfs* *)`) cannot be found by a literal-prefix lookup. That
+class is still quadratic — measured n=1600 at 238.5 ms — but it **cannot grow from
+this tool's own operation**: `generalizePermission`/`mineWildcard` only emit
+`Tool(root *)` with root matching `/^[A-Za-z][\w.-]*$/`, so no `*` can land inside
+a token. The live count is 3, all `mcp__*__*`.
+
+So the old "revisit if the fallback share passes ~20%" trigger is retired: the
+number that could actually grow was the star-free count, and it is gone.
+**New trigger: revisit only if `stats().fallback` exceeds ~25 entries**, which
+would mean a starter-pack change or hand-written glob-in-token rules. Indexing
+that class is possible (bucket on the mandatory literal prefix before the first
+`*`, which the compiled regex is anchored on) but is not warranted at 3 entries.
+
+Worth remembering how the one bug here got out: the index's whole safety argument
+is that only a false NEGATIVE can change an answer, and a false negative shipped.
+`coverIndexKey` treated `:` as a token boundary and `coverLookupKeys` did not, so
+colon-form wildcards on non-command tools — including three `Skill(...)` entries in
+`patterns/starter-pack.json` — were indexed under a key no lookup could generate,
+and being indexed were not in the fallback either. The differential test's
+generator only emitted `Bash`/`PowerShell`, where matching rewrites `:*` to ` *`,
+so 300 random cases per run could not reach it. Fixed and covered three ways
+2026-09-10. The lesson is about the CORPUS, not the code: a differential test is
+only as good as the axes its generator actually varies.
 
 ### Codex: the non-nested `exec_command` shape is still unrecognized
 
@@ -139,9 +155,11 @@ over-count worse.
 
 ### scan() does not report that it went blind
 
-The error count is now non-zero when a root fails, but nothing says "the cursor
-map was preserved because nothing was enumerated". A consumer tuning retry
-backoff has to infer it. Related and pre-existing:
+The error count is non-zero when a root fails, but nothing says "the cursor map
+was preserved because nothing was enumerated". A consumer tuning retry backoff has
+to infer it. The signal now exists in the data — walk failures carry
+`scope: 'root'` as of 2026-09-10 — so surfacing it is a matter of adding a field
+to `lastScanStats`, not of recovering information. Related and pre-existing:
 `lastScanStats.prunedObservations` is written by `scan()` and dropped by
 `sanitizeState`, so it vanishes on reload.
 
@@ -152,15 +170,26 @@ re-execs itself into the toolbox venv (`RECALL_REEXEC=1`), so killing the
 immediate child can leave the process that actually does the embedding running. A
 process-group kill (`taskkill /T` on Windows) is what would make this certain.
 
-### More module state survives deactivate
+### Module state that still survives deactivate
 
-`deactivate()` now resets 4 of 25 module-level mutables rather than 1. Still
-surviving: `autoLearnManager` (reused when its key is unchanged, which it is
-across a same-realm re-activate, so a re-activated extension inherits the old
-manager's in-memory state — the same class of bug as the worker runner, just not
-yet observed to bite), `autoLearnNextRetryAt` (a backoff that persists across a
-reload), `lockedRetries`, `localDrainRetries`, `recallRebuildAt`, `policyLock`,
-`statusBar`.
+Re-measured 2026-09-10: 28 module-level mutables, **9 reset** by `deactivate()`,
+19 surviving. The five that held real memory are now dropped — `dashboard` and
+`memoryLint` each retained the whole `ExtensionContext`, and
+`autoLearnManager`/`autoLearnManagerKey`/`autoLearnCardCache` held parsed history
+state, the largest thing this extension builds.
+
+What remains is inert by inspection: eleven timer handles (`debounceTimer`,
+`recallSyncTimer`, `memBounce`, `gatesBounce`, `autoLearnBounce`, `autoLearnTimer`,
+`policyBounce`, `localDrainBounce`, `dashboardBounce`) which are all cleared above
+— holding a dead handle costs nothing — plus scalars (`lockedRetries`,
+`localDrainRetries`, `localDrainAt`, `recallRebuildAt`, `lastRun`,
+`autoLearnLastError`, `autoLearnFailureCount`, `autoLearnNextRetryAt`) and two
+disposed objects (`statusBar`, `policyLock`).
+
+Two of the scalars have a real if minor effect across a same-realm re-activate:
+`autoLearnNextRetryAt` carries a backoff over, and `autoLearnFailureCount` carries
+the count that computes it. Not worth a change on its own; worth doing next time
+this file is open.
 
 ### Test harnesses can silently assert against a frozen home
 
@@ -318,32 +347,15 @@ appears in the CPU profile; multiple `readSettings()` per extension event is
 JSON.stringify compare is 0.038 ms; `memory/recall.py` has no hot-path issue,
 since build_or_update already gates re-embedding on mtime+size.
 
-### The extension can outlive its own async work
+### The deactivation drain has no deadline
 
-Four related findings from the 2026-09-09 leak audit, all CONFIRMED, none fixed —
-they share one root cause and want one lifecycle guard rather than four patches.
+The other three findings from the 2026-09-09 leak audit are now fixed — children
+are tracked and killed, the `deactivated` flag exists and is checked in the three
+schedulers as well as the async continuations, and the runner and busy latch are
+reset. This one is deliberately left, and one new consequence of it is recorded
+under the 2026-09-10 audit below.
 
-- **No ChildProcess handle is ever retained** (`extension.js:788`, `:2492`,
-  `:751`, `:1309`). Clearing the timers stops a spawn from *starting* after
-  deactivate; it does nothing once the timer has fired. recallSyncTimer fires at
-  T+10 s, so a reload at T+11 s leaves `execFile(python, [...],
-  {timeout:180000})` running with its return value discarded — up to 180 s of
-  Python outliving the extension, whose callback then touches a torn-down
-  dashboard. Sharper for gates: gatesBounce to compileGates (60 s) to
-  `.then(() => ensureGates())` to setGatesAll, which **writes the user's
-  instruction files after deactivate**.
-- **No teardown guard exists.** Grepping for deactivated/isDeactivating/
-  shuttingDown hits comments only. `deactivate()` nulls outputChannel and nothing
-  else: dashboard, statusBar, policyLock, autoLearnManager, autoLearnCardCache,
-  autoLearnWorkerRunner and autoLearnBusy all survive. Within a session that is a
-  stray toast and a postMessage into a dead webview. Across a same-realm
-  re-activate it is worse: `deactivating` is sticky
-  (`autoLearnWorkerRunner.js:13,73`) and the singleton is never nulled, so every
-  later Auto Learn op rejects "Auto Learn is deactivating" **forever**, and a
-  deactivate landing mid-scan leaves autoLearnBusy true so every later scan
-  short-circuits. No test can see it: the activation tests delete the module from
-  require.cache between cases.
-- **The deactivation drain has no deadline** (`autoLearnWorkerRunner.js:79-82`).
+- **The drain has no deadline** (`autoLearnWorkerRunner.js:79-82`).
   `await Promise.allSettled([...jobs])` runs *before* any terminate() and no
   layer sets a per-job timeout, so a worker wedged on a large transcript makes
   deactivate() never resolve — a stalled window reload — and the thread is never
@@ -420,30 +432,23 @@ export removes a wrapper and the pretense of a second implementation.
 AUTO_SUFFIX_CLOSED_ROOTS and the two SAFE_GIT lists are deliberate and
 drift-tested, documented in both export comments.)
 
-### Declared-but-unwired UI, and an uninstall that cannot uninstall
+### Declared-but-unwired UI
 
-Cross-referenced 2026-09-09; the four headline diffs came back clean (18 of 18
-commands registered, 4 of 4 menu entries resolve, 16 of 16 config keys read, 8 of
-8 CLI verbs documented), so these are the residue.
+Cross-referenced 2026-09-09 and re-run 2026-09-10; the headline diffs come back
+clean in both directions (19 of 19 commands registered, 4 of 4 menu entries
+resolve, 16 of 16 config keys both read and declared, 8 of 8 CLI verbs
+dispatched), so these are the residue.
 
-- **`uninstall.sh` cannot undo `install.ps1`, and reports success anyway.**
-  `install.ps1:15` writes the hook as `node "<path>"`; `uninstall.sh:19` filters
-  on the **bare** path, so it can never match. Worse, the write and the
-  "hook removed" message at `:25-26` are both **outside** the `if`, so it always
-  claims success. There is no `uninstall.ps1` at all, yet `README.md:102-107`
-  presents install.sh / uninstall.sh / install.ps1 as a matched set — Windows
-  users have no working uninstall path.
-- **Two config groups have no change listener.** affectsConfiguration covers
-  autoLearn, localDrain and guidance only. Flipping
-  `permissionWildcarding.gates.enabled` in the Settings UI does nothing until a
-  reload, and `memoryLint.js` has **no** onDidChangeConfiguration at all, so the
-  four `memory.*` keys are picked up only by the 5-minute reconcile or a
-  save/open event.
-- **Two dead webview switch arms**: `extension.js:2635` (autoLearnApply) and
-  `:2637` (autoLearnMode) have no sender. All 16 `type:` literals were
-  enumerated; the element ids alApply/alMode do not exist. Two dashboard buttons
-  were removed and their handlers left behind. Both features remain
-  palette-reachable, so this is dead dispatch, not lost functionality.
+Both the uninstall gap and the missing config listeners are now closed — verified
+empirically 2026-09-10 under both PowerShell editions, including per-hook removal
+that spares a co-located third-party hook, and `memory.enabled` taking effect both
+ways without a window reload. What remains:
+
+- **Two dead webview switch arms**: `extension.js:2814` (autoLearnApply) and
+  `:2816` (autoLearnMode) have no sender. All `type:` literals were enumerated
+  (16 senders, 18 arms); the element ids alApply/alMode do not exist. Two
+  dashboard buttons were removed and their handlers left behind. Both features
+  remain palette-reachable, so this is dead dispatch, not lost functionality.
 - **`extension.js:17-34` hard-requires `./src/*`**, which .gitignore excludes and
   scripts/package.mjs creates only at package time. Self-documented as a known
   asymmetry in `autoLearnUi.js:5-16` ("extension.js gets away with ./src/ only
@@ -673,6 +678,255 @@ Around a quarter of candidates are complex with no permission, so they can never
 render a rule, never appear in Review, and cost no prompts: shell keywords
 (`for`, `done`) and quoted-executable basenames. Masking is not at fault, checked
 against bash heredocs and both PowerShell here-string forms. Cosmetic only.
+
+## From the 2026-09-10 five-agent audit
+
+Five read-only agents were run over the day's work: regressions, dead code and
+wiring, memory leaks and lifecycle, optimization, and correctness. Everything they
+confirmed as a REGRESSION was fixed the same day and is not listed here. What
+follows is what was confirmed and left. Note two of them independently found the
+same two Tier-1 defects (the installers and the coverage index), which is worth
+knowing when deciding how much to trust a single agent's report.
+
+### The installers have no behavioural test on CI, only static guards
+
+`test/installers.test.js` (new 2026-09-10) drives `install.sh`'s and
+`uninstall.sh`'s real embedded ES modules, so the POSIX half is covered
+everywhere. The PowerShell pair cannot be driven on a POSIX runner, so it gets
+static guards instead: no `-AsHashtable` outside a `#Requires -Version 6`, and
+both scripts must contain a refusal path. The behavioural PowerShell harnesses
+exist but live in a session scratchpad and will be lost.
+
+**Worth doing:** move them into `scripts/` and call them from
+`verify-release.ps1`, or add a `windows-latest` CI job that runs them under
+`powershell.exe` specifically — the defect they catch is invisible under `pwsh`.
+The seam they need: `install.ps1` reads
+`[System.Environment]::GetFolderPath("UserProfile")`, which ignores
+`$env:USERPROFILE`, so the harness copies the script with that one line rewritten.
+(An earlier version of that harness, before the seam was understood, ran the real
+installer against the live `~/.claude` five times. Nothing was lost — the hook was
+already registered, which short-circuits before the write — but it is the reason
+the seam is documented here.)
+
+### `.gitattributes` is incomplete, and has not been applied to this tree
+
+Measured CR bytes, working tree vs index, 2026-09-10:
+
+```
+bin/wildcard-perms    worktree=842  index=0    (no attribute)
+memory/recall.py      worktree=529  index=0    (no attribute)
+scripts/package.mjs   worktree=55   index=0    (no attribute)
+install.sh            worktree=56   index=0    (eol=lf set)
+uninstall.sh          worktree=69   index=0    (eol=lf set)
+```
+
+Two separate problems. First, `*.sh text eol=lf` covers only the two shell
+scripts, and misses the file with the most to lose: `bin/wildcard-perms` has a
+`#!/usr/bin/env node` shebang, `install.sh` chmod +x's it and registers its bare
+path as the hook command, so a CRLF copy on Linux gives
+`env: 'node\r': No such file or directory` on every tool call.
+`memory/recall.py` and `scripts/package.mjs` are the same shape. Second, adding
+`.gitattributes` does not renormalize an existing checkout — `core.autocrlf=true`
+here — so the commit's "the working tree matches the index" is true only for a
+fresh clone.
+
+Fix: widen to the three shebang'd files (or `* text=auto` with explicit binary
+exclusions) and run `git add --renormalize .` once.
+
+### README claims that are now false
+
+Checked line by line 2026-09-10:
+
+- `README.md:36` — "`src/policy-lock.js` — the advisory lock **every** policy
+  writer takes". Four `settings.json` writers take neither the lock nor
+  `writeFileAtomicSync`: `install.sh`, `install.ps1`, `uninstall.sh`,
+  `uninstall.ps1`. They are the only non-atomic, unlocked writers in the project.
+- `README.md:70-73` — describes the pre-redesign panel ("an \"Active\" status
+  card, live tallies, a **Wildcard Now** button ... a collapsible list"). The hero
+  card, the stateful rows and `LIST_CAP = 12` are all undocumented.
+- `README.md:541-568`, "The hook is fast now" — three problems: it still says
+  `isCoveredBy` sits inside two **quadratic** passes; its quoted
+  `min 103.5 / p50 109.8 ms` contradicts the interleaved
+  `min 157 / median 175 ms` recorded elsewhere by ~60% with no note that they are
+  different measurements; and it names `drainFromHook`, which no longer exists.
+- `README.md:105-115` — presents the uninstallers under a ```powershell fence with
+  no version requirement. True now, but only because `-AsHashtable` was removed.
+- The CLI summary at `README.md:23-27` lists 7 of 10 verbs: `--codex-max` is
+  missing (documented in its own section), and `--help`/`--version` are in
+  `HELP_USAGE` but not in the README at all.
+
+### Four test harnesses can still assert against a frozen home
+
+The general form is already recorded above. The specific audit, 2026-09-10:
+`dashboard-view.test.js`, `local-drain-extension.test.js` and
+`extension-lifecycle-async.test.js` purge repo `src/` from `require.cache`.
+`policy-backup.test.js`, `policy-guard-unreadable.test.js`,
+`extension-activation.test.js` and `extension-managed-blocked.test.js` delete only
+`extensionPath`.
+
+Exactly five module-level paths leak from the first harness to every later one:
+
+```
+MAX_STATE_FILE       src/permissions.js:430
+APPROVE_SCRIPT       src/permissions.js:435
+BYPASS_STATE_FILE    src/permissions.js:351
+POLICY_LOCK_PATH     src/policy-lock.js:19
+CODEX_CONFIG         src/codex-max.js:35
+```
+
+**No assertion is vacuous today** — only `policy-backup.test.js` touches any of
+them, and it survives because each test writes the MAX snapshot and reads it back
+within itself while `writeMaxState`'s `mkdirSync(..., {recursive:true})` silently
+recreates the deleted temp home. But every one of those tests is one early return
+away from becoming vacuous, and the suite leaves stray directories in
+`os.tmpdir()`.
+
+### Assertions whose guarantee is narrower than their comment claims
+
+None is vacuous — each has a nameable killing mutation — but the stated guarantee
+is wider than the check:
+
+- `test/dashboard-view.test.js:277` counts webview routes with
+  `/case '[A-Za-z]+':\s*vscode\.commands\.executeCommand\(/g`. A route written
+  as `case 'x': { ... }`, dispatched via a variable, or named with a digit is not
+  counted, so "fails if a route is added untested" holds only for the current
+  spelling.
+- `test/extension-lifecycle-async.test.js:277` uses `/(?<![\w.])execFile\(/g`,
+  which excludes `.execFile(` — a fifth spawn written `cp.execFile(` passes
+  silently.
+- `src/derived-guidance.js:57-63` says truncation is 200 chars, but the escaping
+  runs AFTER `.slice(0, RULE_LIMIT)`, so `&lt;!--` expansion can push the output
+  past 200. The test only measures `'x'.repeat(400)`, which never escapes.
+- `test/settings-write.test.js:127` asserts `onWrite` fires once on success;
+  nothing asserts it does NOT fire when `writeAllow` throws, and nothing asserts
+  the CLI writer has no `onWrite` — that "deliberate rather than dropped" question
+  rests entirely on a comment.
+- `test/extension-lifecycle-async.test.js`'s `trackChild` check is a source-text
+  scan for `trackChild(execFile(`, so a correct `const c = execFile(...);
+  trackChild(c);` would fail it and a `spawn()` would slip past.
+
+### Guidance removal still consumes one user newline at end of file
+
+`src/agent-guidance.js:181-183` hardcodes `separator = '\n'` on the
+end-of-file branch, while the install branch adds none when the file already ends
+`\n\n`. Measured round trip: `"my own notes\n\n"` -> `"my own notes\n"`.
+`test/agent-guidance.test.js:189-190` asserts this exact output, so it is a
+deliberate-but-undocumented choice — the commit message claims byte-exactness.
+Mid-file, start-of-file, adjacent-blocks and the CRLF install path all round-trip
+exactly, and accumulation is stopped.
+
+**Separate residual, no migration exists:** a file damaged by the pre-fix
+inner-marker bug is not repaired. `blockRange` on a file containing
+`...END ... BEGIN ...` returns null, so `has()` is false and `apply(text, true)`
+appends a SECOND block, leaving the orphaned END above it and accumulating per
+toggle. Only reachable for a user whose corpus quoted a marker before 2026-09-10.
+
+### Optimization, measured and ranked
+
+All from the 2026-09-10 pass. The hook's own sync I/O is clean — one
+`readFileSync` (0.16 ms) and one `existsSync` (0.18 ms) on the common path, no
+per-candidate I/O, no lock. Of a 66 ms process wall, ~50 ms is spawn + node boot
+and not ours.
+
+| Item | Measured | Frequency |
+|---|---|---|
+| `require('./managed-policy')` is eager in `src/permissions.js:8` but only reachable from `maxLayers` (`--max status`, the MAX card) | module load 2.94 -> 2.33 ms | per hook call |
+| A fixed-point cache keyed on a CONTENT HASH of settings.json lets the hook skip the read, the module load and the pass | our-code p50 11.80 -> 2.46 ms; wall 62.3 -> 53.6 ms; 30/30 hits | per hook call |
+| `memoryReport()` runs TWICE per dashboard refresh — `extension.js:817` and the `gateSources` IIFE at `:2689`, in one `_push()` | 11.22 ms of a 21.57 ms refresh; hoisted 20.0 -> 14.7 ms, fs calls 82 -> 61 | per refresh |
+| `runWildcarding` takes the policy lock even on the unchanged path; the CLI hook was deliberately changed not to | lock cycle 3.72 ms of 9.60 ms, plus contention with Auto Learn | per settings.json write |
+
+Two notes worth keeping. The fixed-point cache **needs a decision, not just
+work**: it adds a new cache file on the hook path. Use a pure-JS hash, not
+`crypto` — `require('crypto')` alone is 3.5 ms and ate 40% of the win. Every
+failure mode is "miss -> full pass", and a forced-miss run measured 15.72 vs
+18.28 ms, so there is no cold-path regression.
+
+And the opposite conclusion for the extension, recorded so nobody applies the
+hook's lesson by analogy: its eager requires are **not** worth making lazy.
+Activation is 31.4 ms of requires plus 53.5 ms of `activate()`, paid once per
+window at `onStartupFinished`.
+
+### Dead exports and unreachable options, re-measured
+
+The recorded "42 dead export names" still holds as a count; the composition moved
+(`enableMaxAllow` gained a real consumer; `disableMaxAllow` and
+`registerApproveHook` are now test-only rather than dead). 51 export names are
+referenced only from `test/`. Newly confirmed 2026-09-10, all with zero code
+references:
+
+- `defaultSettingsPath` (`src/settings-write.js:125`) — used only internally at
+  `:60`. Landed the same day it became dead.
+- `createSettingsWriter`'s own fallbacks (`src/settings-write.js:59-60`): all
+  three callers pass `settingsPath`, so both the `= {}` default and the
+  `|| defaultSettingsPath()` leg are unreachable. `onWrite` IS supplied, by the
+  extension only.
+- `assessPolicy`'s `claimed` parameter (`src/policy-guard.js:190`, consumed
+  `:195-196`) has no supplier anywhere; its branch is dead.
+- `isBulkLoss`'s `options.minimum` / `options.fraction`
+  (`src/policy-guard.js:173-175`) — every call site passes two arguments.
+- `renderCodexRules`'s `options.version` and `options.header`
+  (`src/policy-exporters.js:392-397`) — two dead keys and three dead arms across
+  7 call sites.
+- `options.claudeSettingsPath` (`src/auto-learn-manager.js:581`) — a fourth member
+  of the already-recorded alias family; only the alias spelling is supplied.
+- `applyClaude` / `applyCodex` (`src/auto-learn-manager.js:1578`) are test-only;
+  production uses `apply`, and the worker's allow-list does not include them.
+- `createCoverIndex(...).stats()` is test-only — a measurement hook, not API.
+
+Proved clean, worth recording so it is not re-derived: **zero orphaned functions**
+across 578 declarations in `src/`, `bin/`, `vscode-extension/` and `scripts/`, and
+**zero broken imports** across 99 destructured `require` sites / 317 names.
+19/19 commands, 4/4 menus, 16/16 config keys and 8/8 CLI verbs are wired in both
+directions. `scripts/package.mjs` enumerates `src/` dynamically, so there is no
+VSIX gap.
+
+### Vestigial dashboard markup, with one visible consequence
+
+`id="toggle"` (`extension.js:3205`) has no JS reader at all, and `id="chev"`
+(`:3206`) is superseded by `head.querySelector('.chev')` (`:3234`). The leftover
+`#chev` CSS rule (`:3008`, `width: 1em; font-size: 10px`) still wins on
+specificity over `.chev` (`:3057`, `width: .8em; font-size: 9px`), so the
+"Wildcards tracked" chevron renders visibly differently from every other row.
+Also still open: two webview switch arms nothing can reach — `autoLearnApply`
+(`:2814`) and `autoLearnMode` (`:2816`); 16 senders against 18 arms.
+
+### Smaller confirmed items
+
+- **`policy-lock` orphans a zero-byte lock for the full 10 minutes.**
+  `locked()` creates the file with `openSync(..., 'wx')` and writes its metadata
+  after. A process that dies in that window leaves a lock with no valid pid, so
+  `recoverLock` falls to the `lockAgeMs(stat) < staleMs` branch and refuses to
+  reclaim it for `DEFAULT_STALE_MS`. Low probability, and it fails closed
+  (refusal, not corruption), but the fix is small: treat a zero-byte lock as
+  reclaimable after a short grace rather than the full stale window.
+- **The hook accumulates stdin without a bound.** `bin/wildcard-perms:92` is
+  `input += chunk` with no cap, and a PostToolUse payload carries tool output.
+  A cap with a graceful "no cwd, no drain" fallback costs nothing.
+- **`run()` relies on `finish()` never returning.** `bin/wildcard-perms:211` is
+  `if (!settings) finish(input, false);` with no `return`. Correct today because
+  `finish` ends in `process.exit(0)` on all three paths; one added early return
+  and execution falls through and calls `finish` twice. One word.
+- **`wildcardUnderLock` ignores `writeAllow`'s `addedAllow`**
+  (`bin/wildcard-perms:296-300`), computing `added`/`removed` from its own
+  pre-write snapshot — the exact anti-pattern `src/settings-write.js:106-108`
+  documents ten lines above it ("a caller that reports its own intent ends up
+  announcing '+299 restored' over a file that already had them"). Only a stderr
+  diagnostic.
+- **The teardown flag can be cleared under a pending teardown.** `deactivate()`
+  sets `deactivated = true`, then awaits a drain with no deadline; `activate()`
+  sets it false. If VS Code's deactivate timeout expires first and a same-realm
+  re-activate runs, the OLD deactivate's continuation then nulls the SUCCESSOR's
+  runner without draining it. A second consequence of the recorded "no deadline"
+  item. SUSPECTED — depends on VS Code await semantics not verifiable from here.
+- **A junction to a large tree is now walked in full.**
+  `src/history-adapters.js:915` queues `entry.isSymbolicLink()` children, which
+  was the point (junctions), but the realpath set stops cycles, not breadth. And a
+  transcript reachable by two link paths gets two cursors and two parses;
+  `observationHashes` dedupes the observations, so only I/O and state size are
+  wasted. SUSPECTED cost, not correctness.
+- **`/cygdrive/d/...` is not normalized** by either uninstaller's path matcher.
+  Every other spelling converges — I traced `node "D:/..."`, `/d/...`,
+  backslashes and case. Cosmetic.
 
 ## Deferred by the maintainer
 
