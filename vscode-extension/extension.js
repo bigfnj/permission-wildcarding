@@ -1792,6 +1792,36 @@ function activate(context) {
   // released here or the second activation is muted for its whole lifetime.
   deactivated = false;
   activationGeneration += 1;
+  // The busy latch, released unconditionally here. deactivate() only clears it
+  // when it is still the current generation — correctly, because a successor's
+  // in-flight scan must not have its latch cleared by a predecessor's
+  // continuation. But that leaves the mirror-image hole: if the predecessor's
+  // scan never settled, its `finally` never ran, so the latch it set is still
+  // true and its continuation is now forbidden from clearing it. Every later
+  // scan then short-circuits as "already running" and returns null, for the life
+  // of the window, and only a manual click ever surfaces the message.
+  //
+  // Reachable whenever a worker wedges and a re-activate follows — and an
+  // extension upgrade IS a re-activate. Clearing it here is unconditionally safe
+  // because activate() runs synchronously up to scheduleAutoLearn's 750 ms
+  // timer, so at this instant no successor scan can exist to own the latch.
+  autoLearnBusy = false;
+  // And the runner slot, for the same reason and with a worse symptom. It is
+  // nulled at the END of deactivate(), after the awaited drain, deliberately —
+  // nothing may shorten that drain. But when the drain never completes, the
+  // slot keeps the predecessor's runner, whose `deactivating` flag is sticky and
+  // whose public API has no reset. getAutoLearnWorkerRunner() only builds one
+  // when the slot is empty, so the successor inherits the dead instance and
+  // every Auto Learn operation fails with "Auto Learn is deactivating".
+  //
+  // Measured: with a wedged worker and a re-activate, the busy-latch fix above
+  // is not enough on its own — the successor's scan gets that error instead, so
+  // this is a second stranded slot, not the same one.
+  //
+  // Dropping the reference here does not disturb the pending drain: deactivate()
+  // already read the old runner and is awaiting a promise that holds it, so it
+  // still terminates its own worker. The successor simply builds its own.
+  autoLearnWorkerRunner = null;
   // Watch settings.json for any change (Claude Code approval, manual edit, etc.).
   // RelativePattern (not a plain string) — plain strings only watch files inside
   // opened workspace folders, but ~/.claude/settings.json usually isn't one.

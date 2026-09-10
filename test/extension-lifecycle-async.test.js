@@ -44,6 +44,19 @@ class FakeWorker extends EventEmitter {
   terminate() { return Promise.resolve(0); }
 }
 
+// A worker that never answers, so the scan promise never settles and
+// runAutoLearnScan's `finally` never runs. That is the only way to leave the
+// busy latch set, which is what the re-activate test needs. `release()` lets the
+// test settle it at the end so teardown can complete instead of hanging.
+class WedgedWorker extends EventEmitter {
+  release() {
+    this.emit('message', { ok: true, result: {} });
+    this.emit('exit', 0);
+  }
+
+  terminate() { return Promise.resolve(0); }
+}
+
 function harness(tempHome, options = {}) {
   const commands = new Map();
   const watchers = [];
@@ -149,7 +162,11 @@ function harness(tempHome, options = {}) {
       return {
         createAutoLearnWorkerRunner: (runnerOptions) => real.createAutoLearnWorkerRunner({
           ...runnerOptions,
-          workerFactory: () => { const worker = new FakeWorker(); workers.push(worker); return worker; },
+          workerFactory: () => {
+            const worker = options.wedgeWorker ? new WedgedWorker() : new FakeWorker();
+            workers.push(worker);
+            return worker;
+          },
         }),
       };
     }
@@ -618,6 +635,65 @@ test('a re-activate during the drain keeps its own dashboard and memory lint', a
     assert.ok(!app.errors.some((m) => /deactivating/.test(m)),
       'the successor did not inherit the dead worker runner');
   } finally {
+    await app.dispose();
+  }
+});
+
+
+test('a re-activate releases a busy latch that a wedged scan left set', async (t) => {
+  // A regression introduced by the activationGeneration guard added earlier the
+  // same day. That guard is right about the case it names — a predecessor's
+  // continuation must not clear a latch the SUCCESSOR owns — but it left the
+  // mirror image open.
+  //
+  // autoLearnBusy is released by runAutoLearnScan's `finally`, which never runs
+  // if the worker promise never settles. deactivate()'s drain is
+  // Promise.allSettled over those same jobs, so a wedged worker hangs the drain
+  // too. A same-realm re-activate then bumps the generation, and the
+  // predecessor's continuation is permanently forbidden from clearing the latch
+  // it set. Every later scan short-circuits as "already running" and returns
+  // null — Auto Learn dead for the life of the window, and since the periodic
+  // timer says nothing, only a manual click ever surfaces it.
+  //
+  // An extension upgrade is a re-activate, so this is not exotic.
+  const home = tempHome(t);
+  const app = harness(home, { settings: { 'autoLearn.enabled': true }, wedgeWorker: true });
+  try {
+    // Wedge a scan: the latch is set and the promise will never settle.
+    const wedged = app.commands.get('permission-wildcarding.autoLearnScan')();
+    await tick(200);
+    assert.equal(app.workers.length, 1, 'precondition: a worker was built and never answered');
+
+    // The drain cannot finish, so deactivate() is deliberately NOT awaited —
+    // which is exactly the real situation: the host's deactivate timeout expires
+    // and it activates again anyway.
+    const teardown = app.extension.deactivate();
+    app.reactivate();
+
+    app.errors.length = 0;
+    app.statuses.length = 0;
+    // Fired, NOT awaited: this harness wedges EVERY worker, so the successor's
+    // own scan will not settle either. What is under test is whether the
+    // successor is ALLOWED to start one, which is observable immediately.
+    const second = app.commands.get('permission-wildcarding.autoLearnScan')();
+    await tick(200);
+
+    assert.ok(!app.statuses.some((m) => /already running/i.test(m)),
+      'the successor inherited a latch it can never clear, so every scan for the '
+      + 'life of the window short-circuits as "already running"');
+    // TWO stranded slots, asserted separately because they present as different
+    // symptoms and fixing one alone leaves the other. Measured: with only the
+    // busy-latch fix, this test failed here with "Auto Learn is deactivating".
+    assert.ok(!app.errors.some((m) => /deactivating/i.test(m)),
+      'the successor inherited the predecessor’s worker runner, whose '
+      + '`deactivating` flag is sticky, so every Auto Learn operation fails');
+    assert.ok(app.workers.length > 1, 'the successor actually started a scan of its own');
+
+    // Let every wedged job settle so teardown completes rather than hanging.
+    for (const worker of app.workers) if (typeof worker.release === 'function') worker.release();
+    await Promise.allSettled([wedged, teardown, second]);
+  } finally {
+    for (const worker of app.workers) if (typeof worker.release === 'function') worker.release();
     await app.dispose();
   }
 });
