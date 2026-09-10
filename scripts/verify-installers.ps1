@@ -88,6 +88,35 @@ function Invoke-Box {
     return @{ output = $out; code = $LASTEXITCODE }
 }
 
+function Get-RealHookCommand {
+    <#  The exact hook command install.ps1 writes into THIS sandbox, obtained by
+        running it rather than by reconstructing the path.
+
+        Why this exists: a fixture cannot derive the hook path from $env:TEMP and
+        expect it to match. On a GitHub runner %TEMP% is an 8.3 short path
+        (C:\Users\RUNNER~1\...) while PowerShell canonicalises
+        $MyInvocation.MyCommand.Path — which is what both installers derive
+        $scriptDir from — to the LONG form. The two spellings never matched, so
+        every uninstall case that depends on recognising our own hook failed on CI
+        and passed locally, where %TEMP% has no 8.3 component. Asking the installer
+        is both spelling-proof and a truer round trip: it is the same string a real
+        install would leave behind. #>
+    param([string]$InstallSource, [string]$BoxDir)
+    $probe = Join-Path $BoxDir 'install-probe.ps1'
+    [System.IO.File]::WriteAllText($probe,
+        $InstallSource.Replace($HOME_NEEDLE, ('$userProfile = ' + "'" + $BoxDir + "'")))
+    $null = ('n' | & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $probe 2>&1)
+    $written = Join-Path $BoxDir '.claude\settings.json'
+    if (-not (Test-Path $written)) { return $null }
+    $cfg = Get-Content $written -Raw | ConvertFrom-Json
+    $cmd = @($cfg.hooks.PostToolUse)[0].hooks[0].command
+    # Leave the sandbox as the caller found it: no settings.json, no probe.
+    Remove-Item $written -Force -ErrorAction SilentlyContinue
+    Remove-Item ($written + '.pre-install-backup') -Force -ErrorAction SilentlyContinue
+    Remove-Item $probe -Force -ErrorAction SilentlyContinue
+    return $cmd
+}
+
 $HEALTHY = {
     param($hook)
     '{
@@ -189,63 +218,97 @@ if (-not $install) {
 $uninstall = Get-Installer 'uninstall.ps1'
 if (-not $uninstall) {
     Add-Result 'uninstall.ps1 is testable' $false "missing, or the home-directory line moved -- update `$HOME_NEEDLE"
+} elseif (-not $install) {
+    Add-Result 'uninstall.ps1 is testable' $false 'install.ps1 is needed to learn the real hook spelling'
 } else {
+
+    # A sandbox whose fixture is built from the hook command install.ps1 actually
+    # writes, so nothing here assumes a path spelling. See Get-RealHookCommand.
+    function New-UninstallBox {
+        param([scriptblock]$Content)
+        $box = New-Box -Source $uninstall -NoFile
+        $real = Get-RealHookCommand -InstallSource $install -BoxDir $box.dir
+        if (-not $real) { return $null }
+        [System.IO.File]::WriteAllText($box.settings, (& $Content $real))
+        $box.real = $real
+        return $box
+    }
+
+    # $real is the full command install.ps1 writes, e.g. `node "C:/.../wildcard-perms"`.
+    # ConvertTo-Json quotes and escapes it for embedding, so the fixtures never
+    # hand-build that string. $bareOf recovers just the path, which is the spelling
+    # install.sh registers.
+    $bareOf = { param($cmd) ($cmd -replace '^node\s+"?', '') -replace '"$', '' }
 
     # 1. Removes only ours, from among a sibling entry and a separate hook group.
     #    This is the case that could not run at all under 5.1 before the fix.
     $withHook = {
-        param($hook)
+        param($real)
         '{
   "model": "claude-opus-5",
   "permissions": { "allow": ["Bash(rg *)"], "deny": [] },
   "hooks": {
     "SessionStart": [ { "hooks": [ { "type": "command", "command": "other-tool" } ] } ],
     "PostToolUse": [
-      { "matcher": "Bash|PowerShell", "hooks": [ { "type": "command", "command": "node \"' + $hook + '\"" } ] },
+      { "matcher": "Bash|PowerShell", "hooks": [ { "type": "command", "command": ' + (ConvertTo-Json $real) + ' } ] },
       { "matcher": "Bash", "hooks": [ { "type": "command", "command": "someone-elses-hook" } ] }
     ]
   }
 }'
     }
-    $box = New-Box -Source $uninstall -Content $withHook
-    $r = Invoke-Box $box
-    $after = Get-Content $box.settings -Raw | ConvertFrom-Json
-    $ptu = @($after.hooks.PostToolUse)
-    Add-Result 'uninstall: removes only our hook' `
-    ($r.code -eq 0 -and $ptu.Count -eq 1 -and $ptu[0].hooks[0].command -eq 'someone-elses-hook' `
-            -and $null -ne $after.hooks.SessionStart -and $after.model -eq 'claude-opus-5' `
-            -and @($after.permissions.allow).Count -eq 1) `
-        "PostToolUse=$($ptu.Count) survivor=$($ptu[0].hooks[0].command)"
-    Remove-Item -Recurse -Force $box.dir
+    $box = New-UninstallBox -Content $withHook
+    if (-not $box) {
+        Add-Result 'uninstall: removes only our hook' $false 'could not learn the installed hook command'
+    } else {
+        $r = Invoke-Box $box
+        $after = Get-Content $box.settings -Raw | ConvertFrom-Json
+        $ptu = @($after.hooks.PostToolUse)
+        Add-Result 'uninstall: removes only our hook' `
+        ($r.code -eq 0 -and $ptu.Count -eq 1 -and $ptu[0].hooks[0].command -eq 'someone-elses-hook' `
+                -and $null -ne $after.hooks.SessionStart -and $after.model -eq 'claude-opus-5' `
+                -and @($after.permissions.allow).Count -eq 1) `
+            "PostToolUse=$($ptu.Count) survivor=$($ptu[0].hooks[0].command)"
+        Remove-Item -Recurse -Force $box.dir
+    }
 
     # 2. The bare-path spelling install.sh writes, not install.ps1's `node "..."`.
     $bare = {
-        param($hook)
-        '{ "model": "x", "hooks": { "PostToolUse": [ { "matcher": "Bash", "hooks": [ { "type": "command", "command": "' + $hook + '" } ] } ] } }'
+        param($real)
+        '{ "model": "x", "hooks": { "PostToolUse": [ { "matcher": "Bash", "hooks": [ { "type": "command", "command": ' `
+            + (ConvertTo-Json (($real -replace '^node\s+"?', '') -replace '"$', '')) + ' } ] } ] } }'
     }
-    $box = New-Box -Source $uninstall -Content $bare
-    $r = Invoke-Box $box
-    $after = Get-Content $box.settings -Raw | ConvertFrom-Json
-    Add-Result 'uninstall: matches the bare-path spelling too' `
-    ($r.code -eq 0 -and -not ($after.PSObject.Properties.Name -contains 'hooks')) `
-        "keys=$($after.PSObject.Properties.Name -join ',')"
-    Remove-Item -Recurse -Force $box.dir
+    $box = New-UninstallBox -Content $bare
+    if (-not $box) {
+        Add-Result 'uninstall: matches the bare-path spelling too' $false 'could not learn the installed hook command'
+    } else {
+        $r = Invoke-Box $box
+        $after = Get-Content $box.settings -Raw | ConvertFrom-Json
+        Add-Result 'uninstall: matches the bare-path spelling too' `
+        ($r.code -eq 0 -and -not ($after.PSObject.Properties.Name -contains 'hooks')) `
+            "keys=$($after.PSObject.Properties.Name -join ',')"
+        Remove-Item -Recurse -Force $box.dir
+    }
 
     # 3. A third-party hook sharing OUR entry's hooks array. Removing the whole
     #    entry deleted somebody else's tool, silently.
     $shared = {
-        param($hook)
-        '{ "model": "x", "hooks": { "PostToolUse": [ { "matcher": "Bash", "hooks": [ { "type": "command", "command": "' + $hook + '" }, { "type": "command", "command": "neighbour-tool" } ] } ] } }'
+        param($real)
+        '{ "model": "x", "hooks": { "PostToolUse": [ { "matcher": "Bash", "hooks": [ { "type": "command", "command": ' `
+            + (ConvertTo-Json $real) + ' }, { "type": "command", "command": "neighbour-tool" } ] } ] } }'
     }
-    $box = New-Box -Source $uninstall -Content $shared
-    $r = Invoke-Box $box
-    $after = Get-Content $box.settings -Raw | ConvertFrom-Json
-    $ptu = @($after.hooks.PostToolUse)
-    Add-Result 'uninstall: keeps a co-located third-party hook' `
-    ($r.code -eq 0 -and $ptu.Count -eq 1 -and @($ptu[0].hooks).Count -eq 1 `
-            -and $ptu[0].hooks[0].command -eq 'neighbour-tool' -and $ptu[0].matcher -eq 'Bash') `
-        "hooks=$(@($ptu[0].hooks).Count) survivor=$($ptu[0].hooks[0].command) matcher=$($ptu[0].matcher)"
-    Remove-Item -Recurse -Force $box.dir
+    $box = New-UninstallBox -Content $shared
+    if (-not $box) {
+        Add-Result 'uninstall: keeps a co-located third-party hook' $false 'could not learn the installed hook command'
+    } else {
+        $r = Invoke-Box $box
+        $after = Get-Content $box.settings -Raw | ConvertFrom-Json
+        $ptu = @($after.hooks.PostToolUse)
+        Add-Result 'uninstall: keeps a co-located third-party hook' `
+        ($r.code -eq 0 -and $ptu.Count -eq 1 -and @($ptu[0].hooks).Count -eq 1 `
+                -and $ptu[0].hooks[0].command -eq 'neighbour-tool' -and $ptu[0].matcher -eq 'Bash') `
+            "hooks=$(@($ptu[0].hooks).Count) survivor=$($ptu[0].hooks[0].command) matcher=$($ptu[0].matcher)"
+        Remove-Item -Recurse -Force $box.dir
+    }
 
     # 4. Nothing of ours registered: say so, change nothing, exit 0.
     $none = { param($hook) '{ "model": "x", "hooks": { "SessionStart": [ { "hooks": [ { "type": "command", "command": "other" } ] } ] } }' }
@@ -284,13 +347,17 @@ if (-not $uninstall) {
 
     # 8. A copy exists after a real removal. An uninstall is exactly when a user
     #    wants a way back.
-    $box = New-Box -Source $uninstall -Content $withHook
-    $null = Invoke-Box $box
-    $bk = $box.settings + '.pre-uninstall-backup'
-    Add-Result 'uninstall: takes a pre-write backup' `
-    ((Test-Path $bk) -and (Get-Content $bk -Raw) -match 'someone-elses-hook') `
-        "exists=$(Test-Path $bk)"
-    Remove-Item -Recurse -Force $box.dir
+    $box = New-UninstallBox -Content $withHook
+    if (-not $box) {
+        Add-Result 'uninstall: takes a pre-write backup' $false 'could not learn the installed hook command'
+    } else {
+        $r = Invoke-Box $box
+        $bk = $box.settings + '.pre-uninstall-backup'
+        Add-Result 'uninstall: takes a pre-write backup' `
+        ((Test-Path $bk) -and (Get-Content $bk -Raw) -match 'someone-elses-hook') `
+            "exists=$(Test-Path $bk) removalExit=$($r.code)"
+        Remove-Item -Recurse -Force $box.dir
+    }
 }
 
 # ── report ────────────────────────────────────────────────────────────────────
