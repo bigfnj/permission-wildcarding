@@ -143,7 +143,7 @@ test('activation does not leak channels, watchers or timers', async () => {
     window: {
       createStatusBarItem() { return { hide() {}, show() {}, dispose() {} }; },
       createOutputChannel(name) {
-        const channel = { name, disposed: false, appendLine() {}, show() {}, dispose() { this.disposed = true; } };
+        const channel = { name, disposed: false, appendLine() {}, clear() {}, show() {}, dispose() { this.disposed = true; } };
         channels.push(channel);
         return channel;
       },

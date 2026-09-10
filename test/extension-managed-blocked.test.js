@@ -81,6 +81,10 @@ test('the Review command names families a managed rule blocks, and offers the de
       createOutputChannel() {
         return {
           appendLine(line) { channelLines.push(line); },
+          // Real OutputChannel API, and the report path now uses it. Modelled
+          // faithfully rather than stubbed empty, or this mock would report a
+          // channel that grows forever while the product's does not.
+          clear() { channelLines.length = 0; },
           show() { shown = true; },
           dispose() {},
         };
@@ -169,7 +173,12 @@ test('the Review command names families a managed rule blocks, and offers the de
     // "no candidates" toast made it unreachable in the only situation that
     // matters: a busy review list on a machine that keeps getting prompted.
     // It must produce the same detail with no dependence on Review's state.
-    channelLines.length = 0;
+    // Deliberately NOT clearing channelLines by hand any more: the report path
+    // calls OutputChannel.clear() itself now, and that is the thing worth
+    // asserting. The channel is shared and these are palette actions with no
+    // call limit, so without it the second report lands underneath the first
+    // and the reader scrolls past stale output to reach what they just asked
+    // for. A hand-reset here would hide exactly that.
     shown = false;
     assert.equal(commands.has('permission-wildcarding.autoLearnShowBlocked'), true,
       'the command is registered, or the picker title names something unrunnable');
@@ -178,6 +187,13 @@ test('the Review command names families a managed rule blocks, and offers the de
     const direct = channelLines.join('\n');
     assert.match(direct, /Bash\(curl \*\) — 55 successful runs — managed ask: Bash\(curl:\*\)/);
     assert.match(direct, /Bash\(git push \*\) — 1 successful run — managed ask: Bash\(git push:\*\)/);
+    // One copy, not two. This is the assertion the channel-count test could
+    // never make: collapsing to a single shared channel fixed the disposal
+    // leak and replaced it with an unbounded document.
+    assert.equal(
+      channelLines.filter((line) => /Bash\(curl \*\) — 55 successful runs/.test(line)).length, 1,
+      'the second report must replace the first, not accumulate beneath it',
+    );
   } finally {
     // deactivate() has to run even when an assertion above throws. activate()
     // starts interval timers, and leaving them alive keeps the test process up

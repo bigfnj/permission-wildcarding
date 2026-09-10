@@ -36,7 +36,7 @@ function harness(tempHome) {
     },
     window: {
       createStatusBarItem() { return { hide() {}, show() {}, dispose() {} }; },
-      createOutputChannel() { return { appendLine() {}, show() {}, dispose() {} }; },
+      createOutputChannel() { return { appendLine() {}, clear() {}, show() {}, dispose() {} }; },
       registerWebviewViewProvider() { return disposable(); },
       setStatusBarMessage(message) { shown.status.push(message); },
       showErrorMessage(message) { shown.error.push(message); return Promise.resolve(undefined); },

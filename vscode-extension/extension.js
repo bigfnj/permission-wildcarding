@@ -399,7 +399,7 @@ function onManagedPolicyChanged() {
     'Show detail'
   ).then((choice) => {
     if (choice !== 'Show detail') return;
-    const channel = sharedChannel();
+    const channel = sharedChannel({ fresh: true });
     // Name the source honestly. On a console-managed org there is often no
     // managed-settings.json at all, and saying "managed policy: undefined" would
     // be worse than saying where the signal actually came from.
@@ -818,7 +818,13 @@ function memoryCardData() {
   let out = null;
   try {
     const { conf, dir, report } = memoryReport();
-    if (dir && report) {
+    // `conf.enabled` is honoured here, not just discovered. memoryLint.activate()
+    // returns early when memory.enabled is false and so never registers
+    // `permission-wildcarding.lintMemory`, while this card gated on `dir &&
+    // report` alone — so with the feature switched off the card still rendered
+    // and its link posted a command that does not exist, which VS Code reports
+    // as "command not found". Same key, two components, one of them ignoring it.
+    if (conf.enabled !== false && dir && report) {
       const st = recallStatus();
       // embedded/indexable both exclude MEMORY.md, so a complete cache reads N of N
       // rather than looking one short forever.
@@ -1166,7 +1172,7 @@ async function reviewAutoLearnCandidates() {
   const blockedCount = (managed.inertFamilies || []).length;
   const blockedNote = managedBlockedNote(managed);
   const showBlockedDetail = () => {
-    const channel = sharedChannel();
+    const channel = sharedChannel({ fresh: true });
     for (const line of managedBlockedDetail(managed)) channel.appendLine(line);
     channel.show(true);
   };
@@ -1389,7 +1395,7 @@ function showAutoLearnBlocked() {
       'Auto Learn: no command family is blocked by your managed policy.');
     return;
   }
-  const channel = sharedChannel();
+  const channel = sharedChannel({ fresh: true });
   for (const line of managedBlockedDetail(managed)) channel.appendLine(line);
   channel.show(true);
 }
@@ -1695,8 +1701,16 @@ function registerLocalWatchers(context) {
 // Created on first use and disposed with the extension. Lazy rather than built
 // in activate, because the mocked-vscode activation test does not stub every
 // window API and a channel nobody opened costs nothing.
-function sharedChannel() {
+function sharedChannel({ fresh = false } = {}) {
   if (!outputChannel) outputChannel = vscode.window.createOutputChannel('Permission Wildcarding');
+  // Every consumer writes a SELF-CONTAINED report and none of them had a way to
+  // start a clean one. Collapsing N channels into one fixed the disposal leak
+  // and traded it for an unbounded document: these are palette and notification
+  // actions with no call limit, so "Show blocked" ten times printed ten reports
+  // with no separator, oldest first, and the reader had to scroll to find the
+  // one they just asked for. The old test asserted the channel COUNT and
+  // nothing about its content, which is why this survived the fix.
+  if (fresh) outputChannel.clear();
   return outputChannel;
 }
 
@@ -2647,6 +2661,22 @@ class WildcardingViewProvider {
         case 'remove':       this._remove(msg.value); break;
       }
     });
+
+    // The view is disposed every time it is hidden — package.json declares it
+    // without retainContextWhenHidden — and re-resolved on show. Without this,
+    // `this.view` kept pointing at the disposed one, and `refresh()` guards only
+    // on `!this.view`: every dashboard?.refresh() call site (there are dozens,
+    // several of them file-watcher callbacks) would run the entire synchronous
+    // work-up first — processAllowList, a MEMORY.md read per discovered store, a
+    // dry-run drain per workspace folder — and only then throw on postMessage.
+    // From a watcher callback that surfaces as an unhandled extension-host
+    // error, and the wasted work repeated on every background event for as long
+    // as the sidebar stayed collapsed.
+    //
+    // Identity-checked before nulling: a hide/show race can resolve the next
+    // view before the previous one's disposal is delivered, and clearing
+    // unconditionally would drop the live view instead of the dead one.
+    view.onDidDispose(() => { if (this.view === view) this.view = null; });
 
     view.onDidChangeVisibility(() => { if (view.visible) this.refresh(); });
     this.refresh();

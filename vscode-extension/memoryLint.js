@@ -132,9 +132,22 @@ class MemoryLint {
     this.watchers = new Map();
     this.debounce = null;
     this.timer = null;
+    // Set once the subscriptions are disposed, so a callback that was already
+    // in flight cannot act on a torn-down instance. See refresh().
+    this.disposed = false;
   }
 
   activate(context) {
+    // Registered BEFORE the enabled check, and unconditionally. package.json
+    // declares `permission-wildcarding.lintMemory` with no `when` clause and
+    // `contributes.menus.commandPalette` is null, so the palette entry exists
+    // whatever this setting says. Registering it only on the enabled path left
+    // the command's one discoverable entry point raising "command not found".
+    // showReport() answers for the disabled case itself.
+    context.subscriptions.push(
+      vscode.commands.registerCommand('permission-wildcarding.lintMemory', () => this.showReport())
+    );
+
     if (!cfg().enabled) return;
 
     this.diags = vscode.languages.createDiagnosticCollection('claude-memory');
@@ -161,9 +174,25 @@ class MemoryLint {
     );
 
     // The backstop: a move leaves no live watcher to report it, so re-discover on a timer.
+    this.disposed = false;
     this.timer = setInterval(() => this.refresh(), RECONCILE_MS);
     if (typeof this.timer?.unref === 'function') this.timer.unref();
-    context.subscriptions.push({ dispose: () => { clearInterval(this.timer); this.timer = null; } });
+    // The debounce timer belongs here too. It used to be armed by schedule()
+    // and cleared by nothing: a MEMORY.md write within 300 ms of a reload left
+    // it live, and it then fired refresh() AFTER every subscription above was
+    // disposed — clearing a disposed DiagnosticCollection, hiding a disposed
+    // StatusBarItem, and calling syncWatchers(), which creates a fresh watcher
+    // per discovered dir into a map nothing will ever drain again. That is the
+    // same shape as the leak this file is held up elsewhere as the model for.
+    context.subscriptions.push({
+      dispose: () => {
+        this.disposed = true;
+        clearInterval(this.timer);
+        this.timer = null;
+        clearTimeout(this.debounce);
+        this.debounce = null;
+      },
+    });
 
     this.refresh();
   }
@@ -213,6 +242,11 @@ class MemoryLint {
   }
 
   refresh() {
+    // Belt to the cleared-timer brace. Clearing the timers stops a NEW callback
+    // from being scheduled; it cannot recall one that already fired and is
+    // sitting in the microtask queue. Everything below touches objects VS Code
+    // has disposed, and `this.diags.clear()` is not even optional-chained.
+    if (this.disposed) return;
     const conf = cfg();
     if (!conf.enabled) { this.status?.hide(); this.diags?.clear(); this.disposeWatchers(); return; }
     const dirs = discoverDirs(conf);
@@ -266,6 +300,15 @@ class MemoryLint {
 
   showReport() {
     const conf = cfg();
+    // Reachable with the feature off, because the command is now always
+    // registered. Say so plainly instead of dereferencing this.channel, which
+    // activate() never created on that path.
+    if (!conf.enabled) {
+      vscode.window.showInformationMessage(
+        'permission-wildcarding: memory lint is off — set permissionWildcarding.memory.enabled to true.'
+      );
+      return;
+    }
     const dirs = discoverDirs(conf);
     const dir = this.primaryDir(dirs);
     if (!dir) {

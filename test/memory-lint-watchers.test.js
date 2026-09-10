@@ -15,9 +15,14 @@ const Module = require('node:module');
 
 function disposable() { return { dispose() {} }; }
 
-function harness(tempHome) {
+function harness(tempHome, overrides = {}) {
   const created = [];
   const statusText = [];
+  // Command ids are recorded, not discarded: whether a command is registered
+  // at all is the difference between a working palette entry and "command
+  // not found", and it depends on config.
+  const registered = [];
+  const info = [];
   const vscode = {
     RelativePattern: class RelativePattern {
       constructor(base, pattern) { this.base = base; this.pattern = pattern; }
@@ -28,7 +33,7 @@ function harness(tempHome) {
     Range: class Range { constructor(a, b, c, d) { Object.assign(this, { a, b, c, d }); } },
     Diagnostic: class Diagnostic { constructor(range, message) { Object.assign(this, { range, message }); } },
     DiagnosticSeverity: { Warning: 1, Information: 2 },
-    commands: { registerCommand: () => disposable() },
+    commands: { registerCommand: (id) => { registered.push(id); return disposable(); } },
     languages: { createDiagnosticCollection: () => ({ set() {}, clear() {}, dispose() {} }) },
     window: {
       createOutputChannel: () => ({ appendLine() {}, clear() {}, show() {}, dispose() {} }),
@@ -38,9 +43,15 @@ function harness(tempHome) {
         get text() { return statusText[statusText.length - 1]; },
       }),
       onDidChangeActiveTextEditor: () => disposable(),
+      // Recorded, not stubbed empty: with the lint disabled the report has
+      // nowhere to write, so what it TELLS the user is the whole behaviour.
+      showInformationMessage: (message) => { info.push(message); return Promise.resolve(); },
     },
     workspace: {
-      getConfiguration: () => ({ get: (key, fallback) => fallback }),
+      getConfiguration: () => ({
+        get: (key, fallback) => (Object.prototype.hasOwnProperty.call(overrides, key)
+          ? overrides[key] : fallback),
+      }),
       createFileSystemWatcher(pattern) {
         const watcher = {
           pattern, disposed: false,
@@ -71,7 +82,7 @@ function harness(tempHome) {
     global.setInterval = originalSetInterval;
     delete require.cache[modulePath];
   };
-  return { loaded, created, statusText, intervals, restore };
+  return { loaded, created, statusText, intervals, registered, info, restore };
 }
 
 function writeStore(dir, indexBody) {
@@ -161,6 +172,89 @@ test('disabling the lint releases every watcher it was holding', () => {
     lint.disposeWatchers();
     assert.equal(lint.watchers.size, 0);
     assert.equal(h.created.every((w) => w.disposed), true);
+  } finally {
+    h.restore();
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  }
+});
+
+// The debounce timer used to be armed by schedule() and cleared by nothing. A
+// MEMORY.md write within 300 ms of a reload left it live, and it then fired
+// refresh() after every subscription had been disposed — clearing a disposed
+// DiagnosticCollection, hiding a disposed StatusBarItem, and calling
+// syncWatchers(), which creates a watcher per discovered dir into a map nothing
+// would ever drain again. Two guards, so this test asserts both.
+test('the debounce timer is cleared on teardown, and cannot build watchers after it', () => {
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'memory-lint-debounce-'));
+  const dir = path.join(tempHome, '.claude', 'projects', 'd---work', 'memory');
+  writeStore(dir, '# Memory Index\n\n- [one](one.md) — hook\n');
+  fs.writeFileSync(path.join(dir, 'one.md'), 'body\n', 'utf8');
+
+  const h = harness(tempHome);
+  // Stubbed locally rather than in the shared harness: the other tests here do
+  // not arm a debounce, and a global timer stub they did not ask for is exactly
+  // the kind of shared-fixture coupling that makes one failure look like three.
+  const realSetTimeout = global.setTimeout;
+  const realClearTimeout = global.clearTimeout;
+  const armed = [];
+  let cleared = 0;
+  global.setTimeout = (fn, ms) => { const handle = { fn, ms }; armed.push(handle); return handle; };
+  global.clearTimeout = (handle) => { if (handle) cleared += 1; };
+  try {
+    const lint = new h.loaded.MemoryLint();
+    const subscriptions = [];
+    lint.activate({ subscriptions });
+    const watchersAfterActivate = h.created.length;
+    assert.ok(watchersAfterActivate > 0, 'precondition: activation discovered the store');
+
+    // An external write to MEMORY.md, 300 ms before the user reloads the window.
+    lint.schedule();
+    assert.equal(armed.length, 1, 'precondition: schedule() armed the debounce');
+
+    // The reload: VS Code disposes every registered subscription.
+    for (const subscription of subscriptions) subscription.dispose();
+    assert.ok(cleared > 0, 'teardown has to clear the debounce, not only the interval');
+
+    // Belt and brace. Clearing stops a callback being scheduled; it cannot
+    // recall one already dispatched, so refresh() must also refuse to run.
+    armed[0].fn();
+    assert.equal(h.created.length, watchersAfterActivate,
+      'a post-teardown refresh must not create another watcher per discovered dir');
+  } finally {
+    global.setTimeout = realSetTimeout;
+    global.clearTimeout = realClearTimeout;
+    h.restore();
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  }
+});
+
+// package.json declares permission-wildcarding.lintMemory with no `when` clause
+// and a null commandPalette section, so the palette entry exists whatever
+// memory.enabled says. Registration used to sit AFTER the enabled check, so
+// with the feature off the command's only discoverable entry point raised
+// "command not found" — a declared-but-unwired command, not a missing feature.
+test('lintMemory stays registered when the lint is disabled, and says so', () => {
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'memory-lint-off-'));
+  const dir = path.join(tempHome, '.claude', 'projects', 'd---off', 'memory');
+  writeStore(dir, '# Memory Index\n\n- [one](one.md) — hook\n');
+
+  const h = harness(tempHome, { 'memory.enabled': false });
+  try {
+    const lint = new h.loaded.MemoryLint();
+    lint.activate({ subscriptions: [] });
+
+    assert.ok(h.registered.includes('permission-wildcarding.lintMemory'),
+      'the command package.json advertises must exist even with the lint off');
+    // ...and the feature really is off, so this is not just "enabled ignored".
+    assert.equal(lint.watchers.size, 0, 'no watchers when disabled');
+    assert.equal(h.intervals.length, 0, 'no reconcile timer when disabled');
+    assert.equal(lint.diags, null, 'no diagnostic collection when disabled');
+
+    // Invoking it must report, not throw: activate() never built this.channel
+    // on the disabled path, and showReport() used to dereference it.
+    assert.doesNotThrow(() => lint.showReport());
+    assert.match(h.info.join(' '), /memory lint is off/,
+      'it has to name the reason, not fail silently or report an empty index');
   } finally {
     h.restore();
     fs.rmSync(tempHome, { recursive: true, force: true });
