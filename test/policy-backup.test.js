@@ -411,3 +411,81 @@ test('a stale mirror cannot resurrect an entry pruned from the primary', async (
     await app.dispose();
   }
 });
+
+test('MAX off purges a blanket that arrived WHILE MAX was on', async (t) => {
+  // The first coverage of what buildMaxAllowSet's ARGUMENT actually decides.
+  //
+  // An audit reported two surviving mutants here and concluded the change was
+  // untested. Both halves needed correcting. The change cannot be reverted —
+  // f041031 deleted the readSettings() call, so the mutation that would test it
+  // (`the earlier read's allow`) cannot be written against the current code. And
+  // the two mutants it did run are indistinguishable on every existing fixture,
+  // for a findable reason: buildMaxAllowSet's first seven entries are the
+  // MAX_ALLOW_CORE constant, so only the `mcp__*` tail varies, and
+  // detectMcpServers matches the PREFIX `mcp__S__` — so a specific
+  // `mcp__S__tool` surviving into the restored list still yields server S.
+  //
+  // The only discriminating input is an `mcp__S__*` blanket that lands WHILE MAX
+  // is on, for a server with no other `mcp__S__` entry. disableMaxAllow computes
+  // `blanket` from the CURRENT list, so it strips that entry, and the pre-MAX
+  // snapshot cannot restore it — meaning only the read the write landed on ever
+  // knew server S existed.
+  //
+  // Verified against the real functions:
+  //   pre-MAX     ['Bash(git status *)', 'mcp__context7__query-docs']  (a fixed point)
+  //   MAX-ON      the 7 core + mcp__context7__*   (context7 comes from the prefix)
+  //   injected    + mcp__figma__*                 (still a fixed point)
+  //   purge set from the MAX-ON list  -> includes BOTH mcp blankets   <- correct
+  //   from the post-off list          -> includes only mcp__context7__*
+  //   from []                         -> the 7 core only
+  const env = setup(t);
+  // context7 appears ONLY in specific form, so it is the user's and must keep
+  // its cover; figma will appear only as a blanket, so it must lose it.
+  env.write({ permissions: { allow: ['Bash(git status *)', 'mcp__context7__query-docs'], deny: DENY } });
+
+  const app = harness(env.tempHome);
+  try {
+    await app.commands.get('permission-wildcarding.runNow')();
+    await app.commands.get('permission-wildcarding.toggleMax')();
+
+    // What a Claude Code approval or an Auto Learn apply does while MAX is on.
+    const whileOn = env.read();
+    whileOn.permissions.allow.push('mcp__figma__*');
+    fs.writeFileSync(env.settingsPath, JSON.stringify(whileOn, null, 2) + '\n');
+    await app.commands.get('permission-wildcarding.runNow')();
+
+    const whileMax = JSON.parse(fs.readFileSync(env.backupPath, 'utf8')).allow;
+    assert.ok(whileMax.includes('mcp__figma__*'),
+      'precondition: the blanket that arrived during MAX reached the backup');
+    assert.ok(whileMax.includes('mcp__context7__*'),
+      'precondition: MAX\u2019s own context7 blanket reached the backup');
+
+    await app.commands.get('permission-wildcarding.toggleMax')();
+    const live = env.read().permissions.allow;
+    const saved = JSON.parse(fs.readFileSync(env.backupPath, 'utf8')).allow;
+
+    // A. Kills both of the audit's mutants (the post-MAX list, and []). figma's
+    //    only footprint was the blanket, so it is visible only in the list the
+    //    write landed on. Verified: both die here, on this assertion.
+    assert.ok(!live.includes('mcp__figma__*'),
+      'precondition: MAX off dropped the blanket it could not restore');
+    assert.ok(!saved.includes('mcp__figma__*'),
+      'the purge set must come from the list the write landed on, not the list it '
+      + 'produced — otherwise the policy guard re-asserts an mcp blanket and MAX '
+      + 'creeps back on');
+
+    // B. Not a discriminator between the two mutants — assert.ok throws on A
+    //    first, so B is never reached for either. It pins the other half of the
+    //    contract: MAX's own mcp blanket goes while the user's specific entry
+    //    keeps its cover, which is what makes A a statement about PROVENANCE
+    //    rather than about mcp entries in general.
+    assert.ok(!saved.includes('mcp__context7__*'),
+      'MAX\u2019s own mcp blanket leaves the backup');
+    assert.ok(saved.includes('mcp__context7__query-docs'),
+      'the user\u2019s specific entry is not MAX\u2019s and keeps its cover');
+    assert.ok(live.includes('mcp__context7__query-docs'),
+      'precondition: the specific entry is live again after MAX off');
+  } finally {
+    await app.dispose();
+  }
+});

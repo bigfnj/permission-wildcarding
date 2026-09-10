@@ -2246,13 +2246,29 @@ function toggleMax() {
         // res.settings already unions the pre-MAX snapshot back in, so anything
         // still present there is the user's and must keep its backup cover.
         //
-        // Both halves now come from ONE read. This used to compute
-        // buildMaxAllowSet from the caller's older `settings` while measuring it
-        // against res.settings from the transform — two views of one file inside
-        // one expression, which is the same class of defect this change removes.
+        // NAMING, corrected: this used to be called `preMax`, which was wrong and
+        // actively misleading. `wroteOnto` is writeTransform's `latest` — the read
+        // the write landed on — so when turning MAX OFF its allow list is the
+        // MAX-ON on-disk state, NOT the pre-MAX list. The pre-MAX list exists only
+        // in the sidecar snapshot, and disableMaxAllow is what unions it back.
+        //
+        // Both halves come from ONE read, which is the point: the set to purge is
+        // derived from the list the write actually rebased onto, and measured
+        // against the list the write produced.
+        //
+        // What actually varies with this argument is narrow, and worth stating so
+        // nobody mistakes a passing suite for coverage. buildMaxAllowSet's first
+        // seven entries are the MAX_ALLOW_CORE constant, so only the `mcp__*` tail
+        // depends on it — and detectMcpServers matches the PREFIX `mcp__S__`, so a
+        // specific `mcp__S__tool` surviving into the restored list still yields
+        // server S. The only input that distinguishes this from the post-MAX list
+        // is an `mcp__S__*` blanket that arrived WHILE MAX was on, for a server
+        // with no other `mcp__S__` entry: disableMaxAllow strips it and the
+        // snapshot cannot restore it, so only the freshest read knows S existed.
+        // That is the case test/policy-backup.test.js now pins.
         const restoredAllow = res.settings?.permissions?.allow ?? [];
-        const preMax = wroteOnto?.permissions?.allow ?? [];
-        forgetFromBackup(buildMaxAllowSet(preMax)
+        const wroteOntoAllow = wroteOnto?.permissions?.allow ?? [];
+        forgetFromBackup(buildMaxAllowSet(wroteOntoAllow)
           .filter((entry) => !restoredAllow.includes(entry)));
       }
       lastRun = Date.now();
