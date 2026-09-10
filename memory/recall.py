@@ -387,7 +387,17 @@ def lint():
             print(f"    [[{l}]]")
         print()
 
-    if not (over or broken or no_scope or no_gate or demote or stale_gates):
+    # `demote` is deliberately NOT a condition here, though it is still printed
+    # above. Every other finding is actionable -- over budget, a link to a missing
+    # file, a feedback with no scope, a scope:global with no gate block, a gate
+    # edited without a recompile -- and each names a fix. A demotion candidate
+    # names none: the comment where it is collected says it is "Reported and never
+    # acted on", because demoting a memory nothing points at makes it invisible
+    # rather than quiet. Including it made `clean:` unreachable for any corpus
+    # holding a single project or reference memory, which is every real one, and
+    # it contradicted this very message -- which claims budget, links and standing
+    # orders, and says nothing about residency advice.
+    if not (over or broken or no_scope or no_gate or stale_gates):
         print("  clean: index within budget, links resolve, every standing order compiled.\n")
 
 
