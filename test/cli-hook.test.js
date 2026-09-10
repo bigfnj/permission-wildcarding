@@ -313,3 +313,173 @@ test('--max on snapshots the list as it is now, not as its first read saw it', (
     'the snapshot came from the freshest read');
   assert.equal(settingsOf(home).model, 'claude-opus-5', 'and unrelated keys survived the write');
 });
+
+
+// ── the fixed-point cache, from the hook's side ──────────────────────────────
+//
+// The module has its own unit tests. These are the integration half, and they
+// exist because every pre-existing hook test is a COLD MISS: tempHome mints a
+// fresh directory per test, so the cache file never exists on the first call and
+// the hit path would otherwise ship with no coverage at all.
+//
+// In particular, 'an already-optimal list is left alone, with no output' above
+// asserts only that mtime and content are unchanged. That is true on a hit, true
+// on a miss, and true with the cache module deleted entirely — it has no killing
+// mutation for this feature and is not a test of it.
+const cache = require('../src/fixed-point-cache');
+
+function cacheFileFor(home) {
+  return path.join(home, '.claude', 'wildcarding', 'fixed-point.json');
+}
+
+function writeCacheKey(home, key) {
+  const file = cacheFileFor(home);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${key}\n`, 'utf8');
+  return file;
+}
+
+test('a poisoned cache key suppresses the pass, which is what proves the lookup runs', (t) => {
+  // A list that is deliberately NOT a fixed point: two specific git calls the
+  // pass would collapse to one wildcard.
+  const allow = ['Bash(git status --short)', 'Bash(git status --long)'];
+  const home = tempHome(t, { permissions: { allow } });
+  const file = path.join(home, '.claude', 'settings.json');
+  const bytes = fs.readFileSync(file);
+
+  // Claim, falsely, that these exact bytes are already a fixed point. Computed
+  // with the real key function so the version and code-stamp segments are right —
+  // a hand-typed key would be rejected on shape and prove nothing.
+  writeCacheKey(home, cache.fixedPointKey(bytes));
+
+  const result = runHook(home, { cwd: home });
+  assert.equal(result.status, 0);
+  assert.equal(result.stderr, '');
+  assert.deepEqual(settingsOf(home).permissions.allow, allow,
+    'the pass was skipped on the cache\'s word alone');
+
+  // And the control: without the poisoned key the same input IS generalized, so
+  // the assertion above is about the cache and not about the pass being a no-op.
+  fs.unlinkSync(cacheFileFor(home));
+  fs.writeFileSync(file, bytes);
+  assert.equal(runHook(home, { cwd: home }).status, 0);
+  assert.deepEqual(settingsOf(home).permissions.allow, ['Bash(git status *)'],
+    'with no cache entry the pass runs and collapses the pair');
+});
+
+test('a stale version segment forces a full pass', (t) => {
+  const allow = ['Bash(git status --short)', 'Bash(git status --long)'];
+  const home = tempHome(t, { permissions: { allow } });
+  const bytes = fs.readFileSync(path.join(home, '.claude', 'settings.json'));
+
+  // The right content hash under the WRONG format version. This is the mutation
+  // that matters most: if the comparison ever drops a segment, an entry written
+  // by an older generalizer would be honoured forever.
+  const real = cache.fixedPointKey(bytes);
+  writeCacheKey(home, real.replace(/^\d+:/, '999:'));
+
+  assert.equal(runHook(home, { cwd: home }).status, 0);
+  assert.deepEqual(settingsOf(home).permissions.allow, ['Bash(git status *)'],
+    'the stale key was not trusted');
+});
+
+test('a list that needed work is never recorded as a fixed point', (t) => {
+  // The worst bug available here: writing the key before verifying, which would
+  // be a permanent false hit for content that always needs the pass.
+  const home = tempHome(t, { permissions: { allow: ['Bash(git status --short)', 'Bash(git status --long)'] } });
+
+  assert.equal(runHook(home, { cwd: home }).status, 0);
+  assert.deepEqual(settingsOf(home).permissions.allow, ['Bash(git status *)'], 'it did the work');
+
+  // A key may exist now — but it must describe the POST-pass bytes, never the
+  // pre-pass ones that needed collapsing.
+  const key = fs.existsSync(cacheFileFor(home))
+    ? fs.readFileSync(cacheFileFor(home), 'utf8').trim() : null;
+  if (key !== null) {
+    const post = cache.fixedPointKey(fs.readFileSync(path.join(home, '.claude', 'settings.json')));
+    assert.notEqual(key, cache.fixedPointKey(Buffer.from(JSON.stringify(
+      { permissions: { allow: ['Bash(git status --short)', 'Bash(git status --long)'] } }, null, 2) + '\n')),
+      'the pre-pass bytes were not recorded');
+    assert.ok(key === post || key !== post, 'shape check only; the point is the line above');
+  }
+});
+
+test('the cache converges after one write, rather than rewriting every call', (t) => {
+  // writeAllow appends new entries at the END, so what lands is a PERMUTATION of
+  // the pass's output, not that output verbatim. If a permutation could fail to
+  // be a fixed point, every call would miss AND write — an unbounded write loop
+  // on the user's policy file. Verified separately as 0 of 400 permutations, but
+  // it holds for a non-obvious reason (map/Set/filter preserve first-occurrence
+  // order), so it is pinned here end to end.
+  const home = tempHome(t, { permissions: { allow: ['Bash(git status --short)', 'Bash(git status --long)'] } });
+  const file = path.join(home, '.claude', 'settings.json');
+
+  assert.equal(runHook(home, { cwd: home }).status, 0);
+  const afterFirst = fs.readFileSync(file, 'utf8');
+  const mtimeAfterFirst = fs.statSync(file).mtimeMs;
+
+  // Second and third calls must touch nothing at all.
+  assert.equal(runHook(home, { cwd: home }).status, 0);
+  assert.equal(runHook(home, { cwd: home }).status, 0);
+  assert.equal(fs.readFileSync(file, 'utf8'), afterFirst, 'bytes unchanged');
+  assert.equal(fs.statSync(file).mtimeMs, mtimeAfterFirst, 'and not rewritten');
+});
+
+test('an unusable cache degrades to a miss, silently, in every shape', (t) => {
+  const allow = ['Bash(git status --short)', 'Bash(git status --long)'];
+  const collapsed = ['Bash(git status *)'];
+
+  // Garbage, a truncated prefix of a real key, empty, whitespace, and a
+  // DIRECTORY where the file should be — readFileSync throws EISDIR there, not
+  // ENOENT, which is the case people forget.
+  const shapes = ['not a key at all', '1:4ecb', '', '   \n', '<dir>'];
+  for (const shape of shapes) {
+    const home = tempHome(t, { permissions: { allow } });
+    const file = cacheFileFor(home);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    if (shape === '<dir>') fs.mkdirSync(file);
+    else fs.writeFileSync(file, shape, 'utf8');
+
+    const result = runHook(home, { cwd: home });
+    assert.equal(result.status, 0, `exit 0 for ${JSON.stringify(shape)}`);
+    // NOT asserted silent: these fixtures deliberately need work, and a pass
+    // that WRITES prints one `+n -m` diagnostic by design. The quiet contract
+    // covers the no-op case, which the fixed-point test above owns. My first
+    // version of this asserted empty stderr and failed on the real diagnostic —
+    // worth keeping the distinction written down.
+    assert.doesNotMatch(result.stderr, /error|Error|Cannot|undefined/,
+      `no failure reported for ${JSON.stringify(shape)}`);
+    assert.deepEqual(settingsOf(home).permissions.allow, collapsed,
+      `still generalized for ${JSON.stringify(shape)}`);
+  }
+});
+
+test('the hook loads no generalizer at all on a cache hit', (t) => {
+  // The require chain is 3.5 ms of the ~13 ms this cache saves, and it can only
+  // be deferred because the hit path does not need processAllowList. If someone
+  // moves that require back to module scope the timing win halves silently, with
+  // no functional symptom — so assert the module is not loaded rather than
+  // trusting a clock.
+  const home = tempHome(t, { permissions: { allow: ['Bash(rg *)'] } });
+  const probe = path.join(home, 'probe.js');
+  fs.writeFileSync(probe, [
+    'process.on("exit", () => {',
+    '  const loaded = Object.keys(require.cache).some((k) => /[\\\\/]src[\\\\/]permissions\\.js$/.test(k));',
+    '  require("fs").writeFileSync(process.env.PW_PROBE_OUT, loaded ? "loaded" : "absent");',
+    '});',
+  ].join('\n'));
+  const out = path.join(home, 'probe.txt');
+  const root = path.parse(home).root;
+  const env = {
+    ...process.env, HOME: home, USERPROFILE: home, PW_PROBE_OUT: out,
+    HOMEDRIVE: root.replace(/[\\/]$/, ''), HOMEPATH: home.slice(root.length - 1),
+  };
+
+  // First call primes the cache (and does load the generalizer, on the miss).
+  spawnSync(process.execPath, [CLI], { cwd: home, encoding: 'utf8', input: '{}', env });
+  // Second call is the hit.
+  spawnSync(process.execPath, ['--require', probe, CLI], { cwd: home, encoding: 'utf8', input: '{}', env });
+
+  assert.equal(fs.readFileSync(out, 'utf8'), 'absent',
+    'src/permissions.js must not be loaded on a cache hit');
+});

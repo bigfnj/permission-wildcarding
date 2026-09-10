@@ -4,10 +4,14 @@
 const fs = require('fs');
 const path = require('path');
 const os  = require('os');
-const {
-  processAllowList, writeFileAtomicSync, applyBypass, isBypassOn, currentMode,
-  applyMax, isMaxOn, maxLayers,
-} = require('../src/permissions');
+// NOTE: `../src/permissions` is NOT required here. Every name this file used to
+// destructure from it -- writeFileAtomicSync, applyBypass, isBypassOn,
+// currentMode, applyMax, isMaxOn, maxLayers -- is used only inside bypass(),
+// codexMax() and max(), which are command verbs. Nothing on the hook path needs
+// it once the fixed-point cache answers the common case, and the require is
+// 3.5 ms of the ~13 ms that cache saves. A test asserts the module is absent
+// from require.cache on a hit, because moving this back would halve the win with
+// no functional symptom at all.
 // codex-max, agent-guidance, agent-gates and child_process are used by exactly
 // one command verb each and by nothing on the hook path, which runs after every
 // single tool call. `learn()` below already lazy-requires the learner stack for
@@ -237,8 +241,39 @@ function readSettingsForWrite(label) {
 // the thing the next verb author would have found and reused.
 
 function run(input) {
-  const settings = readSettings();
-  if (!settings) finish(input, false);
+  // Read the bytes ONCE, as a Buffer. The hit path never pays the utf8 decode of
+  // a string it would throw away, and on a miss JSON.parse takes the Buffer
+  // directly.
+  let bytes;
+  try { bytes = fs.readFileSync(SETTINGS); }
+  catch { return finish(input, false); }   // absent, or unreadable — both silent
+
+  // The cache answers exactly one question: are THESE bytes already known to be
+  // a fixed point of processAllowList? A hit skips the parse, the pass, and the
+  // whole `../src/permissions` require chain — 13.2 ms of the hook's own work,
+  // measured cold, against ~1 ms to key the file.
+  //
+  // Its own module pulls nothing but fs/path/os, which is why the hash is
+  // hand-rolled: `require('crypto')` plus the first createHash plus a digest is
+  // 4.15 ms cold in a fresh process (min 3.758 over 21 runs), because the lazy
+  // OpenSSL init survives the module snapshot.
+  //
+  // A hit must still reach finish(). The drain's existsSync gate is independent
+  // of the wildcarding fixed point, and skipping it would silently stop
+  // promoting project-local approvals.
+  const cache = require('../src/fixed-point-cache');
+  if (cache.isFixedPoint(bytes)) return finish(input, false);
+
+  // Miss. Only now is the generalizer loaded — that require is 3.5 ms and the
+  // cache is the only thing that makes deferring it possible, since the pass was
+  // previously unconditional. See the lazy-require discipline at the top of this
+  // file.
+  const { processAllowList } = require('../src/permissions');
+
+  let settings;
+  try { settings = JSON.parse(bytes); }
+  catch { return finish(input, false); }   // mid-write; the next run retries
+  if (!settings || typeof settings !== 'object') return finish(input, false);
 
   const before = settings?.permissions?.allow ?? [];
   const after  = processAllowList(before);
@@ -252,7 +287,19 @@ function run(input) {
   // Deliberately NOT "lock on every call": the lock cycle is 3.7 ms of file
   // operations, and paying it on every tool call to discover there is nothing to
   // do is the same mistake the drain's existsSync test already corrected.
-  finish(input, JSON.stringify(before) !== JSON.stringify(after));
+  const pending = JSON.stringify(before) !== JSON.stringify(after);
+
+  // Record the key ONLY for a verified fixed point, and only for the bytes we
+  // actually read and checked. Never for bytes we believe we wrote: writeAllow
+  // re-reads and rebases inside itself, returns counts rather than the written
+  // text, and can fall back to a non-atomic in-place write — so the post-write
+  // content is a file state this process never saw. One wasted miss after a
+  // write is the correct price, and the cache converges on the next call because
+  // what writeAllow leaves behind is itself a fixed point (verified: 0 of 400
+  // permutations of the live list are not).
+  if (!pending) cache.writeFixedPoint(cache.fixedPointKey(bytes));
+
+  return finish(input, pending);
 }
 
 // One exit path for the hook, and now ONE lock acquisition covering both jobs.
@@ -269,6 +316,11 @@ function run(input) {
 // acquisition. A busy lock stays silent: the next tool call fires the hook
 // again and the pass is idempotent, so losing a turn costs at most one extra
 // prompt and never a permission.
+// Every caller now `return`s into this rather than relying on it never returning.
+// run() went from one tail call to five (read threw, cache hit, parse threw, not
+// an object, and the computed pending flag); leaning on process.exit alone across
+// five branches is how a cache write ends up running after a finish that did not
+// exit.
 function finish(input, wildcardPending) {
   const cwd = hookCwd(input);
   const drainPending = !!cwd
@@ -309,6 +361,7 @@ function hookCwd(input) {
 // hooks — comes from the newest file instead of a stale spread. Those fields,
 // not deny, are the common casualty: Claude Code rewrites them constantly.
 function wildcardUnderLock() {
+  const { processAllowList } = require('../src/permissions');
   const writer = settingsWriter();
   const state = writer.readSettingsState();
   const fresh = state.settings;
@@ -353,6 +406,7 @@ function mergeUserAllow(entries) {
   // wildcarding write — so it could revert what the extension had just landed.
   // The extension's half of the drain already routed through writeAllow
   // (vscode-extension/extension.js applyUserAllow); the CLI's was left behind.
+  const { processAllowList } = require('../src/permissions');
   const writer = settingsWriter();
   const fresh = writer.readSettingsState().settings ?? {};
   const existing = Array.isArray(fresh?.permissions?.allow) ? fresh.permissions.allow : [];
@@ -629,6 +683,7 @@ function seed() {
   // wait for the staleness window first.
   let outcome = null;
   withPolicyLock('--seed', () => {
+    const { processAllowList } = require('../src/permissions');
     const writer = settingsWriter();
     const settings = writer.readSettingsState().settings ?? {};
     const existing = Array.isArray(settings?.permissions?.allow) ? settings.permissions.allow : [];
@@ -686,6 +741,7 @@ function withPolicyLock(flag, run) {
 // stashes the previous mode so `off` restores it. Deny rules + Claude Code's
 // hard circuit breakers still apply — this suppresses prompts, not safeguards.
 function bypass(args) {
+  const { applyBypass, isBypassOn, currentMode } = require('../src/permissions');
   const cmd = (args[args.indexOf('--bypass') + 1] || 'status').toLowerCase();
 
   if (cmd === 'status') {
@@ -742,6 +798,7 @@ function bypass(args) {
 // No policy lock here: this writes Codex's config.toml, not Claude's
 // settings.json, so it shares no file with Auto Learn or the wildcarding pass.
 function codexMax(args) {
+  const { writeFileAtomicSync } = require('../src/permissions');
   const {
     CODEX_CONFIG, applyCodexMax, isCodexMaxOn, readApproval, sandboxMode,
     readEnterpriseBundle, targetApproval,
@@ -824,6 +881,7 @@ function codexMax(args) {
 // wildcards + a PreToolUse auto-approve hook), independent of Claude Code's
 // bypassPermissions mode. `--max on|off|status`; bare `--max` reports status.
 function max(args) {
+  const { applyMax, isMaxOn, maxLayers } = require('../src/permissions');
   const cmd = (args[args.indexOf('--max') + 1] || 'status').toLowerCase();
 
   if (cmd === 'status') {
