@@ -1,5 +1,28 @@
-# The two installers and the uninstaller are shell scripts. Git normalises them
-# to LF in the index via core.autocrlf, but the working tree keeps CRLF on
-# Windows — so copying one out of a checkout onto Linux without git ships a file
-# bash refuses. Pin the line endings so the working tree matches the index.
-*.sh text eol=lf
+# Every file with a shebang must be LF in the working tree, not just in the index.
+#
+# Git normalises to LF in the index via core.autocrlf, but on Windows the working
+# TREE keeps CRLF — so copying one of these out of a checkout onto Linux without
+# git ships a file the kernel refuses to execute. `#!/usr/bin/env node\r` fails as
+# `env: 'node\r': No such file or directory`.
+#
+# The original rule here was `*.sh` alone, which missed the file with the most to
+# lose: install.sh chmod +x's bin/wildcard-perms and registers its BARE PATH as
+# the PostToolUse hook command, so a CRLF copy fails on every single tool call.
+# Measured 2026-09-10, working tree vs index (all four had 0 CR in the index):
+# bin/wildcard-perms 874 CR bytes, memory/recall.py 529, memory/bench/bench_embed.py
+# 446, scripts/package.mjs 55.
+#
+# Deliberately NOT `* text=auto`: the four tracked .ps1 files (install.ps1,
+# uninstall.ps1, memory/bench/run.ps1, scripts/verify-release.ps1) have no shebang,
+# are Windows-only, and CRLF is correct for them.
+#
+# Adding rules here does not renormalise an existing checkout — that needs
+# `git add --renormalize .` once, which is why the earlier claim that "the working
+# tree matches the index" was true only for a fresh clone.
+
+*.sh  text eol=lf
+*.py  text eol=lf
+*.mjs text eol=lf
+
+# Extensionless, so no glob reaches it. This is the hook itself.
+bin/wildcard-perms text eol=lf

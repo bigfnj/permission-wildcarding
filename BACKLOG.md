@@ -708,30 +708,31 @@ installer against the live `~/.claude` five times. Nothing was lost — the hook
 already registered, which short-circuits before the write — but it is the reason
 the seam is documented here.)
 
-### `.gitattributes` is incomplete, and has not been applied to this tree
+### ~~`.gitattributes` is incomplete, and has not been applied to this tree~~ — FIXED 2026-09-10
 
-Measured CR bytes, working tree vs index, 2026-09-10:
+Kept as a record because the count in the original entry was wrong and the second
+half of the problem is a trap worth naming.
 
-```
-bin/wildcard-perms    worktree=842  index=0    (no attribute)
-memory/recall.py      worktree=529  index=0    (no attribute)
-scripts/package.mjs   worktree=55   index=0    (no attribute)
-install.sh            worktree=56   index=0    (eol=lf set)
-uninstall.sh          worktree=69   index=0    (eol=lf set)
-```
+**It was FOUR uncovered shebang files, not three** — this entry missed
+`memory/bench/bench_embed.py`. Measured CR bytes, working tree vs index, all four
+with 0 in the index: `bin/wildcard-perms` 874, `memory/recall.py` 529,
+`memory/bench/bench_embed.py` 446, `scripts/package.mjs` 55. The worst is
+`bin/wildcard-perms`: `install.sh` chmod +x's it and registers its BARE PATH as
+the hook command, so a CRLF copy on Linux gives
+`env: 'node\r': No such file or directory` on **every tool call**.
 
-Two separate problems. First, `*.sh text eol=lf` covers only the two shell
-scripts, and misses the file with the most to lose: `bin/wildcard-perms` has a
-`#!/usr/bin/env node` shebang, `install.sh` chmod +x's it and registers its bare
-path as the hook command, so a CRLF copy on Linux gives
-`env: 'node\r': No such file or directory` on every tool call.
-`memory/recall.py` and `scripts/package.mjs` are the same shape. Second, adding
-`.gitattributes` does not renormalize an existing checkout — `core.autocrlf=true`
-here — so the commit's "the working tree matches the index" is true only for a
-fresh clone.
+`.gitattributes` now pins `*.sh`, `*.py`, `*.mjs` and `bin/wildcard-perms`
+explicitly. Deliberately not `* text=auto`: the five tracked `.ps1` files have no
+shebang, are Windows-only, and CRLF is correct for them — verified they still
+report `text: unspecified`.
 
-Fix: widen to the three shebang'd files (or `* text=auto` with explicit binary
-exclusions) and run `git add --renormalize .` once.
+**The trap, for whoever hits this pattern again:** `git add --renormalize .` did
+**not** fix the working tree. The index was already LF, so renormalize found
+nothing to change and staged only `.gitattributes` itself. The working tree is
+only rewritten on checkout, so it took `rm <files> && git checkout -- <files>`.
+And `uninstall.sh` and `test/gates-stale.sh` were still CRLF in the tree despite
+`*.sh eol=lf` having been added hours earlier — for exactly this reason. A sweep
+of every `eol=lf` file now reports 0 CR across the tree.
 
 ### README claims that are now false
 
