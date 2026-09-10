@@ -20,6 +20,7 @@ const path = require('node:path');
 
 const {
   isCoveredBy, createCoverIndex, processAllowList, coverKeyCacheStats,
+  coverIndexKeyCacheStats,
 } = require('../src/permissions');
 
 // The full scan the index replaces. Deliberately written out here rather than
@@ -327,4 +328,76 @@ test('the key memo is bounded, and stays correct across an eviction', (t) => {
   assert.deepEqual(asSet(index.coveredBy(candidate)), expected, 'answer after the flood');
   assert.deepEqual(processAllowList(['Bash(git status --short)', 'Bash(git status *)']),
     ['Bash(git status *)'], 'and the pipeline still collapses after an eviction');
+});
+
+
+// Counted from OUTSIDE the module, like countBoundaryProbes above. `\*\s*$` is
+// tested by coverIndexKey for every rule that matches RULE_SHAPE, and that
+// source appears nowhere else in the repo — so "0 probes" cannot be satisfied by
+// the memo reporting its own hit count.
+function countStarProbes(run) {
+  const original = RegExp.prototype.test;
+  let count = 0;
+  RegExp.prototype.test = function counted(value) {
+    if (this.source === '\\*\\s*$') count += 1;
+    return original.call(this, value);
+  };
+  try { run(); } finally { RegExp.prototype.test = original; }
+  return count;
+}
+
+test('building an index twice keys each rule once, not twice', (t) => {
+  // coverIndexKey is memoized for the same reason as coverLookupKeys: a pure
+  // function of one string, so a global memo is correct regardless of which pool
+  // calls it. Safer, in fact — it returns a string or null, both immutable, so
+  // there is no shared-array hazard at all.
+  //
+  // It became worth doing because the coverLookupKeys memo moved the
+  // bottleneck: with the sweeps cached, createCoverIndex is the dominant term
+  // and coverIndexKey is ~74% of a build. Measured against a purpose-built arm
+  // with the memo removed, interleaved, warm n=200: 0.996/1.150 -> 0.498/0.560
+  // ms at 431 entries (-50%/-51%), and -55%/-53% at 1200.
+  const pool = ['Bash(zzq-alpha *)', 'Bash(zzq-bravo *)', 'Bash(zzq-charlie *)'];
+
+  const cold = countStarProbes(() => createCoverIndex(pool));
+  assert.equal(cold, pool.length, 'a cold build keys every starred rule exactly once');
+
+  assert.equal(countStarProbes(() => createCoverIndex(pool)), 0,
+    'a second build over the same rules must come from the memo, not re-key them');
+
+  // Keyed on the rule ALONE, so a DIFFERENT pool containing the same rule reuses
+  // the key. That is the claim which makes a module-global memo sound.
+  assert.equal(countStarProbes(() => createCoverIndex([...pool, 'Bash(zzq-delta *)'])), 1,
+    'only the rule it has not seen is keyed');
+
+  // A near-miss must not be served from the memo, or a memo returning one
+  // cached answer for everything would satisfy the assertions above.
+  assert.equal(countStarProbes(() => createCoverIndex(['Bash(zzq-alphax *)'])), 1,
+    'one character different is a different key, and is keyed');
+
+  // And the answers still agree with the oracle across the memo boundary.
+  const index = createCoverIndex(pool);
+  for (const probe of ['Bash(zzq-alpha go)', 'Bash(zzq-bravo)', 'Bash(other thing)']) {
+    const expected = [...new Set(oracleCoveredBy(probe, pool))].sort();
+    assert.deepEqual([...new Set(index.coveredBy(probe))].sort(), expected, `warm: ${probe}`);
+  }
+});
+
+test('the coverIndexKey memo is bounded and clears wholesale', (t) => {
+  // A bound nothing observes is not a bound. The extension is a long-lived host
+  // that requires this module once and keeps it for the window's lifetime.
+  const { limit } = coverIndexKeyCacheStats();
+  const flood = [];
+  for (let i = 0; i < limit + 40; i += 1) flood.push(`Bash(zzflood${i} *)`);
+  createCoverIndex(flood);
+
+  const after = coverIndexKeyCacheStats();
+  assert.ok(after.size <= after.limit,
+    `memo holds ${after.size} entries, cap is ${after.limit}`);
+  assert.ok(after.size > 0, 'and it did not simply stop caching');
+
+  // The clear is wholesale, so an entry from before the flood is gone and gets
+  // walked again rather than answered stale.
+  assert.equal(countStarProbes(() => createCoverIndex(['Bash(zzflood0 *)'])), 1,
+    'the clear must drop the pre-flood entry, forcing a fresh key');
 });

@@ -242,7 +242,39 @@ function isCoveredBy(specific, wildcard) {
 const RULE_SHAPE = /^([A-Za-z][A-Za-z0-9:_-]*)\((.*)\)$/s;
 const KEY_SEP = '\u0000';
 
+// Memoized for the same reason and by the same rule as coverLookupKeys below:
+// a pure function of one string, so a global memo is correct regardless of which
+// pool calls it. Safer than that one, in fact — this returns a string or null,
+// both immutable, so there is no shared-array hazard to argue about at all.
+//
+// Worth it because the earlier memo moved the bottleneck. With coverLookupKeys
+// cached, `createCoverIndex` became the dominant term — the two index builds are
+// 21.2% + 21.4% of a warm pass, now EQUAL to the two covers() sweeps — and
+// coverIndexKey is 74% of a build. Measured against a purpose-built arm with the
+// memo removed, interleaved, warm n=270: 0.983/1.095 -> 0.483/0.540 ms at 431
+// entries, a 51% cut, and 55% at 1200.
+//
+// `undefined` is the miss sentinel, which is why a non-indexable rule's `null`
+// is stored explicitly rather than left absent — the same distinction
+// permission-match.js's `cached()` documents.
+const COVER_INDEX_KEY_CACHE_LIMIT = 5000;
+const coverIndexKeyCache = new Map();
+
 function coverIndexKey(rule) {
+  if (typeof rule !== 'string') return coverIndexKeyUncached(rule);
+  const hit = coverIndexKeyCache.get(rule);
+  if (hit !== undefined) return hit;
+  const key = coverIndexKeyUncached(rule);
+  // Wholesale clear, not an LRU: the bookkeeping would cost more than the work
+  // it saves, and reaching this bound means a caller is synthesising rules in a
+  // loop. The cap has to exceed the list length or a clear lands mid-sweep and
+  // hands the next sweep a cold memo.
+  if (coverIndexKeyCache.size >= COVER_INDEX_KEY_CACHE_LIMIT) coverIndexKeyCache.clear();
+  coverIndexKeyCache.set(rule, key);
+  return key;
+}
+
+function coverIndexKeyUncached(rule) {
   const parts = RULE_SHAPE.exec(rule);
   if (!parts) return null;
   const [, tool, arg] = parts;
@@ -364,6 +396,10 @@ function coverLookupKeys(specific) {
 // reason permission-match.js:131-136 exposes matchCacheStats. A bound nothing
 // observes is not a bound: a test without this can only show that results
 // survive an eviction, which stays true when the cap is deleted.
+function coverIndexKeyCacheStats() {
+  return { size: coverIndexKeyCache.size, limit: COVER_INDEX_KEY_CACHE_LIMIT };
+}
+
 function coverKeyCacheStats() {
   return { size: coverKeyCache.size, limit: COVER_KEY_CACHE_LIMIT };
 }
@@ -817,7 +853,7 @@ function applyMax(settings, on) {
 module.exports = {
   generalizePermission, mineWildcard, BASH_SCRIPT_KEYWORDS,
   isCoveredBy, createCoverIndex, prunePermissions, processAllowList, writeFileAtomicSync,
-  coverKeyCacheStats,
+  coverKeyCacheStats, coverIndexKeyCacheStats,
   BYPASS_MODE, BYPASS_STATE_FILE, currentMode, isBypassOn, applyBypass, readBypassState,
   CLASSIFIER_MODE, MAX_MODE, classifierModeOn,
   MAX_ALLOW_CORE, MAX_MARKERS, MAX_STATE_FILE, APPROVE_SCRIPT, APPROVE_COMMAND,
