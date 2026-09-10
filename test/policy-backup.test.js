@@ -95,10 +95,14 @@ function setup(t) {
   t.after(() => fs.rmSync(tempHome, { recursive: true, force: true }));
   const settingsPath = path.join(tempHome, '.claude', 'settings.json');
   const backupPath = path.join(tempHome, '.claude', 'backups', 'allow-list.latest.json');
+  // The off-tree mirror's default, resolved against the mocked home so these
+  // stay hermetic — nothing here may touch the real ~/.permission-wildcarding.
+  const mirrorPath = path.join(tempHome, '.permission-wildcarding', 'allow-list.latest.json');
   return {
     tempHome,
     settingsPath,
     backupPath,
+    mirrorPath,
     write: (value) => fs.writeFileSync(settingsPath, JSON.stringify(value, null, 2) + '\n'),
     read: () => JSON.parse(fs.readFileSync(settingsPath, 'utf8')),
   };
@@ -233,6 +237,116 @@ test('restore never re-enables MAX even if backup holds the markers', async (t) 
     for (const p of userPerms) {
       assert.ok(after.allow.includes(p), `legitimate permission ${p} must still be restored`);
     }
+  } finally {
+    await app.dispose();
+  }
+});
+
+// ── the off-tree mirror ─────────────────────────────────────────────────────────
+// Observed 2026-09-09: every directory under ~/.claude was recreated, so the
+// primary backup went with the thing it exists to protect. These cover the
+// recovery that failure needs, and the two ways a second copy goes wrong.
+
+test('the backup is mirrored outside ~/.claude', async (t) => {
+  const env = setup(t);
+  env.write({ permissions: { allow: ['Bash(git status *)', 'Bash(rg *)'], deny: DENY } });
+
+  const app = harness(env.tempHome);
+  try {
+    await app.commands.get('permission-wildcarding.runNow')();
+
+    const mirrored = JSON.parse(fs.readFileSync(env.mirrorPath, 'utf8'));
+    assert.deepEqual(mirrored.deny, DENY, 'the mirror must carry deny, not only allow');
+    assert.deepEqual(mirrored, JSON.parse(fs.readFileSync(env.backupPath, 'utf8')),
+      'the two copies must be byte-identical, or restore depends on which one is read');
+    // The whole point: outside the directory whose reset it survives.
+    assert.ok(!env.mirrorPath.startsWith(path.join(env.tempHome, '.claude')),
+      'a mirror inside ~/.claude protects against nothing');
+  } finally {
+    await app.dispose();
+  }
+});
+
+test('losing all of ~/.claude still restores, from the mirror', async (t) => {
+  const env = setup(t);
+  const userPerms = ['Bash(git status *)', 'Bash(rg *)'];
+  env.write({ permissions: { allow: userPerms, deny: DENY } });
+
+  const app = harness(env.tempHome);
+  try {
+    await app.commands.get('permission-wildcarding.runNow')();
+    assert.ok(fs.existsSync(env.mirrorPath), 'precondition: the mirror was written');
+
+    // The actual failure, not a settings rewrite: the directory is recreated,
+    // so settings.json AND backups/ are gone together.
+    fs.rmSync(path.join(env.tempHome, '.claude'), { recursive: true, force: true });
+    fs.mkdirSync(path.join(env.tempHome, '.claude'), { recursive: true });
+    env.write({ permissions: { allow: [], deny: [] } });
+    assert.ok(!fs.existsSync(env.backupPath), 'precondition: the primary backup is gone');
+
+    await app.commands.get('permission-wildcarding.restoreBackup')();
+
+    const after = env.read().permissions;
+    for (const p of userPerms) {
+      assert.ok(after.allow.includes(p), `${p} must come back from the mirror`);
+    }
+    assert.deepEqual(after.deny, DENY, 'deny must travel with allow off the mirror too');
+  } finally {
+    await app.dispose();
+  }
+});
+
+test('a pruned entry leaves the mirror too, and cannot come back', async (t) => {
+  const env = setup(t);
+  env.write({ permissions: { allow: ['Bash(git status *)', 'Bash(rg *)'], deny: DENY } });
+
+  const app = harness(env.tempHome);
+  try {
+    await app.commands.get('permission-wildcarding.runNow')();
+    await app.commands.get('permission-wildcarding.toggleMax')();
+    await app.commands.get('permission-wildcarding.runNow')();
+    assert.ok(JSON.parse(fs.readFileSync(env.mirrorPath, 'utf8')).allow.includes('Bash(*)'),
+      'precondition: the mirror captured the blanket entry');
+
+    // MAX off purges the blanket entries. If the purge skipped the mirror, the
+    // high-water mark would survive off-tree and the next restore would hand it
+    // straight back -- so assert on the mirror, not the primary.
+    await app.commands.get('permission-wildcarding.toggleMax')();
+    const mirrored = JSON.parse(fs.readFileSync(env.mirrorPath, 'utf8'));
+    assert.ok(!mirrored.allow.includes('Bash(*)'), 'Bash(*) must leave the mirror on MAX off');
+    assert.ok(!mirrored.allow.includes('PowerShell(*)'),
+      'PowerShell(*) must leave the mirror on MAX off');
+    assert.ok(mirrored.allow.includes('Bash(rg *)'), 'a real permission must survive the purge');
+  } finally {
+    await app.dispose();
+  }
+});
+
+// The reason readBackup falls back rather than unioning. A stale mirror is the
+// normal state after upgrading from a version that wrote only the primary, or
+// after the mirror path changes -- and a union read would treat whatever it still
+// holds as part of the high-water mark, handing back the entry the user pruned.
+// Asserts the absolute answer (the entry stays gone), not that two reads agree.
+test('a stale mirror cannot resurrect an entry pruned from the primary', async (t) => {
+  const env = setup(t);
+  env.write({ permissions: { allow: [], deny: DENY } });
+
+  // Primary is authoritative and no longer holds the pruned entry.
+  fs.mkdirSync(path.dirname(env.backupPath), { recursive: true });
+  fs.writeFileSync(env.backupPath,
+    JSON.stringify({ allow: ['Bash(rg *)'], deny: DENY }, null, 2) + '\n');
+  // The mirror lagged and still does.
+  fs.mkdirSync(path.dirname(env.mirrorPath), { recursive: true });
+  fs.writeFileSync(env.mirrorPath,
+    JSON.stringify({ allow: ['Bash(rg *)', 'Bash(curl *)'], deny: DENY }, null, 2) + '\n');
+
+  const app = harness(env.tempHome);
+  try {
+    await app.commands.get('permission-wildcarding.restoreBackup')();
+    const after = env.read().permissions;
+    assert.ok(after.allow.includes('Bash(rg *)'), 'the primary\'s entries must restore');
+    assert.ok(!after.allow.includes('Bash(curl *)'),
+      'a stale mirror entry must not come back: the primary, when present, is the whole answer');
   } finally {
     await app.dispose();
   }

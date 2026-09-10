@@ -154,6 +154,11 @@
     "configuration": {
       "title": "Permission Wildcarding",
       "properties": {
+        "permissionWildcarding.backupMirrorPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Where to mirror the allow/deny high-water-mark backup, in addition to `~/.claude/backups/allow-list.latest.json`. Empty uses `~/.permission-wildcarding/allow-list.latest.json`. The primary copy lives inside `~/.claude`, so it cannot survive that directory being recreated rather than merely rewritten — the mirror is the copy that can. Set it to a path on another volume to survive more than a reset. Written second and best-effort, so a bad path can never cost you the primary backup; restore reads the primary first and falls back to the mirror."
+        },
         "permissionWildcarding.autoLearn.enabled": {
           "type": "boolean",
           "default": true,

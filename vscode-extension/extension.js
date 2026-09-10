@@ -48,6 +48,15 @@ const { MemoryLint, memoryReport, discoverDirs } = require('./memoryLint');
 const SETTINGS      = path.join(os.homedir(), '.claude', 'settings.json');
 const BACKUP_DIR    = path.join(os.homedir(), '.claude', 'backups');
 const LATEST_BACKUP = path.join(BACKUP_DIR, 'allow-list.latest.json');
+// The primary backup above lives INSIDE the directory it exists to survive the
+// reset of, which is fine for the failure it was written for (an org policy
+// rewriting settings.json in place) and useless for the one observed
+// 2026-09-09, when every directory under ~/.claude was recreated — `backups/`
+// went with it, and the allow list came back only because this extension was
+// still running and held it in memory. So mirror off-tree, outside ~/.claude.
+// Default is homedir-derived to stay portable (and hermetic under a mocked
+// home); point the setting at another volume to survive more than a reset.
+const MIRROR_BACKUP_DEFAULT = path.join(os.homedir(), '.permission-wildcarding', 'allow-list.latest.json');
 const PROJECTS_DIR  = path.join(os.homedir(), '.claude', 'projects');
 const CODEX_SESSIONS_DIR = path.join(os.homedir(), '.codex', 'sessions');
 // Auto Learn, this wildcarding pass, and the MAX/bypass toggles are all writers
@@ -195,9 +204,27 @@ function writeAllow(settings, allow, denyAdditions) {
 //
 // On-disk shape is { allow, deny }. A bare array is the pre-1.12 allow-only
 // backup and is still read, so an existing file upgrades in place on first write.
-function readBackup() {
+//
+// Read late rather than at module load: a settings change must not need a window
+// reload to take effect, and a config read at require time runs before the
+// mocked workspace exists in tests. Falls back to the default when unset or
+// blank, and `~` is expanded so a hand-typed setting behaves as it reads.
+function mirrorBackupPath() {
+  let configured;
+  try {
+    configured = vscode.workspace.getConfiguration('permissionWildcarding')
+      .get('backupMirrorPath', '');
+  } catch { configured = ''; }
+  if (typeof configured !== 'string' || !configured.trim()) return MIRROR_BACKUP_DEFAULT;
+  const raw = configured.trim();
+  return raw.startsWith('~')
+    ? path.join(os.homedir(), raw.slice(1).replace(/^[\\/]+/, ''))
+    : raw;
+}
+
+function readOneBackup(file) {
   let raw;
-  try { raw = JSON.parse(fs.readFileSync(LATEST_BACKUP, 'utf8')); }
+  try { raw = JSON.parse(fs.readFileSync(file, 'utf8')); }
   catch { return null; }
   if (Array.isArray(raw)) return { allow: raw, deny: [] };
   if (!raw || typeof raw !== 'object') return null;
@@ -205,6 +232,29 @@ function readBackup() {
     allow: Array.isArray(raw.allow) ? raw.allow : [],
     deny: Array.isArray(raw.deny) ? raw.deny : [],
   };
+}
+
+// Primary first, mirror only as a FALLBACK — deliberately not a union. Unioning
+// the two copies would resurrect a deliberate prune whenever one of them lagged,
+// which is the single failure `forgetFromBackup` exists to prevent. The mirror
+// therefore only speaks when the primary is gone or unparseable, which is
+// exactly the recovery case it was added for.
+function readBackup() {
+  return readOneBackup(LATEST_BACKUP) ?? readOneBackup(mirrorBackupPath());
+}
+
+// Atomic per file via temp + rename. The mirror is best-effort and written
+// second: it must never cost the primary write, which is the copy every other
+// code path reads first.
+function writeBackupCopies(payload) {
+  const write = (target) => {
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    const tmp = target + '.tmp';
+    fs.writeFileSync(tmp, payload, 'utf8');
+    fs.renameSync(tmp, target);
+  };
+  write(LATEST_BACKUP);
+  try { write(mirrorBackupPath()); } catch { /* off-tree copy is best-effort */ }
 }
 
 function backupPolicy(allow, deny) {
@@ -221,9 +271,7 @@ function backupPolicy(allow, deny) {
       deny: [...new Set([...previous.deny, ...nextDeny])],
     };
     if (JSON.stringify(previous) === JSON.stringify(merged)) return;
-    const tmp = LATEST_BACKUP + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(merged, null, 2) + '\n', 'utf8');
-    fs.renameSync(tmp, LATEST_BACKUP);
+    writeBackupCopies(JSON.stringify(merged, null, 2) + '\n');
   } catch { /* best-effort — never block the main write */ }
 }
 
@@ -245,9 +293,9 @@ function forgetFromBackup(permissions) {
   };
   if (next.allow.length === backup.allow.length && next.deny.length === backup.deny.length) return;
   try {
-    const tmp = LATEST_BACKUP + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n', 'utf8');
-    fs.renameSync(tmp, LATEST_BACKUP);
+    // Both copies, or the next restore reads the mirror and hands the pruned
+    // entry straight back.
+    writeBackupCopies(JSON.stringify(next, null, 2) + '\n');
   } catch { /* best-effort — never block the removal itself */ }
 }
 
@@ -397,7 +445,10 @@ function restoreFromBackup(options = {}) {
   const announce = options.announce !== false;
   const backup = readBackup();
   if (!backup) {
-    vscode.window.showWarningMessage(`permission-wildcarding: no backup found at ${LATEST_BACKUP}`);
+    // Name both, or a user whose ~/.claude was reset is told the only copy is
+    // missing while the off-tree one sits there unmentioned.
+    vscode.window.showWarningMessage('permission-wildcarding: no backup found at '
+      + `${LATEST_BACKUP} or ${mirrorBackupPath()}`);
     return null;
   }
   if (!backup.allow.length && !backup.deny.length) {

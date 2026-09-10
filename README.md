@@ -77,6 +77,14 @@ subcommand. The safety boundary for the legacy hook is still your
   org policy that resets `settings.json` (e.g. `allowManagedHooksOnly`) can't permanently lose
   your wildcards — or your safety boundary. Restoring allow without deny would hand back every
   permission with the killswitch still off, so both halves travel together in one atomic write.
+  That primary copy lives *inside* `~/.claude`, which covers a `settings.json` rewritten in
+  place and not that directory being **recreated** — so the same payload is mirrored off-tree
+  to `~/.permission-wildcarding/allow-list.latest.json`, or wherever
+  `permissionWildcarding.backupMirrorPath` points (put it on another volume to survive more
+  than a reset). The mirror is written second and best-effort, so a bad path can never cost
+  you the primary; restore reads the primary first and falls back to the mirror. It is a
+  fallback rather than a union on purpose — unioning a stale mirror would hand back the entry
+  you deliberately pruned.
   Because it's a VS Code
   extension — not a Claude Code hook — it keeps working even where managed settings disable
   user hooks. It also **lints the Claude Code file-memory index** (`MEMORY.md`): a status-bar
