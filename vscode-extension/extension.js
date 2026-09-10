@@ -2859,54 +2859,121 @@ class WildcardingViewProvider {
   .memlink:hover { text-decoration: underline; }
   .buttonrow { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 8px; }
   .buttonrow button { margin: 0; }
+
+  /* ── layout: one hero, everything else a stateful row ──────────────────────
+     Nine equally-weighted cards meant nothing was weighted: a destructive MAX
+     toggle rendered exactly like a token gauge. So exactly one card keeps card
+     chrome, and every secondary feature becomes a single collapsed row whose
+     CURRENT STATE is on the right-hand side — the point being that you never
+     expand a row just to find out where it stands. */
+  .hero { background: var(--vscode-editorWidget-background, rgba(127,127,127,0.08));
+          border: 1px solid var(--vscode-widget-border, transparent);
+          border-radius: 6px; padding: 12px; margin-bottom: 4px; }
+  .heronum { text-align: center; font-size: 30px; font-weight: 700; line-height: 1.05;
+             margin: 10px 0 2px; }
+  .heronum small { font-size: 13px; font-weight: 400; color: var(--vscode-descriptionForeground); }
+  .herosub { text-align: center; font-size: 11px; color: var(--vscode-descriptionForeground);
+             margin-bottom: 12px; }
+  .hero button.run, .hero button.restore { margin-bottom: 0; }
+  .hero button.restore { margin-top: 6px; }
+
+  .row { border-top: 1px solid var(--vscode-panel-border, rgba(127,127,127,0.25)); }
+  .row:last-of-type { border-bottom: 1px solid var(--vscode-panel-border, rgba(127,127,127,0.25)); }
+  .rowhead { display: flex; align-items: center; gap: 8px; padding: 8px 2px;
+             cursor: pointer; user-select: none; }
+  .rowhead:hover .rowname { color: var(--vscode-textLink-foreground); }
+  /* An identity glyph, not a status colour. The state itself is the text on the
+     right, so a collapsed row never communicates by hue alone — which the eleven
+     glowing dots this replaces did, on a red/green axis. */
+  .glyph { flex: 0 0 auto; width: 1.1em; text-align: center; font-size: 11px;
+           color: var(--vscode-descriptionForeground); }
+  .chev { flex: 0 0 auto; width: .8em; font-size: 9px; color: var(--vscode-descriptionForeground); }
+  .rowname { font-weight: 600; flex: 1 1 auto; }
+  .rowstate { flex: 0 0 auto; font-size: 11px; color: var(--vscode-descriptionForeground);
+              text-align: right; }
+  .rowstate.warn { color: var(--vscode-charts-yellow, #d29922); }
+  .rowstate.hot  { color: var(--vscode-charts-red, #f85149); font-weight: 600; }
+  .rowbody { padding: 0 2px 10px 2.1em; }
+  .rowbody[hidden] { display: none; }
+  /* The card markup inside a row keeps its ids and its JS untouched, and simply
+     stops drawing itself as a card. */
+  .row .card { background: none; border: none; border-radius: 0; padding: 0; margin: 0 0 8px; }
+  .row .card:last-child { margin-bottom: 0; }
+  /* MAX-on has to stay loud, and a nested card has no border left to colour. */
+  .row #maxCard.on, .row #codexMaxCard.on {
+    border-left: 2px solid var(--vscode-charts-red, #f85149); padding-left: 8px; }
+  /* The glow was 6px on every one of eleven dots. Kept as a plain 8px pip. */
+  .dot { box-shadow: none; width: 8px; height: 8px; }
+  .row .status { font-weight: 400; font-size: 12px; }
+  #autoLearnCard > .status { display: none; }
 </style>
 </head>
 <body>
-  <div class="card">
+  <div class="hero">
     <div class="status"><span id="dot" class="dot"></span><span id="statusText">Active</span></div>
     <div class="muted sub" id="watching">watching settings.json</div>
-    <div class="muted" id="lastRun"></div>
+
+    <div class="heronum"><span id="total">–</span> <small>approved</small></div>
+    <div class="herosub">
+      <span id="wildcards">–</span> wildcards · <span id="specific">–</span> specific
+    </div>
+
+    <button class="run" id="runNow">⟳  Wildcard Now</button>
+    <button class="restore" id="restore" title="Merge your saved backup back into the allow list">⤺  Restore prunes from backup</button>
+    <div class="muted sub" id="lastRun"></div>
     <div class="muted" id="backup"></div>
   </div>
 
-  <div class="card" id="autoLearnCard">
-    <div class="status"><span id="aldot" class="dot idle"></span><span id="altext">Auto Learn</span></div>
-    <div class="muted sub" id="alsub">loading cross-agent history state…</div>
-    <div class="stats" style="margin-top:8px">
-      <div class="stat"><div class="n" id="alsafe">–</div><div class="l">safe</div></div>
-      <div class="stat"><div class="n" id="alreview">–</div><div class="l">review</div></div>
-      <div class="stat"><div class="n" id="alobserve">–</div><div class="l">observing</div></div>
+  <section class="row">
+    <div class="rowhead" data-row="autoLearn">
+      <span class="chev">▸</span><span class="glyph">✳</span>
+      <span class="rowname">Auto Learn</span><span class="rowstate" id="stAutoLearn"></span>
     </div>
-    <div class="buttonrow">
-      <button class="restore" id="alScan">Scan now</button>
-      <button class="restore" id="alReview">Review</button>
-      <button class="restore" id="alUndo">Undo</button>
-      <button class="restore" id="alWhy">Why prompt?</button>
+    <div class="rowbody" id="bodyAutoLearn" hidden>
+      <div class="card" id="autoLearnCard">
+        <div class="status"><span id="aldot" class="dot idle"></span><span id="altext">Auto Learn</span></div>
+        <div class="muted sub" id="alsub">loading cross-agent history state…</div>
+        <div class="stats" style="margin-top:8px">
+          <div class="stat"><div class="n" id="alsafe">–</div><div class="l">safe</div></div>
+          <div class="stat"><div class="n" id="alreview">–</div><div class="l">review</div></div>
+          <div class="stat"><div class="n" id="alobserve">–</div><div class="l">observing</div></div>
+        </div>
+        <div class="buttonrow">
+          <button class="restore" id="alScan">Scan now</button>
+          <button class="restore" id="alReview">Review</button>
+          <button class="restore" id="alUndo">Undo</button>
+          <button class="restore" id="alWhy">Why prompt?</button>
+        </div>
+      </div>
     </div>
-  </div>
+  </section>
 
-  <div class="card stats">
-    <div class="stat"><div class="n" id="total">–</div><div class="l">Approved</div></div>
-    <div class="stat"><div class="n" id="wildcards">–</div><div class="l">Wildcards</div></div>
-    <div class="stat"><div class="n" id="specific">–</div><div class="l">Specific</div></div>
-  </div>
+  <section class="row">
+    <div class="rowhead" data-row="max">
+      <span class="chev">▸</span><span class="glyph">↯</span>
+      <span class="rowname">MAX modes</span><span class="rowstate" id="stMax"></span>
+    </div>
+    <div class="rowbody" id="bodyMax" hidden>
+      <div class="card" id="maxCard">
+        <div class="status"><span id="mdot" class="dot idle"></span><span id="mtext">Claude MAX: OFF</span></div>
+        <div class="muted sub" id="msub">Claude · skip every prompt — allow-wildcards + approve hook</div>
+        <button class="bypass" id="maxBtn">⚡ Turn Claude MAX ON</button>
+      </div>
+      <div class="card" id="codexMaxCard">
+        <div class="status"><span id="cxdot" class="dot idle"></span><span id="cxtext">Codex MAX: OFF</span></div>
+        <div class="muted sub" id="cxsub">Codex · approval_policy=never — sandbox stays as the floor</div>
+        <button class="bypass" id="codexMaxBtn">⚡ Turn Codex MAX ON</button>
+      </div>
+    </div>
+  </section>
 
-  <button class="run" id="runNow">⟳  Wildcard Now</button>
-  <button class="restore" id="restore" title="Merge your saved backup back into the allow list">⤺  Restore prunes from backup</button>
-
-  <div class="card" id="maxCard">
-    <div class="status"><span id="mdot" class="dot idle"></span><span id="mtext">Claude MAX: OFF</span></div>
-    <div class="muted sub" id="msub">Claude · skip every prompt — allow-wildcards + approve hook</div>
-    <button class="bypass" id="maxBtn">⚡ Turn Claude MAX ON</button>
-  </div>
-
-  <div class="card" id="codexMaxCard">
-    <div class="status"><span id="cxdot" class="dot idle"></span><span id="cxtext">Codex MAX: OFF</span></div>
-    <div class="muted sub" id="cxsub">Codex · approval_policy=never — sandbox stays as the floor</div>
-    <button class="bypass" id="codexMaxBtn">⚡ Turn Codex MAX ON</button>
-  </div>
-
-  <div class="card" id="localCard" style="display:none">
+  <section class="row" id="localCard" style="display:none">
+    <div class="rowhead" data-row="local">
+      <span class="chev">▸</span><span class="glyph">▤</span>
+      <span class="rowname">Project-local</span><span class="rowstate" id="stLocal"></span>
+    </div>
+    <div class="rowbody" id="bodyLocal" hidden>
+    <div class="card">
     <div class="status"><span id="locdot" class="dot idle"></span><span id="loctext">Project-local approvals</span></div>
     <div class="muted sub" id="locsub"></div>
     <div class="stats" style="margin-top:8px">
@@ -2915,47 +2982,157 @@ class WildcardingViewProvider {
       <div class="stat"><div class="n" id="lockept">–</div><div class="l">project-only</div></div>
     </div>
     <button class="restore" id="drainLocal" title="Promote portable local approvals to user scope, then drop the ones user scope covers">⤴  Drain into user scope</button>
-  </div>
-
-  <div class="card" id="guidanceCard" style="display:none">
-    <div class="status"><span id="gddot" class="dot idle"></span><span id="gdtext">Shell-style guidance</span></div>
-    <div class="muted sub" id="gdsub"></div>
-    <button class="bypass" id="guidanceBtn">Add to ~/.claude/CLAUDE.md</button>
-  </div>
-
-  <div class="card" id="gatesCard" style="display:none">
-    <div class="status"><span id="mgdot" class="dot idle"></span><span id="mgtext">Memory gates</span></div>
-    <div class="muted sub" id="mgsub"></div>
-    <button class="bypass" id="gatesBtn">Compile and add</button>
-  </div>
-
-  <div class="card" id="memCard" style="display:none">
-    <div class="status"><span id="llmDot" class="dot idle"></span><span id="llmText">CPU LLM</span></div>
-    <div class="muted sub" id="memDir"></div>
-    <div class="stats" style="margin-top:8px">
-      <div class="stat"><div class="n" id="memTok">–</div><div class="l">tok/session</div></div>
-      <div class="stat"><div class="n" id="memFiles">–</div><div class="l">files</div></div>
-      <div class="stat"><div class="n" id="memEmb">–</div><div class="l">embedded</div></div>
     </div>
-    <div class="memissues" id="memIssues"></div>
-    <button class="restore" id="rebuild" title="Force a full CPU re-embed of the memory dir (recall.py --rebuild)">⟳  Rebuild recall index</button>
-  </div>
+    </div>
+  </section>
 
-  <div class="listhead" id="toggle" title="Click to collapse / expand">
-    <span class="h"><span id="chev">▾</span> Wildcards tracked</span>
-    <span class="muted" id="wcount"></span>
-  </div>
-  <ul id="list"></ul>
+  <section class="row" id="guidanceCard" style="display:none">
+    <div class="rowhead" data-row="guidance">
+      <span class="chev">▸</span><span class="glyph">▣</span>
+      <span class="rowname">Shell-style guidance</span><span class="rowstate" id="stGuidance"></span>
+    </div>
+    <div class="rowbody" id="bodyGuidance" hidden>
+      <div class="card">
+        <div class="status"><span id="gddot" class="dot idle"></span><span id="gdtext">Shell-style guidance</span></div>
+        <div class="muted sub" id="gdsub"></div>
+        <button class="bypass" id="guidanceBtn">Add to ~/.claude/CLAUDE.md</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="row" id="gatesCard" style="display:none">
+    <div class="rowhead" data-row="gates">
+      <span class="chev">▸</span><span class="glyph">▣</span>
+      <span class="rowname">Memory gates</span><span class="rowstate" id="stGates"></span>
+    </div>
+    <div class="rowbody" id="bodyGates" hidden>
+      <div class="card">
+        <div class="status"><span id="mgdot" class="dot idle"></span><span id="mgtext">Memory gates</span></div>
+        <div class="muted sub" id="mgsub"></div>
+        <button class="bypass" id="gatesBtn">Compile and add</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="row" id="memCard" style="display:none">
+    <div class="rowhead" data-row="memory">
+      <span class="chev">▸</span><span class="glyph">◈</span>
+      <span class="rowname">Memory</span><span class="rowstate" id="stMemory"></span>
+    </div>
+    <div class="rowbody" id="bodyMemory" hidden>
+      <div class="card">
+        <div class="status"><span id="llmDot" class="dot idle"></span><span id="llmText">CPU LLM</span></div>
+        <div class="muted sub" id="memDir"></div>
+        <div class="stats" style="margin-top:8px">
+          <div class="stat"><div class="n" id="memTok">–</div><div class="l">tok/session</div></div>
+          <div class="stat"><div class="n" id="memFiles">–</div><div class="l">files</div></div>
+          <div class="stat"><div class="n" id="memEmb">–</div><div class="l">embedded</div></div>
+        </div>
+        <div class="memissues" id="memIssues"></div>
+        <button class="restore" id="rebuild" title="Force a full CPU re-embed of the memory dir (recall.py --rebuild)">⟳  Rebuild recall index</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="row">
+    <div class="rowhead" id="toggle" data-row="list" title="Click to collapse / expand">
+      <span class="chev" id="chev">▸</span><span class="glyph">✱</span>
+      <span class="rowname">Wildcards tracked</span><span class="rowstate" id="wcount"></span>
+    </div>
+    <div class="rowbody" id="bodyList" hidden><ul id="list"></ul></div>
+  </section>
 
 <script nonce="${nonce}">
   const vscode = acquireVsCodeApi();
   const $ = (id) => document.getElementById(id);
 
-  const st = vscode.getState();
-  let collapsed = !!(st && st.collapsed);
-  function applyCollapsed() {
-    $('list').style.display = collapsed ? 'none' : '';
-    $('chev').textContent = collapsed ? '▸' : '▾';
+  // Which disclosure rows are open, persisted across reloads. Everything starts
+  // CLOSED deliberately: the collapsed summary on the right of each row already
+  // answers "where does this stand?", so opening a row is for acting on it, not
+  // for reading it. That is the whole reason the summaries exist.
+  const st = vscode.getState() || {};
+  const openRows = new Set(Array.isArray(st.open) ? st.open : []);
+  const bodyFor = (key) => $('body' + key.charAt(0).toUpperCase() + key.slice(1));
+
+  function applyRows() {
+    for (const head of document.querySelectorAll('.rowhead')) {
+      const key = head.dataset.row;
+      if (!key) continue;
+      const isOpen = openRows.has(key);
+      const body = bodyFor(key);
+      if (body) body.hidden = !isOpen;
+      const chev = head.querySelector('.chev');
+      if (chev) chev.textContent = isOpen ? '▾' : '▸';
+    }
+  }
+
+  for (const head of document.querySelectorAll('.rowhead')) {
+    head.addEventListener('click', () => {
+      const key = head.dataset.row;
+      if (!key) return;
+      if (openRows.has(key)) openRows.delete(key); else openRows.add(key);
+      vscode.setState({ open: [...openRows] });
+      applyRows();
+    });
+  }
+
+  // The collapsed state of every row. Each is a short phrase, never a bare
+  // colour: eleven glowing red/green dots used to be the only signal, which is
+  // unreadable for the ~8% of men with a red-green deficiency and ambiguous for
+  // everyone else ('is yellow bad?'). The hot/warn tones tint a phrase that is
+  // already legible on its own.
+  function setState(id, text, tone) {
+    const el = $(id);
+    if (!el) return;
+    el.textContent = text || '';
+    el.className = 'rowstate' + (tone ? ' ' + tone : '');
+  }
+
+  function renderRowStates(d) {
+    const a = d.autoLearn || {};
+    const counts = a.counts || {};
+    if (!a.enabled) setState('stAutoLearn', 'disabled');
+    else if (a.busy) setState('stAutoLearn', 'scanning…');
+    else if (a.error) setState('stAutoLearn', 'error', 'hot');
+    else if (counts.review) setState('stAutoLearn', counts.review + ' to review', 'warn');
+    else if (counts.safe) setState('stAutoLearn', counts.safe + ' safe to apply', 'warn');
+    else setState('stAutoLearn', String(a.mode || 'recommend'));
+
+    const cOn = !!(d.max && d.max.on);
+    const xOn = !!(d.codexMax && d.codexMax.on);
+    if (cOn && xOn) setState('stMax', 'both ON', 'hot');
+    else if (cOn) setState('stMax', 'Claude ON', 'hot');
+    else if (xOn) setState('stMax', 'Codex ON', 'hot');
+    else if (d.codexMax && d.codexMax.restricted) setState('stMax', 'off · Codex capped');
+    else setState('stMax', 'both off');
+
+    const g = d.guidance || {};
+    setState('stGuidance', !g.on ? 'not installed' : (g.current ? 'on' : 'older wording'),
+      !g.on || g.current ? null : 'warn');
+
+    const gt = d.gates || {};
+    setState('stGates', !gt.compiled ? 'nothing compiled'
+      : !gt.on ? gt.count + ' waiting'
+        : (gt.current ? gt.count + ' active' : 'stale — refresh'),
+      !gt.compiled ? null : (!gt.on || !gt.current ? 'warn' : null));
+
+    const m = d.memory || {};
+    const issues = (m.over || 0) + (m.broken || 0) + (m.unresolved || 0);
+    setState('stMemory',
+      (m.tokens != null ? fmtK(m.tokens) + ' tok' : 'no index')
+        + (issues ? ' · ' + issues + ' to fix' : ''),
+      issues ? 'warn' : null);
+
+    // promote/prune are counts, not arrays, and 'pending' is defined the same way
+    // renderLocal defines it, so the row and the card can never disagree.
+    const l = d.local || {};
+    const pending = (l.promote || 0) + (l.prune || 0);
+    if (l.blocked) setState('stLocal', 'blocked by MAX', 'warn');
+    else if (!l.trusted) setState('stLocal', 'workspace not trusted');
+    else if (pending) setState('stLocal', pending + ' to drain', 'warn');
+    else setState('stLocal', 'drained');
+
+    setState('wcount', d.wildcardCount + ' total');
   }
 
   function timeAgo(ts) {
@@ -3202,14 +3379,10 @@ class WildcardingViewProvider {
         list.appendChild(li);
       }
     }
-    applyCollapsed();
+    applyRows();
+    renderRowStates(d);
   }
 
-  $('toggle').addEventListener('click', () => {
-    collapsed = !collapsed;
-    vscode.setState({ collapsed });
-    applyCollapsed();
-  });
   $('runNow').addEventListener('click', () => vscode.postMessage({ type: 'runNow' }));
   $('alScan').addEventListener('click', () => vscode.postMessage({ type: 'autoLearnScan' }));
   $('alReview').addEventListener('click', () => vscode.postMessage({ type: 'autoLearnReview' }));
@@ -3223,7 +3396,7 @@ class WildcardingViewProvider {
   $('guidanceBtn').addEventListener('click', () => vscode.postMessage({ type: 'toggleGuidance' }));
   $('gatesBtn').addEventListener('click', () => vscode.postMessage({ type: 'toggleGates' }));
   window.addEventListener('message', (e) => { if (e.data?.type === 'data') render(e.data); });
-  applyCollapsed();
+  applyRows();
   vscode.postMessage({ type: 'refresh' });
 </script>
 </body>
