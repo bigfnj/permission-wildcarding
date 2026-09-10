@@ -247,14 +247,30 @@ function readBackup() {
 // second: it must never cost the primary write, which is the copy every other
 // code path reads first.
 function writeBackupCopies(payload) {
+  // writeFileAtomicSync, not a hand-rolled `target + '.tmp'`. That shared name
+  // is exactly the collision src/permissions.js:31-33 exists to prevent —
+  // "Unique per-writer temp name so the hook and the VS Code extension (or two
+  // extension hosts) never collide on one shared *.wc.tmp" — and this file has
+  // seen four extension copies running at once. Two hosts racing on one .tmp can
+  // rename a half-written file into place, and because both copies used the same
+  // scheme one race corrupted the primary AND the mirror together: readBackup()
+  // then fails to parse both, `previous` collapses to empty, and the high-water
+  // mark silently resets to whatever the live list happens to be at that
+  // instant. If that instant is mid-policy-wipe, the only recovery data for the
+  // 2026-09-09 class of event is destroyed by the thing meant to preserve it.
   const write = (target) => {
     fs.mkdirSync(path.dirname(target), { recursive: true });
-    const tmp = target + '.tmp';
-    fs.writeFileSync(tmp, payload, 'utf8');
-    fs.renameSync(tmp, target);
+    writeFileAtomicSync(target, payload);
   };
-  write(LATEST_BACKUP);
+  // Attempted independently rather than in sequence. The mirror's whole purpose
+  // is surviving the loss of the primary's directory, so a primary failure is
+  // the case where the mirror matters most — it must not be skipped by it.
+  let primaryError;
+  try { write(LATEST_BACKUP); } catch (error) { primaryError = error; }
   try { write(mirrorBackupPath()); } catch { /* off-tree copy is best-effort */ }
+  // Rethrown for the caller's own best-effort catch, so behaviour on a failed
+  // primary write is unchanged from before the mirror existed.
+  if (primaryError) throw primaryError;
 }
 
 function backupPolicy(allow, deny) {
