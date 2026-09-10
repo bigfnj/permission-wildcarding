@@ -15,6 +15,21 @@ const Module = require('node:module');
 
 function disposable() { return { dispose() {} }; }
 
+// Purge extension.js AND every src/ module it pulls in. See the long note in
+// test/extension-activation.test.js: `delete require.cache[extensionPath]` alone
+// leaves every src/ module holding the FIRST harness's `os` stub, so a later
+// activation in this file resolves `home = os.homedir()` defaults to an earlier
+// test's temp home — which t.after has already deleted, so the write re-creates
+// it and leaks a directory into %TEMP% on every run.
+function purgeProjectModules(extensionPath, rootSrc) {
+  const extensionDir = path.dirname(extensionPath) + path.sep;
+  for (const key of Object.keys(require.cache)) {
+    if (key.startsWith(rootSrc + path.sep) || key.startsWith(extensionDir)) {
+      delete require.cache[key];
+    }
+  }
+}
+
 function harness(tempHome) {
   const commands = new Map();
   const vscode = {
@@ -75,7 +90,7 @@ function harness(tempHome) {
     return originalLoad.call(this, request, parent, isMain);
   };
 
-  delete require.cache[extensionPath];
+  purgeProjectModules(extensionPath, rootSrc);
   const extension = require(extensionPath);
   extension.activate({ subscriptions: [] });
   return {
@@ -84,7 +99,7 @@ function harness(tempHome) {
     async dispose() {
       await extension.deactivate();
       Module._load = originalLoad;
-      delete require.cache[extensionPath];
+      purgeProjectModules(extensionPath, rootSrc);
     },
   };
 }

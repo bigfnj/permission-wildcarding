@@ -58,8 +58,14 @@ test('editing is surgical: one line added, nothing else touched', () => {
   assert.deepEqual(before.filter((l) => !after.includes(l)), []);
 });
 
-test('the toggle never touches sandbox_mode, because it is the only floor Codex has', () => {
-  const on = applyCodexMax(REAL_SHAPE, true, { statePath: path.join(os.tmpdir(), 'nope.json'), bundle: null });
+test('the toggle never touches sandbox_mode, because it is the only floor Codex has', (t) => {
+  // A mkdtemp dir like every other test in this file. The name `nope.json`
+  // suggested a path that would not be written, but applyCodexMax writes its
+  // state there — so this left a real 69-byte nope.json in %TEMP% behind on
+  // every run, at a FIXED path, which two concurrent runs would also fight over.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-max-sandbox-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const on = applyCodexMax(REAL_SHAPE, true, { statePath: path.join(dir, 'state.json'), bundle: null });
   assert.equal(sandboxMode(on.text), 'workspace-write');
   assert.equal(on.sandboxUntouched, true);
   assert.equal(/danger-full-access/.test(on.text), false);

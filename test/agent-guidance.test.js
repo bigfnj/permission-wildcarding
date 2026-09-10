@@ -7,6 +7,7 @@
 // had byte for byte.
 
 const test = require('node:test');
+const { after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -20,8 +21,23 @@ const {
 
 const USER_TEXT = '# My global instructions\n\nAlways use the toolbox python.\n';
 
+// Every scratch root this file creates, torn down once at the end. These three
+// helpers are module-level and take no `t`, so a per-test t.after() would mean
+// threading the context through every call site; one `after` hook over a registry
+// is the smaller change. Measured before this: the suite left 3 directories in
+// %TEMP% per run, and 798 had accumulated.
+const scratchRoots = [];
+after(() => {
+  for (const root of scratchRoots) {
+    // maxRetries because a Windows handle can still be closing when we get here.
+    try { fs.rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }); }
+    catch { /* a leaked temp dir must never fail the suite */ }
+  }
+});
+
 function scratch() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-guidance-'));
+  scratchRoots.push(root);
   return { root, file: path.join(root, 'CLAUDE.md'), backupDir: path.join(root, 'backups') };
 }
 

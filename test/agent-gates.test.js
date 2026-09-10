@@ -7,6 +7,7 @@
 // refuses to install rather than fencing off nothing and reporting success.
 
 const test = require('node:test');
+const { after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -21,8 +22,23 @@ const USER_TEXT = '# My global instructions\n\nAlways use the toolbox python.\n'
 const COMPILED = '## Standing gates (1 memories, managed)\n\n- **File edits.** Apply directly.';
 
 // A fake home whose .claude/ holds a compiled gates file, so nothing touches the real one.
+// Every scratch root this file creates, torn down once at the end. These three
+// helpers are module-level and take no `t`, so a per-test t.after() would mean
+// threading the context through every call site; one `after` hook over a registry
+// is the smaller change. Measured before this: the suite left 3 directories in
+// %TEMP% per run, and 798 had accumulated.
+const scratchRoots = [];
+after(() => {
+  for (const root of scratchRoots) {
+    // maxRetries because a Windows handle can still be closing when we get here.
+    try { fs.rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }); }
+    catch { /* a leaked temp dir must never fail the suite */ }
+  }
+});
+
 function fakeHome(compiled = COMPILED) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-gates-'));
+  scratchRoots.push(root);
   fs.mkdirSync(path.join(root, '.claude'), { recursive: true });
   if (compiled !== null) fs.writeFileSync(compiledPath(root), `${compiled}\n`, 'utf8');
   return root;
@@ -107,6 +123,7 @@ test('installing with nothing compiled refuses instead of fencing off nothing', 
 
 test('the gates backup name cannot collide with the guidance one', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-gates-bk-'));
+  scratchRoots.push(root);
   const file = path.join(root, 'CLAUDE.md');
   const backupDir = path.join(root, 'backups');
   fs.writeFileSync(file, USER_TEXT, 'utf8');

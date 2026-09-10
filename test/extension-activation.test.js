@@ -9,6 +9,32 @@ const Module = require('node:module');
 
 function disposable() { return { dispose() {} }; }
 
+// Purge extension.js AND every src/ module it pulls in.
+//
+// `delete require.cache[extensionPath]` alone is not isolation. Every function in
+// src/ that defaults a home — `setGuidanceAll(on, { home = os.homedir() })` is the
+// one that exposed this — resolves that default against ITS OWN `os` binding, and
+// that binding is whatever the Module._load stub returned the first time the module
+// was required. Purging only extension.js leaves all 20-odd src/ modules in the
+// cache holding the FIRST test's stub, so the second test's activation writes into
+// the first test's home.
+//
+// Measured: an `fs` trace of this file showed test 1's home deleted at 61 ms and
+// then re-created at 72 ms by test 2's activate() -> ensureGuidance ->
+// setGuidanceAll, leaving one directory in %TEMP% per run. The leak was the
+// symptom; the isolation failure is the defect, because it means anything test 2
+// asserts about the home was being asserted against a deleted directory.
+//
+// Same implementation as test/extension-lifecycle-async.test.js's purge().
+function purgeProjectModules(extensionPath, rootSrc) {
+  const extensionDir = path.dirname(extensionPath) + path.sep;
+  for (const key of Object.keys(require.cache)) {
+    if (key.startsWith(rootSrc + path.sep) || key.startsWith(extensionDir)) {
+      delete require.cache[key];
+    }
+  }
+}
+
 test('extension activates with mocked VS Code and deactivates without live policy access', async () => {
   const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'permission-wildcarding-extension-'));
   const commands = new Map();
@@ -82,7 +108,7 @@ test('extension activates with mocked VS Code and deactivates without live polic
   };
 
   try {
-    delete require.cache[extensionPath];
+    purgeProjectModules(extensionPath, rootSrc);
     const extension = require(extensionPath);
     const context = { subscriptions: [] };
     extension.activate(context);
@@ -105,7 +131,7 @@ test('extension activates with mocked VS Code and deactivates without live polic
     await extension.deactivate();
   } finally {
     Module._load = originalLoad;
-    delete require.cache[extensionPath];
+    purgeProjectModules(extensionPath, rootSrc);
     fs.rmSync(tempHome, { recursive: true, force: true });
   }
 });
@@ -196,7 +222,7 @@ test('activation does not leak channels, watchers or timers', async () => {
 
   let extension;
   try {
-    delete require.cache[extensionPath];
+    purgeProjectModules(extensionPath, rootSrc);
     extension = require(extensionPath);
     const context = { subscriptions: [] };
     extension.activate(context);
@@ -253,7 +279,7 @@ test('activation does not leak channels, watchers or timers', async () => {
     global.setTimeout = realSetTimeout;
     global.clearTimeout = realClearTimeout;
     Module._load = originalLoad;
-    delete require.cache[extensionPath];
+    purgeProjectModules(extensionPath, rootSrc);
     fs.rmSync(tempHome, { recursive: true, force: true });
   }
 });
