@@ -105,7 +105,16 @@ Registers the `PostToolUse` hook in `~/.claude/settings.json`.
 
 ```powershell
 .\install.ps1       # Windows PowerShell
+.\uninstall.ps1     # remove it
 ```
+
+The two installers register the same hook under two different command strings —
+`install.sh` registers the bare path, and `install.ps1` registers
+`node "<path>"`, because Windows has no shebang support and a bare extensionless
+path pops a "How do you want to open this file?" dialog on every hook fire. Both
+uninstallers match either form, so it does not matter which one you installed
+with; each reports what it removed, and says so plainly when it found nothing.
+Neither touches your allow list.
 
 Then seed the starter-pack patterns into your allow list if you want its
 friction-first legacy defaults (optional; see `patterns/starter-pack.md` for what's included):

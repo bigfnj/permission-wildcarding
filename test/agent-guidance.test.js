@@ -15,6 +15,7 @@ const path = require('node:path');
 const {
   BEGIN, END, guidanceBlock, hasGuidance, isCurrent, applyGuidance, guidanceStatus, setGuidance,
   guidanceTargets, installedGuidanceTargets, guidanceStatusAll, setGuidanceAll,
+  createManagedBlock, escapeMarker,
 } = require('../src/agent-guidance');
 
 const USER_TEXT = '# My global instructions\n\nAlways use the toolbox python.\n';
@@ -157,4 +158,105 @@ test('a missing CLAUDE.md is created rather than treated as an error', () => {
   assert.equal(fs.readFileSync(box.file, 'utf8'), guidanceBlock());
   // Nothing to back up when there was no file.
   assert.equal(fs.existsSync(box.backupDir), false);
+});
+
+// ── Removal arithmetic ────────────────────────────────────────────────────────
+// Both newline sweeps used to eat EVERY adjacent newline and only the
+// end-of-file case put one back, so a block with the user's own text above AND
+// below it fused two of their lines into one. It read as harmless because the
+// block this repo installs lands at line 1 on the author's machine, where the
+// leading sweep is a no-op; any content above the block arms it.
+
+const count = (text, needle) => text.split(needle).length - 1;
+
+// A stand-in for the gates block: same plumbing, its own marker pair. Used
+// rather than agent-gates so these assertions do not depend on a compiled
+// corpus existing anywhere.
+const SECOND = createManagedBlock({
+  begin: '<!-- BEGIN permission-wildcarding: second block (managed) -->',
+  end: '<!-- END permission-wildcarding: second block -->',
+  body: () => '## A second managed block\n\nInstalled below the first one.',
+});
+
+test('removal keeps exactly one separator wherever the block sits', () => {
+  // Mid-file, the measured failure: "my own notesmore of my notes\n".
+  const middle = `my own notes\n\n${BEGIN}\nMANAGED\n${END}\n\nmore of my notes\n`;
+  assert.equal(applyGuidance(middle, false).text, 'my own notes\n\nmore of my notes\n');
+
+  // Single-newline separation stays single: a blank line the user did not have
+  // must not be invented either.
+  const tight = `top\n${BEGIN}\nMANAGED\n${END}\nbottom\n`;
+  assert.equal(applyGuidance(tight, false).text, 'top\nbottom\n');
+
+  // Start of file: nothing above to separate from, so the run below the block
+  // was all the block's own and the file must not open with a blank line.
+  const first = `${BEGIN}\nMANAGED\n${END}\n\nmy own notes\n`;
+  assert.equal(applyGuidance(first, false).text, 'my own notes\n');
+  assert.equal(applyGuidance(`${BEGIN}\nMANAGED\n${END}\n`, false).text, '');
+
+  // End of file: a text file keeps its final newline, and exactly one.
+  const last = `my own notes\n\n${BEGIN}\nMANAGED\n${END}\n`;
+  assert.equal(applyGuidance(last, false).text, 'my own notes\n');
+
+  // No block, no write.
+  assert.deepEqual(applyGuidance('my own notes\n', false),
+    { changed: false, text: 'my own notes\n' });
+});
+
+test('off with a second managed block below it leaves that block on its own line', () => {
+  // `--guidance off` while the gates or a derived block is installed is a
+  // documented, supported combination, and it produced
+  // "user preamble<!-- BEGIN ...": the removal ate the blank line AND the
+  // newline that ended the user's own last line, so the surviving block's begin
+  // marker was appended mid-line, where it is no longer a marker at all.
+  const preamble = '# my own instructions\n\nAlways use the toolbox python.\n';
+  const withShell = applyGuidance(preamble, true).text;
+  const withBoth = SECOND.apply(withShell, true).text;
+  assert.ok(withBoth.startsWith(preamble));
+
+  const shellGone = applyGuidance(withBoth, false);
+  assert.equal(shellGone.changed, true);
+  assert.equal(hasGuidance(shellGone.text), false);
+  assert.ok(SECOND.has(shellGone.text));
+  // Byte-identical to having installed only the second block: removing the
+  // first is a true round trip even with a managed block adjacent to it.
+  assert.equal(shellGone.text, SECOND.apply(preamble, true).text);
+  assert.ok(shellGone.text.startsWith(`${preamble}\n<!-- BEGIN permission-wildcarding: second block`));
+  // And the survivor comes off leaving the user's own file, byte for byte.
+  assert.equal(SECOND.apply(shellGone.text, false).text, preamble);
+  // Removing the LAST of the two is the end-of-file case, and restores the
+  // file as it stood with only the first block installed.
+  assert.equal(SECOND.apply(withBoth, false).text, withShell);
+});
+
+test('a body that quotes the markers cannot truncate its own block', () => {
+  // The gates body is compiled from the user's memory corpus and a derived body
+  // embeds managed rule text, so a body documenting this very feature quotes the
+  // markers. `blockRange` took the FIRST end marker after begin, so the range
+  // stopped inside the body: a rewrite replaced only the truncated range and
+  // left the rest of the old body plus an orphaned end marker behind, and since
+  // the reinstalled body carried that inner marker again, every pass appended
+  // another copy. `off` removed only as far as the first inner marker, which
+  // made the junk permanent.
+  const hostile = `## Gate: managed blocks\n\n- The fence is ${BEGIN} ... ${END} and nothing else.`;
+  const block = createManagedBlock({ begin: BEGIN, end: END, body: () => hostile });
+
+  const on = block.apply(USER_TEXT, true);
+  assert.equal(on.changed, true);
+  assert.equal(count(on.text, BEGIN), 1, 'exactly one begin marker survives the body');
+  assert.equal(count(on.text, END), 1, 'and exactly one end marker');
+  // Neutralised, not dropped: refusing the block would cost a user whose memory
+  // documents this feature all of their gates, so the text stays readable.
+  assert.ok(on.text.includes(escapeMarker(BEGIN)), 'the quoted begin marker is still legible');
+  assert.ok(on.text.includes(escapeMarker(END)));
+  assert.ok(block.isCurrent(on.text));
+
+  // The accumulation: every later pass used to append another body tail.
+  const second = block.apply(on.text, true);
+  assert.equal(second.changed, false, 'a marker-carrying body must still settle');
+  assert.equal(block.apply(second.text, true).text, on.text);
+  assert.equal(count(on.text, END), 1);
+
+  // And it is removable, which the truncated range made impossible.
+  assert.equal(block.apply(on.text, false).text, USER_TEXT);
 });

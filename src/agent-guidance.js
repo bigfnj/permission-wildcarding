@@ -94,6 +94,21 @@ applies to it.
 Managed by permission-wildcarding. Remove this block, or turn it off with
 \`wildcard-perms --guidance off\`.`;
 
+// A marker only fences what cannot contain it. Neither body here is this repo's text —
+// the gates body is compiled from the user's own memory corpus and a derived body embeds
+// managed rule strings — so a body that quotes a marker is ordinary content. It used to
+// truncate `blockRange` at the inner marker: a rewrite then replaced only the truncated
+// range and left the rest of the old body plus an orphaned end marker behind, and since
+// the reinstalled body still carried that inner marker, every later pass appended another
+// copy. `off` removed only as far as the first inner marker, so none of it was removable.
+//
+// Neutralised rather than refused. Refusing would cost a user whose memory documents this
+// very feature all of their gates; escaping the angle brackets leaves the marker readable
+// to a human, stops it being a fence, and keeps the block removable.
+function escapeMarker(marker) {
+  return String(marker).replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 // A managed block is a marker pair plus a body. The shell-style text above is one
 // instance; the compiled memory gates in `agent-gates.js` are another. Each closes over
 // its own markers, so adding a block cannot change how an existing one behaves, and an
@@ -102,7 +117,10 @@ function createManagedBlock({ begin, end, body }) {
   // Resolved per call, never captured: a static block hands back a const, while the gates
   // block reads whatever the compiler last wrote. That is what makes a corpus-derived
   // block's staleness detectable at all, with no version to bump.
-  const bodyText = () => (typeof body === 'function' ? body() : body);
+  const fenced = (text) => (text == null ? '' : String(text))
+    .split(begin).join(escapeMarker(begin))
+    .split(end).join(escapeMarker(end));
+  const bodyText = () => fenced(typeof body === 'function' ? body() : body);
   const block = () => `${begin}\n${bodyText()}\n${end}\n`;
 
   // Marker-fenced, so a rewrite replaces exactly what a previous version wrote and
@@ -138,16 +156,32 @@ function createManagedBlock({ begin, end, body }) {
 
     if (!on) {
       if (!range) return { changed: false, text: current };
-      // Take the trailing newline with the block, and the blank line that was
-      // inserted ahead of it, so removing and re-adding is a round trip. The
-      // separator sweep eats the newline that ended the user's own last line too,
-      // so put exactly one back — a text file keeps its final newline.
-      let start = range.start;
-      let stop = range.end;
-      while (stop < current.length && current[stop] === '\n') stop += 1;
-      while (start > 0 && current[start - 1] === '\n') start -= 1;
-      let next = current.slice(0, start) + current.slice(stop);
-      if (next.length && !next.endsWith('\n')) next += '\n';
+      // The block's own bytes are the fenced range, the newline that ends its last
+      // marker line, and the ONE blank line the install below inserts ahead of it.
+      // Every other newline in the two runs around it belongs to the user: the one
+      // that ended their own last line above, and whatever separated what follows.
+      //
+      // Sweeping both runs bare and only restoring a newline at end of file fused
+      // two of the user's own lines into one whenever the block sat between them,
+      // and dropped the separator entirely ahead of a second managed block — the
+      // shape `--guidance off` meets on any file that also carries the gates or a
+      // derived block. It read as harmless only because a block written at line 1
+      // makes the leading sweep a no-op.
+      let above = range.start;
+      while (above > 0 && current[above - 1] === '\n') above -= 1;
+      let below = range.end;
+      while (below < current.length && current[below] === '\n') below += 1;
+      const head = current.slice(0, above);
+      const tail = current.slice(below);
+      // Start of file: nothing above to separate from, and the run below was all
+      // the block's own. End of file: the head is a text file, so exactly one final
+      // newline. Mid-file: the user's line terminator above (their run less the one
+      // blank line an install inserts) plus their own separation below (that run
+      // less the newline that ended the block's last line).
+      const separator = head.length === 0 ? ''
+        : tail.length === 0 ? '\n'
+          : '\n'.repeat(Math.max(1, range.start - above - 1) + Math.max(0, below - range.end - 1));
+      const next = head + separator + tail;
       return { changed: next !== current, text: next };
     }
 
@@ -244,5 +278,5 @@ module.exports = {
   guidancePath, codexGuidancePath, guidanceTargets, installedGuidanceTargets,
   guidanceBlock, hasGuidance, isCurrent, applyGuidance,
   guidanceStatus, setGuidance, guidanceStatusAll, setGuidanceAll,
-  createManagedBlock, SHELL_BLOCK,
+  createManagedBlock, escapeMarker, SHELL_BLOCK,
 };
