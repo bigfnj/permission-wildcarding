@@ -153,6 +153,7 @@ function readSettings() {
 const {
   createSettingsWriter,
   SETTINGS_ABSENT, SETTINGS_PRESENT, SETTINGS_UNREADABLE, SETTINGS_UNREADABLE_CODE,
+  SETTINGS_CONTENDED_CODE,
 } = require('./src/settings-write');
 
 // backupPolicy is INJECTED rather than imported by the writer: it reaches
@@ -2307,8 +2308,18 @@ function toggleMax() {
   } catch (err) {
     // User-initiated, so report the contention instead of deferring silently the
     // way runWildcarding's watcher-driven pass does.
-    vscode.window.showErrorMessage(err?.code === POLICY_LOCK_CODE
-      ? `permission-wildcarding: ${POLICY_LOCK_BUSY_MESSAGE}`
+    //
+    // SETTINGS_CONTENDED is transient by construction and nothing was written,
+    // so it gets the same "try again" wording as a held policy lock rather than
+    // "MAX toggle failed". Until now this code had ZERO readers anywhere: it was
+    // set on both throws in settings-write and every catch in the repo tested
+    // only POLICY_LOCK_CODE or SETTINGS_UNREADABLE, so a routine race with
+    // Claude Code surfaced as a hard failure — the exact opposite of what its
+    // own comment promises ("nothing was written, retry on the next trigger").
+    const transient = err?.code === POLICY_LOCK_CODE || err?.code === SETTINGS_CONTENDED_CODE;
+    vscode.window.showWarningMessage(transient
+      ? `permission-wildcarding: ${err?.code === POLICY_LOCK_CODE ? POLICY_LOCK_BUSY_MESSAGE
+        : 'settings.json is being written by another process — try the toggle again in a moment.'}`
       : `permission-wildcarding: MAX toggle failed — ${err.message}`);
     updateStatusBar();
     dashboard?.refresh();

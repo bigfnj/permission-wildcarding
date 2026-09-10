@@ -776,7 +776,19 @@ function bypass(args) {
       // snapshot taken before the lock work. applyBypass touches nothing else.
       ({ result: res } = settingsWriter().writeTransform((latest) => applyBypass(latest, cmd === 'on')));
     } catch (err) {
-      process.stderr.write(`wildcard-perms --bypass: refused — ${err.message}\n`);
+      // Contention is transient and nothing was written, so say so rather
+      // than reporting a refusal the user might act on. This code had no
+      // reader anywhere until now.
+      //
+      // Required HERE, not at module scope: this file loads nothing from src/ on
+      // the hook's common path. A catch body is the safest possible place for it
+      // — it runs only on an error, and by then settingsWriter() has already
+      // pulled the module in, so this is a require.cache hit.
+      const { SETTINGS_CONTENDED_CODE } = require('../src/settings-write');
+      process.stderr.write(err?.code === SETTINGS_CONTENDED_CODE
+        ? `wildcard-perms --bypass: settings.json is being written by another `
+          + `process — nothing was changed, try again in a moment.\n`
+        : `wildcard-perms --bypass: refused — ${err.message}\n`);
       process.exitCode = 1;
       return;
     }
@@ -924,7 +936,19 @@ function max(args) {
       // by `--max off` instead of being lost.
       ({ result: res, wrote } = settingsWriter().writeTransform((latest) => applyMax(latest, cmd === 'on')));
     } catch (err) {
-      process.stderr.write(`wildcard-perms --max: refused — ${err.message}\n`);
+      // Contention is transient and nothing was written, so say so rather
+      // than reporting a refusal the user might act on. This code had no
+      // reader anywhere until now.
+      //
+      // Required HERE, not at module scope: this file loads nothing from src/ on
+      // the hook's common path. A catch body is the safest possible place for it
+      // — it runs only on an error, and by then settingsWriter() has already
+      // pulled the module in, so this is a require.cache hit.
+      const { SETTINGS_CONTENDED_CODE } = require('../src/settings-write');
+      process.stderr.write(err?.code === SETTINGS_CONTENDED_CODE
+        ? `wildcard-perms --max: settings.json is being written by another `
+          + `process — nothing was changed, try again in a moment.\n`
+        : `wildcard-perms --max: refused — ${err.message}\n`);
       process.exitCode = 1;
       return;
     }

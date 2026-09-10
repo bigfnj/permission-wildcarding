@@ -730,3 +730,66 @@ for (const flag of ['--version', '-V']) {
     assert.ok(bytesOf(home).equals(before), '--version must not touch the policy file');
   });
 }
+
+
+// A shim that makes EVERY compare-and-swap fail, by handing back a different
+// byte sequence for settings.json on every read. writeTransform then exhausts
+// its 3 attempts and throws SETTINGS_CONTENDED — the path whose error code had
+// no reader anywhere in the repo until it was wired up.
+//
+// Same seam as staleReadShim: a Node --require preload patching fs.readFileSync
+// in the child. Nothing in bin/wildcard-perms knows it is under test.
+function neverSettlesShim(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'permission-wildcarding-contend-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const shim = path.join(dir, 'always-moving.js');
+  fs.writeFileSync(shim, [
+    "const fs = require('fs');",
+    "const real = fs.readFileSync;",
+    "let n = 0;",
+    "fs.readFileSync = function (file, ...rest) {",
+    "  if (typeof file === 'string' && file.endsWith('settings.json')) {",
+    "    n += 1;",
+    // A real, parseable settings object that differs on every read, so the CAS
+    // can never hold. `model` is an unrelated key, exactly what Claude Code
+    // rewrites on every /model.
+    "    const body = JSON.stringify({",
+    "      model: 'moving-target-' + n,",
+    "      permissions: { allow: ['Bash(git status *)'], deny: [] },",
+    "    }, null, 2) + '\\n';",
+    "    return Buffer.isBuffer(real.call(fs, file, ...rest)) && rest.length === 0",
+    "      ? Buffer.from(body) : body;",
+    "  }",
+    "  return real.call(fs, file, ...rest);",
+    "};",
+  ].join('\n'));
+  return shim;
+}
+
+test('--max reports contention as transient, not as a refusal', (t) => {
+  // SETTINGS_CONTENDED_CODE was set on both throws in src/settings-write.js and
+  // read by NOBODY: every catch in the repo tested only POLICY_LOCK_CODE or
+  // SETTINGS_UNREADABLE. So a routine race with Claude Code — which rewrites
+  // settings.json on every /model, /effort and approval — surfaced as
+  // "refused", the exact opposite of what the code's own comment promises
+  // ("nothing was written, retry on the next trigger").
+  //
+  // This test also exists because wiring it up nearly shipped a ReferenceError:
+  // bin/wildcard-perms loads nothing from src/ at module scope, so the constant
+  // is not in scope there and `node --check` cannot see it. The catch body has
+  // to require it locally, and only running the path proves it does.
+  const home = tempHome(t);
+  fs.writeFileSync(path.join(home, '.claude', 'settings.json'),
+    JSON.stringify({ model: 'start', permissions: { allow: ['Bash(git status *)'], deny: [] } }, null, 2) + '\n');
+
+  const r = spawnSync(process.execPath, ['--require', neverSettlesShim(t), CLI, '--max', 'on'], {
+    cwd: home, encoding: 'utf8', env: { ...process.env, USERPROFILE: home, HOME: home },
+  });
+
+  assert.equal(r.status, 1, 'a contended toggle is still a non-zero exit');
+  assert.match(r.stderr, /being written by another process/,
+    'contention must read as transient — a ReferenceError or a bare "refused" both fail here');
+  assert.doesNotMatch(r.stderr, /ReferenceError/,
+    'the constant has to be required inside the catch; this file loads no src module at module scope');
+  assert.doesNotMatch(r.stderr, /refused —/, 'and not as a refusal the user might act on');
+});
