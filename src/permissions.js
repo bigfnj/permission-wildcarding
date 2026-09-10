@@ -209,7 +209,16 @@ function isCoveredBy(specific, wildcard) {
 // The two coverage scans below were 99.8% of processAllowList, which the hook
 // pays on every tool call: 348,588 RegExp.test() calls per pass at 423 entries,
 // ~52 ms of a 56 ms pass, and quadratic on a list that only ever grows
-// (measured: 100 entries 3.0 ms, 423 entries 52.7 ms, 841 entries 254.2 ms).
+// (measured BEFORE this index: 100 entries 3.0 ms, 423 entries 52.7 ms, 841
+// entries 254.2 ms).
+//
+// THOSE ARE THE "BEFORE" NUMBERS AND THEY ARE NO LONGER WHAT THIS COSTS. With the
+// index in place, measured 2026-09-10 cold in a fresh process: 8.1 ms at 430
+// entries, and ~9.6 ms for enableMaxAllow's pass over the allow list plus the
+// blanket set. Left in place because they are the justification for the index
+// existing, but labelled — an unlabelled 52-254 ms already misled a reviewer into
+// sizing a concurrency window at 60 ms when it is 10 ms, which changed the design
+// they recommended.
 //
 // This index does NOT reimplement matching. It NARROWS the candidate set, and
 // `isCoveredBy` — untouched — still decides every answer. So a false positive

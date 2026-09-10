@@ -228,10 +228,13 @@ function readSettingsForWrite(label) {
   return state.settings;
 }
 
-function writeSettings(settings) {
-  // Atomic write with Windows-safe rename retry + in-place fallback.
-  writeFileAtomicSync(SETTINGS, JSON.stringify(settings, null, 2) + '\n');
-}
+// writeSettings is GONE. It was a naive whole-object writer — read, compute,
+// spread the snapshot back — and its two callers were `--max` and `--bypass`,
+// the last two writers of settings.json in this file that could revert a
+// concurrent change. Both now go through settingsWriter().writeTransform, which
+// re-reads, runs the transform against that read, and compare-and-swaps on the
+// bytes. Deleting the primitive matters as much as fixing the callers: it was
+// the thing the next verb author would have found and reused.
 
 function run(input) {
   const settings = readSettings();
@@ -699,14 +702,26 @@ function bypass(args) {
   }
 
   withPolicyLock('--bypass', () => {
-    const settings = readSettingsForWrite('--bypass');
-    if (settings === null) { process.exitCode = 1; return; }
-    const res = applyBypass(settings, cmd === 'on');
+    // Kept ahead of the writer even though writeTransform refuses an unreadable
+    // file too: this path owns the word "refused", which test/cli-hook.test.js
+    // pins, while the writer's throw would surface as "write error:" through
+    // withPolicyLock's catch.
+    if (readSettingsForWrite('--bypass') === null) { process.exitCode = 1; return; }
+    let res;
+    try {
+      // The transform runs against the writer's OWN fresh read, so
+      // permissions.defaultMode is set on the newest file rather than on a
+      // snapshot taken before the lock work. applyBypass touches nothing else.
+      ({ result: res } = settingsWriter().writeTransform((latest) => applyBypass(latest, cmd === 'on')));
+    } catch (err) {
+      process.stderr.write(`wildcard-perms --bypass: refused — ${err.message}\n`);
+      process.exitCode = 1;
+      return;
+    }
     if (!res.changed) {
       process.stdout.write(`wildcard-perms bypass: already ${cmd.toUpperCase()} (defaultMode=${res.to})\n`);
       return;
     }
-    writeSettings(res.settings);
     process.stdout.write(
       `wildcard-perms bypass: ${res.from} → ${res.to} — ` +
       `${cmd === 'on' ? 'ALL PROMPTS BYPASSED' : 'prompts restored'}. ` +
@@ -829,10 +844,26 @@ function max(args) {
   withPolicyLock('--max', () => {
     // Before applyMax, which writes the allow-list snapshot as a side effect —
     // an unreadable read here would have recorded an EMPTY snapshot over a real
-    // one, making `--max off` unable to restore anything.
-    const settings = readSettingsForWrite('--max');
-    if (settings === null) { process.exitCode = 1; return; }
-    const res = applyMax(settings, cmd === 'on');
+    // one, making `--max off` unable to restore anything. writeTransform refuses
+    // that case too, and refuses BEFORE running the transform for the same
+    // reason; this check stays because it owns the "refused" wording the tests
+    // pin, and because the file can become unreadable between the two reads.
+    if (readSettingsForWrite('--max') === null) { process.exitCode = 1; return; }
+    let res;
+    let wrote = false;
+    try {
+      // applyMax IS the transform, not a value computed before the write. Its
+      // side effects — the allow-list snapshot and the approve script — are
+      // therefore taken against the same read the write lands on, which is what
+      // makes the snapshot reflect the freshest list rather than one from before
+      // the ~9.6 ms pass. An approval that lands in that window is now restored
+      // by `--max off` instead of being lost.
+      ({ result: res, wrote } = settingsWriter().writeTransform((latest) => applyMax(latest, cmd === 'on')));
+    } catch (err) {
+      process.stderr.write(`wildcard-perms --max: refused — ${err.message}\n`);
+      process.exitCode = 1;
+      return;
+    }
     // A refusal is not "already in that state". Reporting "already ON" after the
     // allow snapshot failed to land would be the worst possible answer: MAX is
     // off, the user believes it is on, and the snapshot that alone could restore
@@ -850,7 +881,6 @@ function max(args) {
       process.stdout.write(`wildcard-perms MAX: already ${cmd.toUpperCase()}\n`);
       return;
     }
-    writeSettings(res.settings);
     const L = maxLayers(res.settings);
     process.stdout.write(
       `wildcard-perms MAX: ${cmd.toUpperCase()} — ` +

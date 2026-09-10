@@ -18,6 +18,7 @@ const path = require('node:path');
 const {
   createSettingsWriter, readSettingsState,
   SETTINGS_ABSENT, SETTINGS_PRESENT, SETTINGS_UNREADABLE, SETTINGS_UNREADABLE_CODE,
+  SETTINGS_CONTENDED_CODE,
 } = require('../src/settings-write');
 
 function tempSettings(t, value) {
@@ -129,4 +130,149 @@ test('the injected write hook receives what actually landed', (t) => {
   assert.deepEqual(seen[0].deny, ['Bash(mkfs* *)'], 'and the deny list it must not lose');
   assert.deepEqual(seen[0].allow, env.read().permissions.allow,
     'what the hook records and what is on disk cannot disagree');
+});
+
+
+// ── writeTransform ───────────────────────────────────────────────────────────
+//
+// The other writer shape, for callers whose change cannot be expressed as an
+// allow-list delta. `applyMax` and `applyBypass` both DELETE keys
+// (permissions.defaultMode, hooks.PreToolUse) rather than nulling them, and
+// writeAllow is a merge — `{ ...latest, permissions }` — which can never express
+// a delete and can only carry permissions.allow. Routing MAX through it would
+// silently drop the approve-hook registration, i.e. half the feature.
+
+test('the transform runs against the file as it is NOW, not the caller read', (t) => {
+  const env = tempSettings(t, { model: 'A', permissions: { allow: ['Bash(git status)'] } });
+
+  // What lands while the caller is still deciding what to do.
+  fs.writeFileSync(env.file, JSON.stringify({
+    model: 'B',
+    effortLevel: 'high',
+    permissions: { allow: ['Bash(git status)', 'Bash(npm test)'] },
+  }, null, 2) + '\n');
+
+  let seen = null;
+  const out = env.writer().writeTransform((latest) => {
+    seen = latest;
+    return { changed: true, settings: { ...latest, permissions: { ...latest.permissions, defaultMode: 'plan' } } };
+  });
+
+  // THIS is the assertion that fails if someone reverts to handing the transform
+  // a caller-supplied snapshot. The disk assertions below can be satisfied by a
+  // lucky merge; this one cannot.
+  assert.equal(seen.model, 'B', 'the transform saw the newest read');
+  assert.ok(seen.permissions.allow.includes('Bash(npm test)'),
+    'including an approval that landed after the caller started');
+
+  assert.equal(out.wrote, true);
+  assert.equal(out.latest.model, 'B', 'and the caller is told which read it wrote onto');
+
+  const disk = env.read();
+  assert.equal(disk.model, 'B', 'the concurrent write survives');
+  assert.equal(disk.effortLevel, 'high', 'including a key the caller never saw at all');
+  assert.equal(disk.permissions.defaultMode, 'plan', 'and the transform still took effect');
+});
+
+test('a transform that changes nothing does not touch the file', (t) => {
+  const env = tempSettings(t, { model: 'A', permissions: { allow: ['Bash(rg *)'] } });
+  const before = fs.statSync(env.file).mtimeMs;
+  const beforeBytes = fs.readFileSync(env.file, 'utf8');
+
+  const out = env.writer().writeTransform((latest) => ({ changed: false, settings: latest, to: 'already' }));
+
+  assert.equal(out.wrote, false);
+  assert.equal(out.result.to, 'already',
+    'the transform result comes back VERBATIM — callers read .error, .to, .switchedMode');
+  assert.equal(fs.statSync(env.file).mtimeMs, before, 'not rewritten');
+  assert.equal(fs.readFileSync(env.file, 'utf8'), beforeBytes);
+});
+
+test('an unreadable file is refused BEFORE the transform runs', (t) => {
+  const env = tempSettings(t);
+  // Truncated mid-array: somebody else's atomic write in progress.
+  fs.writeFileSync(env.file, '{ "permissions": { "allow": [ ');
+
+  const sideEffects = [];
+  assert.throws(
+    () => env.writer().writeTransform((latest) => {
+      sideEffects.push('ran');
+      return { changed: true, settings: latest };
+    }),
+    (err) => err.code === SETTINGS_UNREADABLE_CODE,
+  );
+
+  // The ordering is the whole point, not an implementation detail. applyMax
+  // writes the allow-list snapshot as a side effect of being called, so a
+  // transform that ran before the refusal would overwrite a real snapshot with
+  // one taken from a file we then decline to write — turning MAX-on into
+  // permanent loss of the allow list.
+  assert.deepEqual(sideEffects, [], 'the transform was never invoked');
+});
+
+test('a delete survives the round trip, because this writer does not merge', (t) => {
+  const env = tempSettings(t, { model: 'A', permissions: { allow: [], defaultMode: 'plan' } });
+
+  env.writer().writeTransform((latest) => {
+    const permissions = { ...latest.permissions };
+    delete permissions.defaultMode;
+    return { changed: true, settings: { ...latest, permissions } };
+  });
+
+  const disk = env.read();
+  assert.equal('defaultMode' in disk.permissions, false,
+    'the key is gone from the FILE — writeAllow could not express this at all');
+  assert.equal(disk.model, 'A', 'and nothing else moved');
+});
+
+test('a transform that would drop a deny rule is refused, not obeyed', (t) => {
+  const env = tempSettings(t, {
+    permissions: { allow: ['Bash(rg *)'], deny: ['Bash(rm -rf /*)', 'Bash(curl *)'] },
+  });
+  const beforeBytes = fs.readFileSync(env.file, 'utf8');
+
+  // deny is the safety boundary every other feature defers to. writeAllow
+  // guarantees it additively; this writer writes verbatim, so it refuses to be
+  // the thing that silently drops one. Neither real transform can trigger this —
+  // it is a guard for the next author.
+  assert.throws(
+    () => env.writer().writeTransform((latest) => ({
+      changed: true,
+      settings: { ...latest, permissions: { allow: latest.permissions.allow } },
+    })),
+    /deny rule/,
+  );
+  assert.equal(fs.readFileSync(env.file, 'utf8'), beforeBytes, 'and nothing was written');
+});
+
+test('a file that keeps moving is reported, never written over', (t) => {
+  const env = tempSettings(t, { model: 'A', permissions: { allow: [] } });
+  let n = 0;
+
+  // The transform itself is the concurrent writer: every attempt sees the file
+  // change underneath it, which is the compare-and-swap's terminal case.
+  assert.throws(
+    () => env.writer().writeTransform((latest) => {
+      n += 1;
+      fs.writeFileSync(env.file, JSON.stringify({ model: `moved-${n}`, permissions: { allow: [] } }, null, 2) + '\n');
+      return { changed: true, settings: { ...latest, permissions: { ...latest.permissions, defaultMode: 'plan' } } };
+    }, { attempts: 3 }),
+    (err) => err.code === SETTINGS_CONTENDED_CODE,
+  );
+
+  assert.equal(n, 3, 'it retried the configured number of times before giving up');
+  assert.equal('defaultMode' in env.read().permissions, false,
+    'and the losing write never landed');
+});
+
+test('an absent settings.json is the legitimate first run, not a refusal', (t) => {
+  const env = tempSettings(t); // no file at all
+
+  const out = env.writer().writeTransform((latest) => ({
+    changed: true,
+    settings: { ...latest, permissions: { ...latest?.permissions, defaultMode: 'bypassPermissions' } },
+  }));
+
+  assert.equal(out.wrote, true);
+  assert.equal(env.read().permissions.defaultMode, 'bypassPermissions');
 });

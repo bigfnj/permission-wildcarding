@@ -218,3 +218,98 @@ test('--max and --bypass still work on an absent settings.json, which is the leg
   const after = JSON.parse(fs.readFileSync(path.join(home, '.claude', 'settings.json'), 'utf8'));
   assert.equal(after.permissions.defaultMode, 'bypassPermissions');
 });
+
+
+// ── the concurrency the toggles used to lose ─────────────────────────────────
+//
+// `--max` and `--bypass` used to read settings.json, compute a whole new object,
+// and write it back. They hold the policy lock, and the lock is irrelevant:
+// Claude Code never takes it and rewrites this file on every /model, /effort and
+// approval. So anything that landed between the read and the write was reverted.
+// Nothing in the suite covered that — every existing test writes the file once
+// and never moves it underneath a running verb.
+//
+// The seam is a Node `--require` preload, NOT an env var the product checks. The
+// shim monkey-patches fs.readFileSync inside the child and returns STALE bytes
+// for the first read of settings.json only, so the process behaves exactly as it
+// would if Claude Code had written between its first read and its write. Nothing
+// in bin/wildcard-perms knows it is under test; the only coupling is "settings
+// .json is read via fs.readFileSync", which is true at src/settings-write.js and
+// at the CLI's own readSettings.
+function staleReadShim(t, stalePayload) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'permission-wildcarding-shim-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const shim = path.join(dir, 'stale-first-read.js');
+  fs.writeFileSync(shim, [
+    "const fs = require('fs');",
+    "const real = fs.readFileSync;",
+    `const stale = ${JSON.stringify(stalePayload)};`,
+    'let served = false;',
+    // Only readFileSync, and only for that basename, so the sidecar reads and
+    // writeFileAtomicSync's own I/O are untouched.
+    'fs.readFileSync = function patched(target, ...rest) {',
+    "  if (!served && typeof target === 'string' && target.endsWith('settings.json')) {",
+    '    served = true;',
+    "    return rest[0] === 'utf8' || rest[0]?.encoding === 'utf8' ? stale : Buffer.from(stale);",
+    '  }',
+    '  return real.call(this, target, ...rest);',
+    '};',
+  ].join('\n'));
+  return shim;
+}
+
+function runVerbWithShim(home, shim, args) {
+  const root = path.parse(home).root;
+  return spawnSync(process.execPath, ['--require', shim, CLI, ...args], {
+    cwd: home, encoding: 'utf8', windowsHide: true,
+    env: {
+      ...process.env, HOME: home, USERPROFILE: home,
+      HOMEDRIVE: root.replace(/[\\/]$/, ''), HOMEPATH: home.slice(root.length - 1),
+    },
+  });
+}
+
+test('--bypass keeps a key that landed between its read and its write', (t) => {
+  // On disk: what Claude Code wrote while the verb was working.
+  const home = tempHome(t, {
+    model: 'claude-opus-5',
+    effortLevel: 'high',
+    permissions: { allow: ['Bash(git status *)', 'Bash(npm test)'], deny: ['Bash(rm -rf /*)'] },
+  });
+  // What the verb's FIRST read returns: an older file, missing all of that.
+  const stale = JSON.stringify({ permissions: { allow: ['Bash(git status *)'] } }, null, 2) + '\n';
+
+  const run = runVerbWithShim(home, staleReadShim(t, stale), ['--bypass', 'on']);
+  assert.equal(run.status, 0, run.stderr);
+
+  const after = settingsOf(home);
+  assert.equal(after.permissions.defaultMode, 'bypassPermissions', 'the toggle took effect');
+  // Reverted code writes the stale object: no model, no effortLevel, no deny, and
+  // one fewer approval.
+  assert.equal(after.model, 'claude-opus-5', 'model survived');
+  assert.equal(after.effortLevel, 'high', 'effortLevel survived');
+  assert.deepEqual(after.permissions.deny, ['Bash(rm -rf /*)'], 'deny survived');
+  assert.ok(after.permissions.allow.includes('Bash(npm test)'),
+    'and the approval that landed in the window survived');
+});
+
+test('--max on snapshots the list as it is now, not as its first read saw it', (t) => {
+  const home = tempHome(t, {
+    model: 'claude-opus-5',
+    permissions: { allow: ['Bash(git status *)', 'Bash(npm test)'] },
+  });
+  const stale = JSON.stringify({ permissions: { allow: ['Bash(git status *)'] } }, null, 2) + '\n';
+
+  const run = runVerbWithShim(home, staleReadShim(t, stale), ['--max', 'on']);
+  assert.equal(run.status, 0, run.stderr);
+
+  // The snapshot is the only thing that can restore the list, so what it captured
+  // is the whole question. Taken from the stale read, `Bash(npm test)` would be
+  // absent from it AND pruned from the live list by the blanket set — gone for
+  // good, which is exactly the loss this change was made to stop.
+  const snapshot = JSON.parse(
+    fs.readFileSync(path.join(home, '.claude', 'backups', 'wildcarding-max.json'), 'utf8'));
+  assert.ok(snapshot.allowSnapshot.includes('Bash(npm test)'),
+    'the snapshot came from the freshest read');
+  assert.equal(settingsOf(home).model, 'claude-opus-5', 'and unrelated keys survived the write');
+});

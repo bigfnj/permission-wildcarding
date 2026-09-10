@@ -2152,20 +2152,43 @@ function toggleMax() {
   let restoredMode = null;
   try {
     getPolicyLock().locked(() => {
-      const settings = readSettings();
-      if (!settings) {
-        vscode.window.showWarningMessage('permission-wildcarding: settings.json not found — cannot toggle MAX.');
-        return;
-      }
-      turningOn = !isMaxOn(settings);
-      const res = applyMax(settings, turningOn);
+      // Read, transform and write are one operation now, all against the SAME
+      // fresh read taken inside the writer.
+      //
+      // What this replaces: a readSettings() here, applyMax against it, and a
+      // whole-object writeFileAtomicSync at the end. That held the policy lock
+      // the entire time and it did not matter — Claude Code never takes this lock
+      // and rewrites settings.json on every /model, /effort and approval, so
+      // anything landing in the window was reverted. The CLI had the identical
+      // shape and was fixed in the same change; fixing only one would have left
+      // half the bug, which is the mistake that was made in the other direction
+      // when the drain was rebased.
+      //
+      // `turningOn` is derived INSIDE the closure, not before it. Deriving it
+      // from an earlier read let the request and the file disagree: if MAX had
+      // already reached the requested state, applyMax returned changed:false,
+      // nothing was written, `layers` stayed null, and BOTH notification branches
+      // below were skipped — the user clicked and got no message at all, the
+      // exact failure the snapshot-refusal branch was added to fix.
+      //
+      // It also deletes a guard that told a lie. readSettings() collapses absent
+      // and unreadable into null and reported "settings.json not found" for a
+      // file that was merely mid-write, and it refused on an ABSENT file where
+      // the CLI proceeds. Now: absent yields {} and MAX-on works on a fresh
+      // install like the CLI's does, and unreadable throws SETTINGS_UNREADABLE
+      // into the catch below, which says "could not be parsed" — which is true.
+      let res;
+      let wroteOnto;
+      ({ result: res, latest: wroteOnto } = settingsWriter.writeTransform((latest) => {
+        turningOn = !isMaxOn(latest);
+        return applyMax(latest, turningOn);
+      }));
       // A refusal is not "already in that state". `changed: false` with
       // `error: 'max-snapshot-failed'` means the allow-list snapshot did not
       // land, so MAX-off could never restore the user's entries. Falling
       // through to the bare `!res.changed` return left `layers` null, which
       // skips BOTH notification branches below — the user got no message at
-      // all, and believes MAX is on while it is off. The CLI reports this
-      // properly at bin/wildcard-perms:808.
+      // all, and believes MAX is on while it is off.
       if (res.error === 'max-snapshot-failed') {
         vscode.window.showErrorMessage(
           'permission-wildcarding: MAX refused — could not write the allow-list snapshot to '
@@ -2174,24 +2197,32 @@ function toggleMax() {
         );
         return;
       }
-      if (!res.changed) return;
+      if (!res.changed) {
+        // Reachable now that intent comes from the same read as the transform:
+        // another writer got the file into the requested state first. Say so
+        // rather than returning silently into no notification at all.
+        vscode.window.showInformationMessage(
+          `permission-wildcarding: MAX is already ${turningOn ? 'OFF' : 'ON'} — nothing to change.`
+        );
+        return;
+      }
       switchedMode = res.switchedMode;
       restoredMode = res.restoredMode;
-      writeFileAtomicSync(SETTINGS, JSON.stringify(res.settings, null, 2) + '\n');
       if (!turningOn) {
         // Purge MAX blanket entries from the backup so the policy guard does not
         // treat them as "missing" and re-assert them, re-enabling MAX silently.
         //
         // Only the ones MAX itself added, which is what MAX-off actually removed:
         // res.settings already unions the pre-MAX snapshot back in, so anything
-        // still present there is the user's and must keep its backup cover. The
-        // old line forgot the whole set — Read(*), Edit, Write, WebFetch(*),
-        // WebSearch and every mcp__<server>__* — contradicting restoreFromBackup's
-        // own note that "the full MAX set is legitimately used outside MAX too, so
-        // only the two markers that uniquely signal MAX-on are excluded". One MAX
-        // round trip silently dropped that half of the high-water mark.
+        // still present there is the user's and must keep its backup cover.
+        //
+        // Both halves now come from ONE read. This used to compute
+        // buildMaxAllowSet from the caller's older `settings` while measuring it
+        // against res.settings from the transform — two views of one file inside
+        // one expression, which is the same class of defect this change removes.
         const restoredAllow = res.settings?.permissions?.allow ?? [];
-        forgetFromBackup(buildMaxAllowSet(settings.permissions?.allow ?? [])
+        const preMax = wroteOnto?.permissions?.allow ?? [];
+        forgetFromBackup(buildMaxAllowSet(preMax)
           .filter((entry) => !restoredAllow.includes(entry)));
       }
       lastRun = Date.now();

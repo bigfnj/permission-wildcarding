@@ -35,6 +35,9 @@ const SETTINGS_ABSENT = 'absent';
 const SETTINGS_PRESENT = 'present';
 const SETTINGS_UNREADABLE = 'unreadable';
 const SETTINGS_UNREADABLE_CODE = 'SETTINGS_UNREADABLE';
+// Coded like the lock and the unreadable case: a caller should report this and
+// let its next trigger retry, not treat it as a hard failure.
+const SETTINGS_CONTENDED_CODE = 'SETTINGS_CONTENDED';
 
 function readSettingsState(settingsPath) {
   let raw;
@@ -51,6 +54,23 @@ function readSettingsState(settingsPath) {
     // Includes the zero-byte window of a truncate-then-write.
     return { state: SETTINGS_UNREADABLE, settings: null };
   }
+}
+
+// The raw bytes, for the compare-and-swap in writeTransform. Deliberately not a
+// parse: two different byte sequences can parse equal, and for a whole-object
+// write any byte change at all means someone else got there first.
+function rawSettingsText(target) {
+  try { return fs.readFileSync(target, 'utf8'); }
+  catch { return null; }
+}
+
+// Deny rules present in `before` that `after` would not carry. Used to refuse a
+// transform that would drop the safety boundary.
+function deniesLost(before, after) {
+  const had = Array.isArray(before?.permissions?.deny) ? before.permissions.deny : [];
+  if (!had.length) return [];
+  const kept = new Set(Array.isArray(after?.permissions?.deny) ? after.permissions.deny : []);
+  return had.filter((rule) => !kept.has(rule));
 }
 
 // `onWrite(allow, deny)` runs after a successful write — the extension passes its
@@ -114,10 +134,98 @@ function createSettingsWriter({ settingsPath, onWrite } = {}) {
     };
   }
 
+  // ── writeTransform ──────────────────────────────────────────────────────────
+  //
+  // The OTHER shape of writer, for callers whose change cannot be expressed as an
+  // allow-list delta. Read the contrast before reaching for either:
+  //
+  //   writeAllow      replays the caller's delta onto a fresh read, protects deny
+  //                   additively, and MERGES (`{ ...latest, permissions }`). A
+  //                   merge can never express a DELETE, and it can only ever
+  //                   change `permissions.allow` plus additive `permissions.deny`.
+  //   writeTransform  runs the caller's function against a fresh read and writes
+  //                   what it returns, VERBATIM. It can therefore delete keys —
+  //                   which `applyMax`/`applyBypass` require, since both remove
+  //                   `permissions.defaultMode` and `hooks.PreToolUse` rather than
+  //                   nulling them — and it gets none of writeAllow's protections.
+  //
+  // Routing MAX through writeAllow would silently drop Layer 2 entirely: `hooks`
+  // comes from `latest` in that merge, so the approve-hook registration would
+  // never be written. That is why a second writer exists.
+  //
+  // Compare-and-swap, not just a rebase. A rebase alone would close nothing here:
+  // the caller's expensive work happens INSIDE this function (enableMaxAllow runs
+  // processAllowList, measured 9.6 ms), so the read-to-write window survives the
+  // change. Re-reading the bytes after the transform and retrying when they moved
+  // is what actually shrinks it, and it is the pattern auto-learn-manager already
+  // uses for its own transactional write. Retry is safe because both transforms
+  // are idempotent overwrites — each attempt re-snapshots from the newest read,
+  // which is also what makes "the MAX snapshot comes from the freshest read" true
+  // at the moment of the write rather than merely at the moment of the read.
+  function writeTransform(transform, { attempts = 3 } = {}) {
+    let lastLatest = null;
+    let lastResult = null;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      const before = readSettingsState(target);
+      // Refuse BEFORE running the transform, never after. applyMax writes the
+      // allow-list snapshot as a side effect, so transforming first would clobber
+      // a real snapshot with one taken from a file we then refuse to write.
+      // test/cli-hook.test.js asserts those snapshot bytes survive a refusal.
+      if (before.state === SETTINGS_UNREADABLE) {
+        const err = new Error(`${target} exists but could not be parsed, so it is not safe to write over`);
+        err.code = SETTINGS_UNREADABLE_CODE;
+        throw err;
+      }
+      // `absent` yields {}, which is the legitimate first-run case.
+      const latest = before.settings;
+      const beforeText = rawSettingsText(target);
+      const result = transform(latest);
+      lastLatest = latest;
+      lastResult = result;
+      if (!result || result.changed !== true) return { wrote: false, result, latest };
+
+      // Did the file move under us while the transform ran? Compare bytes, not a
+      // parse: any change at all invalidates a whole-object write.
+      if (rawSettingsText(target) !== beforeText) continue;
+
+      // deny is the safety boundary every other feature defers to. writeAllow
+      // guarantees it additively; this writer cannot, so it refuses to be the
+      // thing that drops one rather than doing it silently. Both current
+      // transforms spread `permissions` through, so this never fires for them —
+      // it is a guard for the next author.
+      const lost = deniesLost(latest, result.settings);
+      if (lost.length) {
+        throw new Error(
+          `refusing to write: the transform would drop ${lost.length} deny rule(s) `
+          + `(${lost.slice(0, 3).join(', ')}${lost.length > 3 ? ', …' : ''})`,
+        );
+      }
+
+      writeFileAtomicSync(target, JSON.stringify(result.settings, null, 2) + '\n');
+      // Deliberately NOT calling onWrite. That hook is the allow-list high-water
+      // backup, and the reason is narrower than it looks: MAX's blanket set does
+      // legitimately reach the backup in production (via the watcher, which
+      // test/policy-backup.test.js relies on), so this is not about keeping it
+      // out. It is about preserving today's behaviour byte-for-byte through a
+      // correctness change — the extension compensates by hand with
+      // forgetFromBackup, and moving that here would be a second change riding
+      // the first.
+      return { wrote: true, result, latest };
+    }
+    // Out of attempts: another writer is winning every race. Report rather than
+    // write over it; the caller's next trigger retries.
+    const err = new Error(`${target} changed under every write attempt (${attempts}), so nothing was written`);
+    err.code = SETTINGS_CONTENDED_CODE;
+    err.result = lastResult;
+    err.latest = lastLatest;
+    throw err;
+  }
+
   return {
     settingsPath: target,
     readSettingsState: () => readSettingsState(target),
     writeAllow,
+    writeTransform,
   };
 }
 
@@ -129,4 +237,5 @@ module.exports = {
   SETTINGS_PRESENT,
   SETTINGS_UNREADABLE,
   SETTINGS_UNREADABLE_CODE,
+  SETTINGS_CONTENDED_CODE,
 };
