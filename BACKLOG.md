@@ -31,6 +31,258 @@ tests, 289 pass, 1 POSIX-only skip, 0 fail.
 
 ## Open
 
+### The hook writes settings.json with no lock and no rebase, and can lose a deny rule
+
+**Highest-severity finding of the 2026-09-09 audit.** `bin/wildcard-perms:193-207`.
+The hook is the highest-frequency writer of settings.json on this machine
+(PostToolUse on `Bash|PowerShell`) and it is the one writer that takes no lock.
+`README.md:36` says "the advisory lock **every** policy writer takes" and
+`:561` says the wildcarding pass and Auto Learn "both take the same lock". That
+is true of the extension's `runWildcarding` (`extension.js:2133`, which locks and
+retries) and **false of the CLI's**. The two most frequent writers have zero
+mutual exclusion. It also does not rebase, unlike `writeAllow`
+(`extension.js:142-176`), which documents this exact hazard and defends against it.
+
+Failure scenario, and it loses the thing this project says it never loses: the
+user hand-adds `Bash(rm -rf *)` to `permissions.deny`. A tool call completes, the
+hook fires, reads settings.json *before* that edit lands, spends ~56 ms in
+processAllowList, then writes back its snapshot —
+`permissions: { ...settings.permissions, allow: after }` carries the **old**
+deny. The rule is gone, and nothing re-asserts it: the high-water backup only
+restores a deny it already recorded, and it never saw this one.
+
+Narrow window, because the write is skipped when the list is already a fixed
+point — but it opens precisely when a new approval has just been persisted, which
+is when a concurrent write is most likely. Secondary: a write landing between
+Auto Learn's settings write and its claims write leaves the registry describing
+entries that no longer exist, the exact failure `policy-lock.js:1-7` was written
+to prevent.
+
+`--seed` has the same shape (`bin/wildcard-perms:515-541`: read, merge, write, no
+lock, no rebase) while `withPolicyLock` is defined 20 lines below and used by
+`--drain`, `--bypass` and `--max`. Two extension writers also bypass the lock —
+`restoreFromBackup` (`extension.js:444`, reached from the **automatic** bulk-loss
+path at `:379`, i.e. during a policy wipe, maximum contention) and `_remove`
+(`:2740`). Both rebase, so they cannot lose unrelated fields, but they can
+interleave with Auto Learn's two-file application.
+
+### Three swallowed snapshot failures turn a toggle destructive
+
+Same shape in three places: a best-effort state write whose failure is discarded,
+followed by a destructive operation that assumed it succeeded.
+
+- **MAX-on can lose the entire allow list.** `src/permissions.js:361-366` and
+  `:424`. `writeMaxState` swallows its error, `enableMaxAllow` proceeds
+  unconditionally, and processAllowList then prunes all 423 specific entries
+  under `Bash(*)`. On MAX-off, `disableMaxAllow` reads `state.allowSnapshot`;
+  with no snapshot `Array.isArray(snap)` is false, `restored = kept`, and the
+  user is left with the 7 blanket entries. The "best-effort" comment is borrowed
+  from `writeBypassState:250`, where the stated consequence is genuinely benign;
+  here it is total. CLI-only users have no second copy.
+- **`writeCodexMaxState` is the one state write not using an atomic helper**
+  (`src/codex-max.js:118-124`), while every sibling uses `writeFileAtomicSync` or
+  `atomicWrite`. Interrupted mid-write, `readCodexMaxState` catches the parse
+  error and returns `{}`, `priorApproval` is undefined, and
+  `applyCodexMax(..., false)` calls `clearApproval` — **removing
+  `approval_policy` entirely instead of restoring the user's prior value**.
+- **`ensureApproveScript()`'s failure is discarded** (`permissions.js:464`, and
+  `:480` ignores the return), so `registerApproveHook` registers the PreToolUse
+  entry regardless and `--max status` prints `approve-hook=on` with no
+  `approve-all.js` on disk. Fail-safe in direction (prompts still appear) but
+  `maxLayers`' own comment sets the opposite standard: "Reporting `hook: true` in
+  that case would claim a control that is not running".
+
+### The backup can drop entries it legitimately owns
+
+- **`_remove` prunes the backup before the write that may fail**
+  (`extension.js:2750-2751`). `forgetFromBackup` runs first; if `writeAllow` then
+  throws — and `SETTINGS_UNREADABLE_CODE` is routine, the file is rewritten in
+  place on every approval — the entry is still live in settings.json but gone
+  from the high-water mark, so a later wipe will not restore it. Swap the order,
+  or roll the forget back in the catch.
+- **MAX-off purges the full MAX set from the backup** (`extension.js:2084`):
+  `Read(*)`, `Edit`, `Write`, `WebFetch(*)`, `WebSearch` and every
+  `mcp__<server>__*`. This contradicts `restoreFromBackup`'s own comment ~1600
+  lines earlier (`:473-478`): "The full MAX set is legitimately used outside MAX
+  too, so only the two markers that uniquely signal MAX-on are excluded." A user
+  who had `Read(*)` before ever touching MAX keeps it in settings.json (restored
+  from the sidecar) but loses it from the backup. Use `MAX_MARKERS` here, or
+  forget only what is absent from `state.allowSnapshot`.
+
+### Codex evidence past 256 KB is silently discarded
+
+`src/history-adapters.js:686-702` with `src/auto-learn-manager.js:1367`.
+Verified empirically 2026-09-09, including against a real session file on this box.
+
+Codex records `cwd` only in the head-of-file `session_meta`, and
+`parseCodexJsonl` carries it forward in `state.cwd`. In `append` mode the scanner
+reads from `max(0, prior.size - 256 KB)`, so once a session exceeds the overlap
+window the head is not in the buffer, `state.cwd` stays undefined, and the scan
+drops the observation at `within(workspaceRoot, undefined) === false`.
+`workspaceRoot` is always set from the CLI (`--workspace` defaults to cwd) and for
+any normal VS Code window.
+
+    size=423227
+    PASS1 mode=full    obs=[{"cmd":"git status","cwd":"D:/work/repo"}]
+    PASS2 mode=append  obs=[{"cmd":"git log"}]      <- cwd absent, dropped
+
+On the real `~/.codex/sessions/.../rollout-*.jsonl`: **2 of 32 records carry cwd,
+both at the head.** Real Claude transcripts carry it on ~83% of records
+(1524/1833) spread throughout, so Claude is unaffected in practice. This is a
+plausible mechanical explanation for the handoff's "Codex gap was 30 of 6,870
+observations". `rebuildManagedHits` is immune because it forces `cursors: {}` and
+reads in full — which is why a rebuild and a scan disagree.
+
+Secondary: `session` is lost the same way and is part of `identityParts` in
+`createObservation`, so the same call gets a **different observation id** in
+append vs full mode. With `workspaceRoot` null — an empty VS Code window, since
+`extension.js:860` uses `workspaceFolders?.[0]` — an append-counted observation
+is counted again after a transcript rewrite forces a full re-read, inflating
+`counts.success`, which is the number that gates auto-safe application.
+
+### A junctioned transcript directory is invisible, with no error
+
+`src/history-adapters.js:816-846`. The comment claims junctions are handled
+("Use a real-path set and an iterative walk so either a cycle or extreme nesting
+is harmless"), but `:841` queues children on `entry.isDirectory()`, and a Dirent
+for a Windows junction reports `isSymbolicLink() === true`,
+`isDirectory() === false`, `isFile() === false`. The directory is never queued,
+the real-path cycle guard never fires from that direction, and every transcript
+under it is skipped silently. Verified:
+
+    linked isDirectory=false isFile=false isSymbolicLink=true
+    files found: []
+
+**This bears directly on the corpus-protection item above.** Junctioning a
+directory under `~/.claude` to a git repo on `D:` is the natural move on a box
+laid out across two drives, and for a *transcript* directory it would silently
+zero the evidence base. Before recommending that protection, confirm which
+discovery paths follow a junction: `memoryLint.discoverDirs` happens to be safe
+because it tests `existsSync(<dir>/MEMORY.md)`, which follows the link, but
+`findJsonlFiles` is not, and `recall.py`'s own discovery has not been checked.
+Fix is to queue on `isDirectory() || isSymbolicLink()` and let the existing
+realpath set handle cycles — which is what it was written for.
+
+### One unreadable transcript root wipes every cursor and reports a clean scan
+
+`src/auto-learn-manager.js:1415` replaces `state.cursors` wholesale from the scan
+result, and `src/history-adapters.js:824,835,838` has three `catch { continue; }`
+covering statSync, realpathSync and readdirSync. If `~/.claude/projects` is
+momentarily inaccessible — EACCES from antivirus, a locked directory —
+`findJsonlFiles` returns zero files with no error, so every file's byte offset is
+lost and `lastScanStats` reports `{files: 0, observations: 0, errors: 0}`,
+indistinguishable from "nothing to do". The per-file catch at `:1057-1068`
+reasons carefully about not "claiming progress we did not make"; the root-level
+enumeration failure sits outside that reasoning and produces the outcome it was
+written to prevent. Skip the cursor replacement when zero files are found but
+prior cursors existed, and surface a root-level error.
+
+### Managed-block removal can fuse the user's own lines
+
+`src/agent-guidance.js:147-150`. Both newline sweeps eat every adjacent newline
+and only the end-of-file case puts one back, against a file whose contract
+(`:22-25`) is that the block is "removable without touching a byte of the user's
+own text". Measured:
+
+    CASE 1  off        -> "my own notesmore of my notes\n"     <- two user lines fused
+    CASE 2  first off  -> "user preamble<!--GB-->\nGATES\n<!--GE-->\n"
+
+Case 2 is `--guidance off` while gates or a derived block is installed, a
+documented supported combination. Harmless on this box *today* only because the
+live `~/.claude/CLAUDE.md` has the block at lines 1-31 with user content from 33,
+so `start === 0`; any content added above the block, or any second block below
+it, arms this.
+
+Related, same file: `blockRange` (`:113-119`) takes `indexOf(begin)` then the
+**first** `indexOf(end, start)`, with no guard against a body containing its own
+END marker. The gates body is arbitrary user-corpus text and the derived body
+embeds managed rule text, so a memory whose `<!-- gate -->` section documents
+this feature — entirely plausible for someone whose memories are about their own
+tooling — truncates the range; `apply(text, true)` then leaves the old body tail
+plus an orphaned END marker in the file, accumulating on every toggle.
+
+And there are **five unsynchronized writers** of that one file: CLI guidance
+(`bin/wildcard-perms:422`), CLI gates (`:489`), extension guidance
+(`extension.js:2367,2416`), extension gates (`:2531,2595`) and `decideDerived`
+(`auto-learn-manager.js:921`). Only the last holds a lock, and it is the *policy*
+lock, which none of the others take — so it buys nothing here. The extension also
+recompiles gates automatically on a memory-dir change, so an automatic write can
+race a manual `--guidance off`. Individually recoverable; combined with the two
+findings above, a race can leave the file structurally broken. Note also that the
+instruction-file backups are single-slot fixed names
+(`agent-guidance.js:211`, `derived-guidance.js:308`), so two toggles in a row
+overwrite the good copy with the bad one.
+
+### Two unvalidated external inputs reach a policy or instruction file
+
+- **Project `settings.local.json` is promoted to user scope with no trust gate on
+  the CLI path.** `bin/wildcard-perms:252-266` to `src/local-settings.js:172-244`.
+  `drainFromHook` takes `cwd` from the hook's stdin and promotes that project's
+  local allow entries into **user-scope** allow on the next tool call. The
+  extension refuses this for an untrusted workspace
+  (`extension.js:2196-2201`, "an untrusted window reads but never writes"); the
+  CLI has no equivalent, and VS Code trust has no CLI analogue. A repo that
+  commits `.claude/settings.local.json` containing `Bash(curl *)`,
+  `Bash(python *)` or `Bash(node *)` clears `PROMOTABLE` and lands in the user's
+  global allow list, announced by one stderr line on a path that is "quiet by
+  design". The module's bar is *portability*, never provenance. May be inherent,
+  but it deserves a decision rather than an accident.
+- **Managed rule text reaches CLAUDE.md unsanitized.**
+  `src/derived-guidance.js:73` interpolates the rule into a code span in the block
+  body. On the `inertFamilies` path the value is `String(rule)` straight from
+  `~/.claude/remote-settings.json`, and `addCost`
+  (`auto-learn-manager.js:787`) does **not** apply `clean()` while the sibling
+  managedHits path at `:1391` does (`clean(observation.managedRule, 200)`). A
+  rule containing a backtick, a newline or the END marker escapes the span or
+  breaks the block. remote-settings.json is a local client-refreshed cache, so
+  any local process that can write it can inject text into the user's instruction
+  file, gated only on a human accepting the mitigation. Apply `clean()` on both.
+
+### Interesting, off-axis
+
+- **A URL reaches an observation, right next to invariant 1.**
+  `src/tool-learn.js:26` returns `input.url` verbatim as `observation.command`.
+  Invariant 1's assertion is `doesNotMatch(JSON.stringify(observations), /README/)`
+  — about an observed *file* path — and would not catch a URL carrying a path,
+  query string or token. It does not reach the state file (`candidate()` drops
+  `command`) and `toolInvocation` reduces it to `host`, but the data invariant as
+  tested is narrower than "no user data on an observation".
+- **The writer writes a field the reader discards.** `scan()` sets
+  `lastScanStats.prunedObservations` and `persistentState` writes it, but
+  `sanitizeState:422-426` rebuilds only `{files, observations, errors}`. Harmless
+  today, but it is the same whitelist-drift class the handoff calls out — and
+  this time in the *current* version, not an older copy.
+- **Auto Learn never consults the user's own deny list on the write path.**
+  `applyUnlocked` checks the managed policy for `inert`
+  (`auto-learn-manager.js:1103-1110`) but not `settings.permissions.deny`, so
+  `--learn apply` writes an allow entry the user's own deny already blocks and
+  reports it applied. `planPromotions` (`local-settings.js:84-85`) does check
+  `userDeny` and withholds. Nothing unsafe — deny wins — but it is a dead entry
+  and a misleading report, which is the class of bug the `inert` gate was added
+  to fix.
+- **`auto-mode-audit.js` cannot keep its "no credentials" promise.** `:77` passes
+  `env: { ...process.env, CLAUDE_CONFIG_DIR: configDir }`. That redirects the
+  config dir, not env-provided credentials, so with `ANTHROPIC_API_KEY` set the
+  probe authenticates and makes a **real API call** with prompt `audit-<hex>` —
+  contradicting its own lines 13-19. Strip the auth vars. Also `:52`'s JSON.parse
+  is unguarded, and `:94` reads the module-level `args` from inside a
+  parameterized function.
+- **An invisible character is load-bearing.** `src/managed-policy.js:75` and
+  `scripts/auto-mode-audit.js:52` contain the raw UTF-8 BOM bytes `EF BB BF`
+  inside a regex literal rather than `\uFEFF`. Verified working, but every other
+  site in the repo spells it `\uFEFF` (auto-learn-manager x5,
+  policy-exporters:526). Any re-encode, normalizer or copy-paste breaks it
+  silently.
+- **Residual staleness in the stat-keyed caches.** `policyFingerprint`
+  (`auto-learn-manager.js:621`) and `autoLearnStateStamp` (`extension.js:987`)
+  key on `mtimeMs:size`, so a same-size rewrite inside timestamp granularity
+  still returns a stale verdict. Far better than the lifetime cache it replaced;
+  worth knowing the residual exists, since the managed policy is exactly the file
+  that gets rewritten in place.
+- **`mirrorBackupPath()` accepts `~` alone** (`extension.js:213-223`):
+  `path.join(homedir(), '')` is the home directory itself, and the write then
+  fails EISDIR and is swallowed. Cosmetic, but a configured `~` reads as valid.
+
 ### processAllowList is quadratic, and it is now the whole hook cost
 
 Measured 2026-09-09 on the 423-entry live list. The hook is **141.9 ms median**
@@ -62,6 +314,37 @@ decides which of the user's permissions get pruned, in a tool whose whole job is
 writing a security boundary. It was escalated to the owner rather than landed
 alongside eleven other changes, and it wants its own change with an exhaustive
 old-vs-new equivalence test over the real list plus generated shapes.
+
+**Correctness constraints, established empirically 2026-09-09 against the real
+`ruleMatches` — read these before implementing.** The "0 of 423 mismatches"
+figure was measured on today's list and does not by itself prove the approach
+generalizes; these four probes are what it rests on:
+
+    no     Bash(gi *)     vs Bash(git status)
+    MATCH  Bash(git *)    vs Bash(git status)
+    MATCH  Bash(git *)    vs Bash(git)
+    MATCH  Bash(g* *)     vs Bash(git status)
+    MATCH  Bash(mkfs* *)  vs Bash(mkfs.ext4 /dev/sda)
+
+1. Matching is **token-aware, not raw glob** — `Bash(gi *)` does NOT match
+   `Bash(git status)`. This is what makes a token-boundary prefix index sound;
+   a raw-substring index would have to enumerate every character prefix.
+2. `Bash(git *)` matches `Bash(git)`, so the trailing `*` matches **empty** and
+   the separating space is not required. An index keyed on `"git "` misses it.
+3. A glob **inside** a token still matches: `Bash(g* *)` and `Bash(mkfs* *)`
+   both match. These cannot be found by any literal-prefix lookup, so the
+   fallback pool must be defined as "the pre-`*` text contains a glob
+   character", not merely "the rule is not `Tool(word *)`-shaped". `mkfs* *` is
+   a real shape — it ships in the starter pack's deny half — so this is not
+   hypothetical.
+4. Identity is not coverage, and `Tool(cmd:*)` and `Tool(cmd *)` are the same
+   rule rather than one covering the other (`isCoveredBy` defers to `sameRule`
+   first). The index must not turn a rule into its own coverer.
+
+The differential test therefore needs generated adversarial shapes — globs mid
+token, the `:*` spelling, empty-tail cases, single-token rules — and not just
+the live list, precisely because the live list contains none of case 3 in its
+allow half.
 
 ### The extension recomputes the same quadratic pass twice per settings write
 
