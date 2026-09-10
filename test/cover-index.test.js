@@ -188,3 +188,41 @@ test('processAllowList is unchanged on the real allow list, if one is present', 
   assert.deepEqual(processAllowList(allow), oracle,
     `the indexed pipeline must match the full scan over all ${allow.length} live entries`);
 });
+
+test('a rule with no star is not in the pool at all, and could not cover anything if it were', (t) => {
+  // escapeLiteral (permission-match.js:59-61) escapes every regex
+  // metacharacter INCLUDING `?`, and the only `*` -> `.*` expansion is at :94.
+  // So a star-free rule compiles to a fully anchored literal that matches
+  // nothing but itself, and isCoveredBy excludes identity via sameRule.
+  //
+  // Half the test is that premise, checked against the real matcher rather than
+  // assumed — because the optimisation below is only sound if it holds.
+  const starFree = ['Skill(dataviz)', 'Bash(git status)', 'Edit', 'Write', 'WebSearch', 'mcp__srv__tool'];
+  const probes = [
+    'Skill(dataviz:report)', 'Skill(dataviz)', 'Bash(git status --short)', 'Bash(git status)',
+    'Edit(foo.txt)', 'Edit', 'Write(x)', 'WebSearch', 'mcp__srv__tool(a)',
+  ];
+  for (const rule of starFree) {
+    for (const probe of probes) {
+      assert.equal(isCoveredBy(probe, rule), false,
+        `${rule} must not cover ${probe} — the star-free drop depends on it`);
+    }
+  }
+
+  // And the optimisation itself: neither indexed nor in the linear fallback.
+  const index = createCoverIndex([...starFree, 'Bash(rg *)', 'Bash(g* *)']);
+  const stats = index.stats();
+  assert.equal(stats.indexed, 1, 'only Bash(rg *) is indexable');
+  assert.equal(stats.fallback, 1, 'only Bash(g* *) needs the linear scan');
+
+  // On the live list this is 20 of 23 fallback entries, and the fallback is
+  // consulted for EVERY candidate — 83% of prunePermissions' isCoveredBy calls
+  // spent proving `false`.
+  const pack = JSON.parse(fs.readFileSync(
+    path.resolve(__dirname, '..', 'patterns', 'starter-pack.json'), 'utf8'));
+  const packStarFree = pack.filter((rule) => !rule.includes('*')).length;
+  assert.ok(packStarFree > 0, 'the pack ships star-free rules, so this path is live');
+  assert.equal(createCoverIndex(pack).stats().indexed + createCoverIndex(pack).stats().fallback,
+    pack.length - packStarFree,
+    'every star-free rule in the pack is dropped, and nothing else is');
+});

@@ -201,6 +201,33 @@ function settingsWriter() {
   return createSettingsWriter({ settingsPath: SETTINGS });
 }
 
+// readSettings() collapses "absent" and "unreadable" into null, which is right
+// for a reader and destructive for a WRITER: `readSettings() ?? {}` followed by
+// a whole-object write replaces the user's settings.json with just the key the
+// verb happened to touch. Measured: `--max on` against an unparseable file wrote
+// `{"permissions":{...7 blanket entries},"hooks":{"PreToolUse":[...]}}` and
+// nothing else, having already recorded an EMPTY allowSnapshot — so `--max off`
+// would restore nothing. The CLI writes no high-water backup, so on a CLI-only
+// install there was no way back at all.
+//
+// This is the refusal src/settings-write.js:67-79 documents, reached from the
+// two verbs that do not go through writeAllow. The extension's toggleMax
+// already got this right; the CLI half was left behind.
+function readSettingsForWrite(label) {
+  const { readSettingsState, SETTINGS_UNREADABLE } = require('../src/settings-write');
+  const state = readSettingsState(SETTINGS);
+  if (state.state === SETTINGS_UNREADABLE) {
+    process.stderr.write(
+      `wildcard-perms ${label}: refused — ${SETTINGS} exists but could not be read or parsed.\n`
+      + '  Nothing was changed. That is usually a file being written right now;\n'
+      + '  retry in a moment, or fix the file if it is genuinely damaged.\n'
+    );
+    return null;
+  }
+  // Absent yields {}, which is the legitimate first-run case.
+  return state.settings;
+}
+
 function writeSettings(settings) {
   // Atomic write with Windows-safe rename retry + in-place fallback.
   writeFileAtomicSync(SETTINGS, JSON.stringify(settings, null, 2) + '\n');
@@ -672,7 +699,8 @@ function bypass(args) {
   }
 
   withPolicyLock('--bypass', () => {
-    const settings = readSettings() ?? {};
+    const settings = readSettingsForWrite('--bypass');
+    if (settings === null) { process.exitCode = 1; return; }
     const res = applyBypass(settings, cmd === 'on');
     if (!res.changed) {
       process.stdout.write(`wildcard-perms bypass: already ${cmd.toUpperCase()} (defaultMode=${res.to})\n`);
@@ -799,7 +827,11 @@ function max(args) {
   }
 
   withPolicyLock('--max', () => {
-    const settings = readSettings() ?? {};
+    // Before applyMax, which writes the allow-list snapshot as a side effect —
+    // an unreadable read here would have recorded an EMPTY snapshot over a real
+    // one, making `--max off` unable to restore anything.
+    const settings = readSettingsForWrite('--max');
+    if (settings === null) { process.exitCode = 1; return; }
     const res = applyMax(settings, cmd === 'on');
     // A refusal is not "already in that state". Reporting "already ON" after the
     // allow snapshot failed to land would be the worst possible answer: MAX is

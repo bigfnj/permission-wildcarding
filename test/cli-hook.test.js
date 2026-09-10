@@ -141,3 +141,80 @@ test('a missing settings.json is not an error either', (t) => {
   assert.equal(result.status, 0);
   assert.equal(result.stderr, '');
 });
+
+// ── the two verbs that do not go through the rebasing writer ─────────────────
+
+// `--max` and `--bypass` build their whole output from `readSettings() ?? {}`
+// and then write the WHOLE object. readSettings collapses "absent" and
+// "unreadable" into null, so an unparseable file — the zero-byte window of
+// somebody else's write, routine here — became `{}` and the write replaced the
+// user's entire settings.json with just the key the verb touched.
+//
+// `--max on` was the worst of the two: applyMax records the allow-list snapshot
+// as a side effect, so it wrote an EMPTY snapshot over the real one and `--max
+// off` could then restore nothing. The CLI keeps no high-water backup, so on a
+// CLI-only install there was no way back.
+function runVerb(home, args) {
+  const root = path.parse(home).root;
+  return spawnSync(process.execPath, [CLI, ...args], {
+    cwd: home, encoding: 'utf8', windowsHide: true,
+    env: {
+      ...process.env, HOME: home, USERPROFILE: home,
+      HOMEDRIVE: root.replace(/[\/]$/, ''), HOMEPATH: home.slice(root.length - 1),
+    },
+  });
+}
+
+function brokenHome(t) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'permission-wildcarding-broken-'));
+  fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+  // Truncated mid-array, exactly as a reader sees it inside a non-atomic write.
+  fs.writeFileSync(path.join(home, '.claude', 'settings.json'),
+    '{ "model": "claude-opus-5", "permissions": { "allow": [ ');
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  return home;
+}
+
+for (const verb of ['--max', '--bypass']) {
+  test(`${verb} on refuses an unreadable settings.json instead of replacing it`, (t) => {
+    const home = brokenHome(t);
+    const settingsPath = path.join(home, '.claude', 'settings.json');
+    const before = fs.readFileSync(settingsPath, 'utf8');
+
+    const run = runVerb(home, [verb, 'on']);
+
+    assert.notEqual(run.status, 0, 'a refusal has to be visible in the exit code');
+    assert.match(run.stderr, /refused/, run.stderr || run.stdout);
+    assert.equal(fs.readFileSync(settingsPath, 'utf8'), before,
+      'the bytes are untouched, so the damaged file stays recoverable');
+  });
+}
+
+test('--max on does not record an empty allow snapshot over a real one', (t) => {
+  const home = brokenHome(t);
+  const snapshot = path.join(home, '.claude', 'backups', 'wildcarding-max.json');
+  fs.mkdirSync(path.dirname(snapshot), { recursive: true });
+  // A real snapshot from a previous, healthy MAX-on. Overwriting this with []
+  // is what makes the loss permanent: `--max off` restores from here.
+  const real = JSON.stringify({ allowSnapshot: ['Bash(git *)', 'Bash(rg *)'] }, null, 2) + '\n';
+  fs.writeFileSync(snapshot, real);
+
+  const run = runVerb(home, ['--max', 'on']);
+
+  assert.notEqual(run.status, 0);
+  assert.equal(fs.readFileSync(snapshot, 'utf8'), real,
+    'the snapshot is the only thing that can restore the allow list');
+});
+
+test('--max and --bypass still work on an absent settings.json, which is the legitimate case', (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'permission-wildcarding-fresh-'));
+  fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  // The refusal must key on "present but unreadable", not on "no settings yet",
+  // or a first run is broken.
+  const run = runVerb(home, ['--bypass', 'on']);
+  assert.equal(run.status, 0, run.stderr);
+  const after = JSON.parse(fs.readFileSync(path.join(home, '.claude', 'settings.json'), 'utf8'));
+  assert.equal(after.permissions.defaultMode, 'bypassPermissions');
+});

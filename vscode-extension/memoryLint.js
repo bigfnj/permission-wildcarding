@@ -144,6 +144,9 @@ class MemoryLint {
     this.watchers = new Map();
     this.debounce = null;
     this.timer = null;
+    // The ExtensionContext, kept so reconfigure() can build the enabled half
+    // after activation. Only ever read; never disposed from here.
+    this.context = null;
     // Set once the subscriptions are disposed, so a callback that was already
     // in flight cannot act on a torn-down instance. See refresh().
     this.disposed = false;
@@ -160,7 +163,22 @@ class MemoryLint {
       vscode.commands.registerCommand('permission-wildcarding.lintMemory', () => this.showReport())
     );
 
+    // Retained so reconfigure() can build the rest later. Everything below the
+    // enabled check is built once at activation or never, and `memory.enabled`
+    // is a Settings-UI toggle a user can flip at any time.
+    this.context = context;
+
     if (!cfg().enabled) return;
+    this.initialize(context);
+  }
+
+  // The half activate() skips when the lint is disabled. Separate so flipping
+  // memory.enabled false -> true can build it without a window reload: before
+  // this existed, extension.js's config listener refreshed the dashboard CARD
+  // and nothing else, so the card showed live memory data while the linter
+  // itself was inert — the UI asserting a feature was on when it was off.
+  initialize(context) {
+    if (this.diags) return;   // already built
 
     this.diags = vscode.languages.createDiagnosticCollection('claude-memory');
     this.channel = vscode.window.createOutputChannel('Claude Memory Lint');
@@ -213,6 +231,22 @@ class MemoryLint {
       },
     });
 
+    this.refresh();
+  }
+
+  // Called when permissionWildcarding.memory.* changes.
+  //
+  // false -> true has to BUILD what activate() skipped; true -> false is
+  // already handled by refresh(), which hides the gauge, clears the diagnostics
+  // and drops the watchers. Both directions used to need a window reload, and
+  // the 5-minute reconcile timer does not exist on the disabled path to cover
+  // for it.
+  reconfigure() {
+    // The instance outlives its subscriptions on a teardown; rebuilding into a
+    // disposed context would leak a watcher per discovered dir into a map
+    // nothing will drain again.
+    if (this.disposed) return;
+    if (cfg().enabled && this.context) this.initialize(this.context);
     this.refresh();
   }
 

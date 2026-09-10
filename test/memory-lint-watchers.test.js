@@ -307,3 +307,104 @@ test('activate completes on the default configuration, registering the command o
     fs.rmSync(tempHome, { recursive: true, force: true });
   }
 });
+
+// `memory.enabled` is a Settings-UI toggle, and everything below activate()'s
+// enabled check is built once at activation or never. Flipping it false -> true
+// therefore needed a window reload, and the disabled path has no reconcile timer
+// to cover for that. extension.js's config listener made this worse rather than
+// better for a while: it refreshed the dashboard CARD, whose data is re-read on
+// every call, so the card went live while the linter stayed inert — the UI
+// asserting the feature was on when it was off.
+test('enabling the lint at runtime builds it, without a window reload', () => {
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'memory-lint-enable-'));
+  const dir = path.join(tempHome, '.claude', 'projects', 'd---on', 'memory');
+  writeStore(dir, '# Memory Index\n\n- [one](one.md) — ' + 'y'.repeat(80) + '\n');
+  fs.writeFileSync(path.join(dir, 'one.md'), 'body\n', 'utf8');
+
+  // Mutable, so the test can flip the setting the way the Settings UI does.
+  const overrides = { 'memory.enabled': false };
+  const h = harness(tempHome, overrides);
+  try {
+    const lint = new h.loaded.MemoryLint();
+    lint.activate({ subscriptions: [] });
+
+    // Disabled: the command exists, and nothing else does.
+    assert.equal(h.registered.length, 1, 'the palette entry is always registered');
+    assert.equal(lint.diags, null, 'no diagnostic collection yet');
+    assert.equal(lint.status, null, 'no gauge yet');
+    assert.equal(h.intervals.length, 0, 'and no reconcile timer');
+
+    overrides['memory.enabled'] = true;
+    lint.reconfigure();
+
+    assert.ok(lint.diags, 'the diagnostic collection is built on demand');
+    assert.ok(lint.status, 'and the gauge');
+    assert.equal(h.intervals.length, 1, 'and the reconcile timer is armed');
+    assert.equal(lint.watchers.size, 1, 'and a watcher exists for the store');
+    assert.ok(h.statusText.some((t) => /mem: \d+/.test(t)), 'and the gauge was painted');
+    assert.equal(h.registered.length, 1, 'the command is still registered exactly once');
+  } finally {
+    h.restore();
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  }
+});
+
+test('disabling the lint at runtime releases it, and a second flip does not rebuild twice', () => {
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'memory-lint-toggle-'));
+  const dir = path.join(tempHome, '.claude', 'projects', 'd---on', 'memory');
+  writeStore(dir, '# Memory Index\n\n- [one](one.md) — hook\n');
+  fs.writeFileSync(path.join(dir, 'one.md'), 'body\n', 'utf8');
+
+  const overrides = {};   // enabled defaults to true
+  const h = harness(tempHome, overrides);
+  try {
+    const lint = new h.loaded.MemoryLint();
+    lint.activate({ subscriptions: [] });
+    assert.equal(lint.watchers.size, 1);
+    const firstDiags = lint.diags;
+
+    overrides['memory.enabled'] = false;
+    lint.reconfigure();
+    assert.equal(lint.watchers.size, 0, 'the watchers are released, not just ignored');
+
+    overrides['memory.enabled'] = true;
+    lint.reconfigure();
+    // initialize() is idempotent: a second build would strand the first
+    // collection, gauge and interval with nothing able to dispose them.
+    assert.equal(lint.diags, firstDiags, 'the same collection, not a second one');
+    assert.equal(h.intervals.length, 1, 'still exactly one reconcile timer');
+    assert.equal(lint.watchers.size, 1, 'and the watcher is back');
+  } finally {
+    h.restore();
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  }
+});
+
+test('reconfigure does nothing once the instance is torn down', () => {
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'memory-lint-torndown-'));
+  const dir = path.join(tempHome, '.claude', 'projects', 'd---on', 'memory');
+  writeStore(dir, '# Memory Index\n\n- [one](one.md) — hook\n');
+
+  const overrides = {};
+  const h = harness(tempHome, overrides);
+  try {
+    const lint = new h.loaded.MemoryLint();
+    const subscriptions = [];
+    lint.activate({ subscriptions });
+    // What VS Code does at deactivate.
+    for (const sub of subscriptions) sub.dispose();
+    assert.equal(lint.disposed, true);
+
+    // A configuration event can still arrive here — the listener is disposed,
+    // but an already-dispatched callback is not recalled. Rebuilding into a
+    // disposed context would leak a watcher per discovered dir into a map
+    // nothing will ever drain again.
+    lint.reconfigure();
+
+    assert.equal(lint.watchers.size, 0, 'no watcher was created after teardown');
+    assert.equal(h.intervals.length, 1, 'and no second reconcile timer');
+  } finally {
+    h.restore();
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  }
+});

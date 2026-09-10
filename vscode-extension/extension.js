@@ -106,6 +106,9 @@ let dashboardBounce = null;     // debounce for dashboard pushes (see refresh())
 // The worst case was the gate compile: its callback chains into ensureGates() →
 // setGatesAll(), so a compile that started before a reload rewrote the user's
 // CLAUDE.md / AGENTS.md from a torn-down extension host.
+// The memory linter instance. Module-scoped so onDidChangeConfiguration can
+// reach it; see the memory branch of the listener.
+let memoryLint = null;
 let deactivated = false;
 
 // The children themselves. execFile returns a ChildProcess and not one of the
@@ -418,7 +421,22 @@ function onManagedPolicyChanged() {
 // being rewritten in place, and each of those fired the guard immediately.
 const POLICY_CHECK_DEBOUNCE_MS = 1500;
 
+// The `deactivated` check belongs in the SCHEDULER, not only in the callback.
+// deactivate() sets the flag and clears these timers, and then AWAITS the Auto
+// Learn drain — which by deliberate decision has no deadline. Every file watcher
+// is still live across that await, and a settings.json or policy-limits.json
+// event arriving in it called straight through to here and re-armed a timer that
+// had just been cleared. 400-1500 ms later runWildcarding() took the policy lock
+// and wrote ~/.claude/settings.json, drainLocal() wrote that AND the project's
+// settings.local.json, and onManagedPolicyChanged() could reach
+// restoreFromBackup() — all from a torn-down extension host. drainLocal's own
+// retry path re-schedules up to 20 times, which can stretch that window to a
+// minute.
+//
+// Refusing to arm is strictly better than checking inside the callback: it also
+// stops the timer existing, so nothing is left for a later teardown to clear.
 function schedulePolicyCheck(delay = POLICY_CHECK_DEBOUNCE_MS) {
+  if (deactivated) return;
   clearTimeout(policyBounce);
   policyBounce = setTimeout(() => {
     try { onManagedPolicyChanged(); } catch { /* a watcher must never surface a stack */ }
@@ -1711,7 +1729,16 @@ function registerLocalWatchers(context) {
       // memory.enabled once at activation, so its four keys were picked up only
       // by the 5-minute reconcile or a save event.
       if (event.affectsConfiguration('permissionWildcarding.gates')) ensureGates(true);
-      if (event.affectsConfiguration('permissionWildcarding.memory')) dashboard?.refresh();
+      if (event.affectsConfiguration('permissionWildcarding.memory')) {
+        // BOTH, and in this order. Refreshing only the dashboard was worse than
+        // refreshing nothing: memoryCardData() re-reads the configuration and
+        // the corpus on every call, so the card went live while the linter
+        // stayed exactly as activate() left it — no gauge and no diagnostics on
+        // a false -> true flip, and a stale gauge on true -> false. The card
+        // then asserted a feature was on when it was off.
+        memoryLint?.reconfigure();
+        dashboard?.refresh();
+      }
     }));
   }
   context.subscriptions.push({
@@ -1894,7 +1921,10 @@ function activate(context) {
   // Memory-index hygiene lint: status-bar bloat gauge + editor squiggles on over-budget
   // hook lines / broken index links. Isolated so a failure here never breaks wildcarding.
   try {
-    const memoryLint = new MemoryLint();
+    // Module-scoped, not block-local: the configuration listener needs a handle
+    // on it. Without one it could only refresh the dashboard card, which is how
+    // the card ended up reporting live memory data for a linter that was off.
+    memoryLint = new MemoryLint();
     memoryLint.activate(context);
   } catch (err) {
     console.error('permission-wildcarding: memory lint failed to activate —', err);
@@ -2060,6 +2090,23 @@ function toggleCodexMax() {
       );
       return;
     }
+    // A refusal is not "already in that state". applyCodexMax returns
+    // `changed: false` with `error: 'codex-max-snapshot-failed'` when the
+    // snapshot that alone can restore the previous Codex settings did not land
+    // — and falling through to the silent `!res.changed` return told the user
+    // nothing at all: Codex MAX stays off while they believe it went on. The
+    // CLI already reports this (bin/wildcard-perms:808 for the Claude half);
+    // both extension toggles ignored it.
+    if (res.error === 'codex-max-snapshot-failed') {
+      vscode.window.showErrorMessage(
+        'Codex MAX: refused — could not write the settings snapshot to ~/.claude/backups, '
+        + 'so turning it off later could not restore your Codex approval policy. '
+        + 'Nothing was changed. Check that directory is writable and retry.'
+      );
+      updateStatusBar();
+      dashboard?.refresh();
+      return;
+    }
     if (!res.changed) { updateStatusBar(); dashboard?.refresh(); return; }
     fs.mkdirSync(path.dirname(CODEX_CONFIG), { recursive: true });
     writeFileAtomicSync(CODEX_CONFIG, res.text);
@@ -2106,6 +2153,21 @@ function toggleMax() {
       }
       turningOn = !isMaxOn(settings);
       const res = applyMax(settings, turningOn);
+      // A refusal is not "already in that state". `changed: false` with
+      // `error: 'max-snapshot-failed'` means the allow-list snapshot did not
+      // land, so MAX-off could never restore the user's entries. Falling
+      // through to the bare `!res.changed` return left `layers` null, which
+      // skips BOTH notification branches below — the user got no message at
+      // all, and believes MAX is on while it is off. The CLI reports this
+      // properly at bin/wildcard-perms:808.
+      if (res.error === 'max-snapshot-failed') {
+        vscode.window.showErrorMessage(
+          'permission-wildcarding: MAX refused — could not write the allow-list snapshot to '
+          + '~/.claude/backups, so turning MAX off later could not restore your entries. '
+          + 'MAX is unchanged. Check that directory is writable and retry.'
+        );
+        return;
+      }
       if (!res.changed) return;
       switchedMode = res.switchedMode;
       restoredMode = res.restoredMode;
@@ -2171,6 +2233,9 @@ function getPolicyLock() {
 }
 
 function schedule(delay = 400) {
+  // See schedulePolicyCheck: a watcher event during deactivate's awaited drain
+  // re-armed this and wrote settings.json after teardown.
+  if (deactivated) return;
   clearTimeout(debounceTimer);
   // 400ms debounce — Claude Code may write settings.json in several rapid bursts.
   debounceTimer = setTimeout(() => runWildcarding(), delay);
@@ -2367,6 +2432,9 @@ function drainLocal(manual = false) {
 }
 
 function scheduleLocalDrain(delay = 900) {
+  // See schedulePolicyCheck. This one also self-reschedules on contention, up
+  // to 20 times, so an unguarded arm could keep writing for about a minute.
+  if (deactivated) return;
   clearTimeout(localDrainBounce);
   localDrainBounce = setTimeout(() => drainLocal(), delay);
 }
@@ -3636,6 +3704,24 @@ async function deactivate() {
   // as "already running".
   autoLearnWorkerRunner = null;
   autoLearnBusy = false;
+
+  // The retainers, dropped last. 27 module-level mutables survive a deactivate;
+  // most are timer handles, already cleared above, and holding a dead handle
+  // costs nothing. These four are different — they hold real memory across a
+  // same-realm re-activate (an extension disable/enable, or an upgrade):
+  //
+  //   dashboard    the webview provider, and through it the whole ExtensionContext
+  //   memoryLint   the same, via this.context, which reconfigure() needs
+  //   autoLearnManager / autoLearnCardCache   parsed history state, which is the
+  //                largest thing this extension ever builds
+  //
+  // Nulling them is safe because every caller is either `?.`-guarded or behind
+  // the `deactivated` check, and activate() rebuilds all four.
+  dashboard = null;
+  memoryLint = null;
+  autoLearnManager = null;
+  autoLearnManagerKey = null;
+  autoLearnCardCache = null;
 }
 
 module.exports = { activate, deactivate };

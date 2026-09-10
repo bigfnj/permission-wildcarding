@@ -284,6 +284,24 @@ function createCoverIndex(pool) {
   const indexed = new Map();
   const fallback = [];
   for (const rule of pool) {
+    // A rule with no `*` cannot cover anything, so it belongs in neither the
+    // buckets nor the fallback. escapeLiteral (permission-match.js:59-61)
+    // escapes every regex metacharacter INCLUDING `?` and excluding `*`, and
+    // the only `*` -> `.*` expansion is at :94 — so a star-free rule compiles
+    // to a fully anchored literal that matches nothing but itself, and
+    // isCoveredBy already excludes identity via sameRule.
+    //
+    // This is not a micro-optimisation. On the live 424-entry list 20 of the 23
+    // unindexable rules are star-free (`Skill(dataviz)`, `Edit`, `Write`,
+    // `WebSearch`, one-off literal commands), and because the fallback is
+    // consulted for EVERY candidate they absorbed 8,480 of prunePermissions'
+    // 10,153 isCoveredBy calls — 83% of the work, for a guaranteed `false`.
+    // Measured: cold processAllowList 12.38 -> 8.85 ms per hook call, warm
+    // 3.82 -> 2.45 ms per dashboard refresh. It also retires the growth mode
+    // that mattered: star-free entries are what a real allow list accumulates,
+    // and with them gone the fallback is 3 rules with no growth axis, so a
+    // 3,200-entry list goes from 1,190 ms to 15.6 ms.
+    if (!rule.includes('*')) continue;
     const key = coverIndexKey(rule);
     if (key === null) { fallback.push(rule); continue; }
     const bucket = indexed.get(key);

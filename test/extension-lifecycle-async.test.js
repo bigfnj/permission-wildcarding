@@ -395,3 +395,60 @@ test('an Auto Learn operation arriving after deactivate does not start a worker'
     await app.dispose();
   }
 });
+
+// A list the pass WOULD rewrite, written AFTER activation. Two points, both
+// learned the hard way:
+//   - activate() runs the wildcarding pass synchronously and writes, so a
+//     fixture placed before it is already a fixed point by the time a watcher
+//     event arrives, and the pass then writes nothing whether it ran or not.
+//   - `Bash(rg *)`, tempHome's default, is a fixed point to begin with.
+// With either of those, "nothing was written" is true for the wrong reason and
+// the test passes with the guards removed. It did.
+const UNGENERALIZED = JSON.stringify({
+  permissions: { allow: ['Bash(git status --short)', 'Bash(git status --long)'], deny: [] },
+}, null, 2) + '\n';
+
+test('a settings.json change is acted on while the extension is live', async (t) => {
+  // The control. Without it, the teardown test below cannot distinguish "the
+  // guard stopped the write" from "there was no write to stop".
+  const home = tempHome(t);
+  const settingsPath = path.join(home, '.claude', 'settings.json');
+  const app = harness(home, { settings: { 'autoLearn.enabled': true } });
+  try {
+    fs.writeFileSync(settingsPath, UNGENERALIZED);
+    app.watcherFor('settings.json').fire('change', { fsPath: settingsPath });
+    await tick(1200);
+
+    const after = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+    assert.deepEqual(after.permissions.allow, ['Bash(git status *)'],
+      'the live extension generalizes on a settings.json event');
+  } finally {
+    await app.dispose();
+  }
+});
+
+test('a watcher event during deactivate cannot re-arm a cleared timer', async (t) => {
+  const home = tempHome(t);
+  const settingsPath = path.join(home, '.claude', 'settings.json');
+  const app = harness(home, { settings: { 'autoLearn.enabled': true } });
+  try {
+    // deactivate() sets the flag, clears the timers, and then AWAITS the Auto
+    // Learn drain — which by deliberate decision has no deadline. Every watcher
+    // is live across that await, and a window reload is exactly when Claude
+    // Code is rewriting settings.json.
+    const teardown = app.extension.deactivate();
+    fs.writeFileSync(settingsPath, UNGENERALIZED);
+    app.watcherFor('settings.json').fire('change', { fsPath: settingsPath });
+    app.watcherFor('.claude/settings.local.json').fire('change', { fsPath: settingsPath });
+    await teardown;
+
+    // Past the 400 ms wildcarding debounce, the 900 ms local drain and the
+    // 1500 ms policy check. If any of them armed, it has fired.
+    await tick(1700);
+
+    assert.equal(fs.readFileSync(settingsPath, 'utf8'), UNGENERALIZED,
+      'a torn-down extension host wrote the user\u2019s settings.json');
+  } finally {
+    await app.dispose();
+  }
+});
