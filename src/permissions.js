@@ -200,11 +200,113 @@ function isCoveredBy(specific, wildcard) {
   return ruleMatches(wildcard, specific);
 }
 
+// ── coverage index ────────────────────────────────────────────────────────────
+//
+// The two coverage scans below were 99.8% of processAllowList, which the hook
+// pays on every tool call: 348,588 RegExp.test() calls per pass at 423 entries,
+// ~52 ms of a 56 ms pass, and quadratic on a list that only ever grows
+// (measured: 100 entries 3.0 ms, 423 entries 52.7 ms, 841 entries 254.2 ms).
+//
+// This index does NOT reimplement matching. It NARROWS the candidate set, and
+// `isCoveredBy` — untouched — still decides every answer. So a false positive
+// costs one extra regex and changes nothing, and only a false NEGATIVE could
+// alter a result. That asymmetry is the whole safety argument, and it is why the
+// differential test in test/cover-index.test.js can assert byte-identical
+// cover-sets rather than merely "looks right".
+//
+// Indexable means `Tool(<literal> *)` or `Tool(<literal>:*)` with NO glob inside
+// the literal. Established empirically against the real matcher:
+//
+//   no     Bash(gi *)     vs Bash(git status)   <- matching is token-aware
+//   MATCH  Bash(git *)    vs Bash(git status)
+//   MATCH  Bash(git *)    vs Bash(git)          <- the trailing star matches empty
+//   MATCH  Bash(g* *)     vs Bash(git status)   <- a glob INSIDE a token matches
+//   MATCH  Bash(mkfs* *)  vs Bash(mkfs.ext4 /dev/sda)
+//
+// The last two cannot be found by any literal-prefix lookup, so a rule whose
+// literal contains a glob goes to the linear fallback. `Bash(mkfs* *)` is not
+// hypothetical — it ships in the starter pack's deny half.
+const RULE_SHAPE = /^([A-Za-z][A-Za-z0-9:_-]*)\((.*)\)$/s;
+const KEY_SEP = '\u0000';
+
+function coverIndexKey(rule) {
+  const parts = RULE_SHAPE.exec(rule);
+  if (!parts) return null;
+  const [, tool, arg] = parts;
+  if (!/\*\s*$/.test(arg)) return null;                  // not a trailing-scope wildcard
+  // The star must sit on a TOKEN BOUNDARY, i.e. be preceded by whitespace or a
+  // colon, or be the whole argument. `Bash(rm -rf /*)` fails this: stripping its
+  // star leaves `rm -rf /`, which is not a prefix of `rm -rf /home` at any
+  // whitespace boundary, so a lookup would miss it — a false negative, the one
+  // error class that can change an answer. The differential test caught exactly
+  // this case before it shipped. Such rules go to the linear fallback.
+  const head = arg.replace(/\*\s*$/, '');
+  if (head !== '' && !/[\s:]$/.test(head)) return null;
+  const literal = head.replace(/[\s:]+$/, '');
+  if (/[*?]/.test(literal)) return null;                 // glob inside the literal
+  return `${tool}${KEY_SEP}${literal}`;
+}
+
+// Every key a candidate could be covered by: the tool-wide key, then the
+// candidate's own argument truncated at each token boundary. Sliced from the
+// ORIGINAL string rather than rebuilt from split tokens, so runs of internal
+// whitespace and quoted paths keep their exact bytes — rebuilding with single
+// spaces would miss `Bash("C:\Program  Files\x.exe" *)` and a miss is the one
+// error class that matters here.
+function coverLookupKeys(specific) {
+  const parts = RULE_SHAPE.exec(specific);
+  if (!parts) return [];
+  const [, tool, arg] = parts;
+  const keys = [`${tool}${KEY_SEP}`];
+  for (let i = 0; i <= arg.length; i += 1) {
+    if (i === arg.length || /\s/.test(arg[i])) {
+      keys.push(`${tool}${KEY_SEP}${arg.slice(0, i).replace(/[\s:]+$/, '')}`);
+    }
+  }
+  return keys;
+}
+
+// `covers(specific)` answers "does anything in this pool cover it", and
+// `coveredBy(specific)` returns the covering entries, both with the same result
+// the full scan would give.
+function createCoverIndex(pool) {
+  const indexed = new Map();
+  const fallback = [];
+  for (const rule of pool) {
+    const key = coverIndexKey(rule);
+    if (key === null) { fallback.push(rule); continue; }
+    const bucket = indexed.get(key);
+    if (bucket) bucket.push(rule); else indexed.set(key, [rule]);
+  }
+  const narrow = (specific) => {
+    const out = [];
+    for (const key of coverLookupKeys(specific)) {
+      const bucket = indexed.get(key);
+      if (bucket) out.push(...bucket);
+    }
+    // A rule with a glob in its literal is unreachable by lookup, so the
+    // fallback is always consulted. It is small in practice — 27 of 423 here.
+    out.push(...fallback);
+    return out;
+  };
+  return {
+    covers: (specific) => narrow(specific).some((rule) => isCoveredBy(specific, rule)),
+    coveredBy: (specific) => narrow(specific).filter((rule) => isCoveredBy(specific, rule)),
+    stats: () => ({ indexed: indexed.size, fallback: fallback.length }),
+  };
+}
+
 // Remove entries that are fully covered by a broader entry in the same list.
+//
+// The index is built once per call rather than per entry, which is what turns
+// the quadratic scan linear. Identity is preserved by isCoveredBy itself
+// (`sameRule` first), so an entry can never prune itself — the old `i !== j`
+// index inequality was only equivalent to string inequality because
+// processAllowList dedupes through a Set first, and relying on that coincidence
+// here would break the moment a caller passed a list with duplicates.
 function prunePermissions(allows) {
-  return allows.filter((perm, i) =>
-    !allows.some((other, j) => i !== j && isCoveredBy(perm, other))
-  );
+  const index = createCoverIndex(allows);
+  return allows.filter((perm) => !index.covers(perm));
 }
 
 // Full pipeline: generalize → deduplicate → prune.
@@ -212,8 +314,14 @@ function processAllowList(allows) {
   if (!Array.isArray(allows) || allows.length === 0) return allows;
 
   const existingScopes = allows.filter((permission) => /\*\s*\)$/.test(permission));
+  // Indexed once for the whole map, not re-scanned per entry. The old
+  // `scope !== permission` guard is dropped as redundant rather than lost:
+  // isCoveredBy defers to sameRule first, so an entry never covers itself, and
+  // that holds for the `Tool(cmd:*)` / `Tool(cmd *)` spellings too — they are the
+  // same rule rather than one covering the other.
+  const scopeIndex = createCoverIndex(existingScopes);
   const generalized = [...new Set(allows.map((permission) => {
-    if (existingScopes.some((scope) => scope !== permission && isCoveredBy(permission, scope))) {
+    if (scopeIndex.covers(permission)) {
       return permission;
     }
     return generalizePermission(permission);
@@ -569,7 +677,7 @@ function applyMax(settings, on) {
 
 module.exports = {
   generalizePermission, mineWildcard, BASH_SCRIPT_KEYWORDS,
-  isCoveredBy, prunePermissions, processAllowList, writeFileAtomicSync,
+  isCoveredBy, createCoverIndex, prunePermissions, processAllowList, writeFileAtomicSync,
   BYPASS_MODE, BYPASS_STATE_FILE, currentMode, isBypassOn, applyBypass, readBypassState,
   CLASSIFIER_MODE, MAX_MODE, classifierModeOn,
   MAX_ALLOW_CORE, MAX_MARKERS, MAX_STATE_FILE, APPROVE_SCRIPT, APPROVE_COMMAND,
