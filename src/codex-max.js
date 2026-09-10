@@ -27,6 +27,11 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+// The shared atomic writer. No cycle: src/permissions.js requires only
+// ./permission-match and ./managed-policy, never this file. Same require the
+// agent-guidance and derived-guidance modules already make.
+const { writeFileAtomicSync } = require('./permissions');
+
 const CODEX_CONFIG = path.join(os.homedir(), '.codex', 'config.toml');
 const CODEX_MAX_STATE_FILE = path.join(os.homedir(), '.claude', 'backups', 'wildcarding-codex-max.json');
 const APPROVAL_NEVER = 'never';
@@ -116,11 +121,19 @@ function readCodexMaxState(statePath = CODEX_MAX_STATE_FILE) {
   } catch { return {}; }
 }
 
+// The one state write in this project that was not atomic. Interrupted
+// mid-write, readCodexMaxState catches the parse error and returns {}, so
+// `priorApproval` is undefined and applyCodexMax(…, false) calls clearApproval —
+// REMOVING approval_policy entirely instead of restoring the value the user had.
+// Same "swallowed snapshot, destructive toggle proceeds" shape as writeMaxState,
+// so it gets the same atomic writer every sibling already uses, and reports
+// whether the write landed.
 function writeCodexMaxState(state, statePath = CODEX_MAX_STATE_FILE) {
   try {
     fs.mkdirSync(path.dirname(statePath), { recursive: true });
-    fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + '\n', 'utf8');
-  } catch { /* best-effort — never block the toggle */ }
+    writeFileAtomicSync(statePath, JSON.stringify(state, null, 2) + '\n');
+    return true;
+  } catch { return false; }
 }
 
 // ── enterprise policy ───────────────────────────────────────────────────────────
@@ -264,7 +277,16 @@ function applyCodexMax(text, on, options = {}) {
         target: target.value, restricted: target.restricted, allowed: target.allowed,
       };
     }
-    writeCodexMaxState({ priorApproval: readApproval(source), savedAt: now() }, statePath);
+    // Refuse rather than proceed, for the same reason enableMaxAllow does: this
+    // snapshot is the ONLY record of the user's prior approval_policy, and
+    // without it turning MAX off calls clearApproval and deletes the key instead
+    // of restoring the value. Better to leave Codex MAX off and say why.
+    if (!writeCodexMaxState({ priorApproval: readApproval(source), savedAt: now() }, statePath)) {
+      return {
+        changed: false, text: source, sandboxUntouched: true, error: 'codex-max-snapshot-failed',
+        target: target.value, restricted: target.restricted, allowed: target.allowed,
+      };
+    }
     const result = setApproval(source, target.value);
     return {
       ...result, sandboxUntouched: true,

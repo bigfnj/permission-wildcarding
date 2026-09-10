@@ -17,7 +17,7 @@ const {
 //
 // `policy-lock` and `local-settings` were the two the reasoning missed, and they
 // were the ones it applied to most cleanly: BOTH are reachable only after the
-// existsSync gate in drainFromHook, the case the comment there documents as
+// existsSync gate in finish(), the case the comment there documents as
 // normal ("zero such files exist anywhere in the measured project tree"), and
 // each drags a further module in — crypto behind policy-lock, policy-guard
 // behind local-settings. Re-measured over 15 runs each: 50.1 ms bare node,
@@ -178,11 +178,27 @@ function readSettings() {
   try {
     return JSON.parse(fs.readFileSync(SETTINGS, 'utf8'));
   } catch (err) {
-    if (err.code !== 'ENOENT') {
+    // ENOENT is normal. A SyntaxError is the zero-byte or half-written window of
+    // somebody else's atomic write — routine rather than exotic, because Claude
+    // Code rewrites this file in place on every /model, /effort and approval —
+    // and it used to print, because a SyntaxError has no `.code` and so failed
+    // the ENOENT test. That broke the hook path's "quiet by design" contract on
+    // exactly the interleaving this whole change is about. Anything else is
+    // genuinely unexpected and still worth saying out loud.
+    if (err.code !== 'ENOENT' && !(err instanceof SyntaxError)) {
       process.stderr.write(`wildcard-perms: read error: ${err.message}\n`);
     }
     return null;
   }
+}
+
+// The shared rebasing writer, required lazily so the hook path pays for it only
+// when it has actually decided to write. No backup hook: the extension owns the
+// high-water mark, and giving the CLI one here would be a behaviour change
+// smuggled in beside a correctness fix.
+function settingsWriter() {
+  const { createSettingsWriter } = require('../src/settings-write');
+  return createSettingsWriter({ settingsPath: SETTINGS });
 }
 
 function writeSettings(settings) {
@@ -192,52 +208,126 @@ function writeSettings(settings) {
 
 function run(input) {
   const settings = readSettings();
-  if (!settings) finish(input);
+  if (!settings) finish(input, false);
 
   const before = settings?.permissions?.allow ?? [];
   const after  = processAllowList(before);
 
-  if (JSON.stringify(before) === JSON.stringify(after)) finish(input);
+  // This read is a NEGATIVE TEST ONLY, which is what makes it safe unlocked. If
+  // the list is already a fixed point — the overwhelmingly common case, measured
+  // at 404 of 423 entries already generalized here — we exit having written
+  // nothing, so a stale read costs nothing. The moment it differs, everything
+  // authoritative is redone inside the lock.
+  //
+  // Deliberately NOT "lock on every call": the lock cycle is 3.7 ms of file
+  // operations, and paying it on every tool call to discover there is nothing to
+  // do is the same mistake the drain's existsSync test already corrected.
+  finish(input, JSON.stringify(before) !== JSON.stringify(after));
+}
+
+// One exit path for the hook, and now ONE lock acquisition covering both jobs.
+//
+// The drain runs whether or not the user-scope pass changed anything: Claude
+// Code persists an "always approve" into the project's settings.local.json, and
+// the hook fires immediately after that write, so this is the moment to promote
+// it.
+//
+// The two jobs used to lock separately — the wildcarding write took no lock at
+// all and the drain took its own — leaving a window between them for Auto Learn
+// to land its settings write and its claims write. That is verbatim the
+// interleaving src/policy-lock.js:3-7 exists to prevent, so they now share one
+// acquisition. A busy lock stays silent: the next tool call fires the hook
+// again and the pass is idempotent, so losing a turn costs at most one extra
+// prompt and never a permission.
+function finish(input, wildcardPending) {
+  const cwd = hookCwd(input);
+  const drainPending = !!cwd
+    && fs.existsSync(path.join(cwd, '.claude', 'settings.local.json'));
+  if (!wildcardPending && !drainPending) process.exit(0);
+
+  const { createPolicyLock, POLICY_LOCK_PATH } = require('../src/policy-lock');
+  try {
+    createPolicyLock({ lockPath: POLICY_LOCK_PATH }).locked(() => {
+      if (wildcardPending) wildcardUnderLock();
+      if (drainPending) drainUnderLock(cwd);
+    });
+  } catch { /* busy, or an unreadable project — the next hook run retries */ }
+  process.exit(0);
+}
+
+// The hook's event arrives as JSON on stdin; one field matters.
+function hookCwd(input) {
+  let cwd;
+  try { cwd = JSON.parse(String(input || '{}'))?.cwd; }
+  catch { return null; }
+  return typeof cwd === 'string' && cwd ? cwd : null;
+}
+
+// The authoritative half of the pass: the caller's snapshot is DISCARDED and
+// everything recomputed from a read taken inside the lock.
+//
+// Replaying the earlier delta instead would be unsound, and not subtly. With MAX
+// on, Claude Code persists `Bash(npm test)`; the unlocked pass marks it removed
+// because `Bash(*)` covers it; `--max off` then runs and deliberately preserves
+// it; replaying `removed` deletes it for good, since it is absent from
+// allowSnapshot precisely because it was granted while MAX was on. Recomputing
+// costs the warm 57 ms, and only on the rare changed path.
+//
+// Because `fresh` is what writeAllow re-reads, its rebase degenerates to
+// identity here, and what it contributes is the rest of its contract: deny is
+// additive only, and every unrelated top-level field — model, effortLevel, env,
+// hooks — comes from the newest file instead of a stale spread. Those fields,
+// not deny, are the common casualty: Claude Code rewrites them constantly.
+function wildcardUnderLock() {
+  const writer = settingsWriter();
+  const state = writer.readSettingsState();
+  const fresh = state.settings;
+  if (!fresh) return; // absent or mid-write; the next hook run retries
+
+  const before = Array.isArray(fresh?.permissions?.allow) ? fresh.permissions.allow : [];
+  const after = processAllowList(before);
+  if (JSON.stringify(before) === JSON.stringify(after)) return; // someone got there first
 
   try {
-    writeSettings({
-      ...settings,
-      permissions: { ...settings.permissions, allow: after },
-    });
-
+    writer.writeAllow(fresh, after);
     const added   = after.filter(p => !before.includes(p));
     const removed = before.filter(p => !after.includes(p));
     process.stderr.write(
       `wildcard-perms: +${added.length} -${removed.length} → ${after.length} entries\n`
     );
   } catch (err) {
-    process.stderr.write(`wildcard-perms: write error: ${err.message}\n`);
+    // SETTINGS_UNREADABLE is "come back in a moment", not a failure to shout
+    // about — and the hook path is quiet by design either way.
+    if (err?.code !== 'SETTINGS_UNREADABLE') {
+      process.stderr.write(`wildcard-perms: write error: ${err.message}\n`);
+    }
   }
-
-  finish(input);
 }
 
-// One exit path for the hook, so the project-local drain runs whether or not the
-// user-scope pass had anything to change. Claude Code persists an "always
-// approve" to the project's settings.local.json, which no pass here used to
-// read — the hook fires immediately after that write, so this is the moment to
-// promote it.
-function finish(input) {
-  drainFromHook(input);
-  process.exit(0);
+function drainUnderLock(cwd) {
+  const report = drainWorkspace(cwd);
+  if (!report.changed) return;
+  process.stderr.write(
+    `wildcard-perms: local drain — promoted ${report.promoted.length}, ` +
+    `pruned ${report.pruned.length}, kept ${report.kept}\n`
+  );
 }
 
 // Merge entries into the user-scope allow list, generalizing and pruning the
 // result exactly as the hook pass would, so a promoted permission is
 // indistinguishable from one approved directly.
 function mergeUserAllow(entries) {
-  const settings = readSettings() ?? {};
-  const existing = Array.isArray(settings?.permissions?.allow) ? settings.permissions.allow : [];
+  // Through the rebasing writer, and computed from ITS read, so the rebase
+  // degenerates to identity. This was the third unrebased read-modify-write in
+  // this file, and the one that ran on the hook path immediately after the
+  // wildcarding write — so it could revert what the extension had just landed.
+  // The extension's half of the drain already routed through writeAllow
+  // (vscode-extension/extension.js applyUserAllow); the CLI's was left behind.
+  const writer = settingsWriter();
+  const fresh = writer.readSettingsState().settings ?? {};
+  const existing = Array.isArray(fresh?.permissions?.allow) ? fresh.permissions.allow : [];
   const merged = processAllowList([...new Set([...existing, ...entries])]);
-  writeSettings({
-    ...settings,
-    permissions: { ...(settings.permissions ?? {}), allow: merged },
-  });
+  writer.writeAllow(fresh, merged);
 }
 
 function drainWorkspace(workspaceRoot, { dryRun = false } = {}) {
@@ -250,34 +340,11 @@ function drainWorkspace(workspaceRoot, { dryRun = false } = {}) {
   });
 }
 
-// The hook path is quiet by design: a busy lock is not an error (the next tool
-// call fires the hook again), and a project with no local approvals is the norm.
-// Anything noisier would print on every single tool use.
-function drainFromHook(input) {
-  let cwd;
-  try { cwd = JSON.parse(String(input || '{}'))?.cwd; }
-  catch { return; }
-  if (typeof cwd !== 'string' || !cwd) return;
-  // Check for the file BEFORE taking the lock. The lock cycle is mkdir, an
-  // exclusive open, a write, an fsync, a close, a read and an unlink, measured
-  // at 3.7 ms, and it was paid on every single tool call to then discover that
-  // the project has no local approvals at all, which is the normal case: zero
-  // such files exist anywhere in the measured project tree. A missing file is
-  // not an error and never was, so this only reorders the cheap test ahead of
-  // the expensive one.
-  if (!fs.existsSync(path.join(cwd, '.claude', 'settings.local.json'))) return;
-  const { createPolicyLock, POLICY_LOCK_PATH } = require('../src/policy-lock');
-  try {
-    createPolicyLock({ lockPath: POLICY_LOCK_PATH }).locked(() => {
-      const report = drainWorkspace(cwd);
-      if (!report.changed) return;
-      process.stderr.write(
-        `wildcard-perms: local drain — promoted ${report.promoted.length}, ` +
-        `pruned ${report.pruned.length}, kept ${report.kept}\n`
-      );
-    });
-  } catch { /* lock busy, or an unreadable project — the next hook run retries */ }
-}
+// drainFromHook is gone: its body is now drainUnderLock(), called from finish()
+// inside the SAME lock acquisition as the wildcarding write. Keeping its own
+// lock meant two acquisitions per changed hook run with a window between them,
+// which is exactly what the shared lock is for. The cheap existsSync test it
+// introduced survives, in finish().
 
 // Promote a project's local approvals into user scope and drop the ones user
 // scope now covers. `--dry-run` reports without writing either file.
@@ -521,36 +588,48 @@ function seed() {
     process.exit(1);
   }
 
-  const settings = readSettings() ?? {};
-  const existing = settings?.permissions?.allow ?? [];
+  // Read, merge and write all INSIDE the lock, through the rebasing writer.
+  // --seed had the same shape as the old hook path — read, merge, spread, write
+  // — so it reverted whatever landed in between, and it took no lock at all
+  // while `withPolicyLock` sat twenty lines below serving --drain/--bypass/--max.
+  //
+  // Reporting happens after the lock is released, and nothing inside it calls
+  // process.exit: an exit skips the release, and while recoverLock() reclaims a
+  // dead owner's lock eventually, leaving one behind makes every other writer
+  // wait for the staleness window first.
+  let outcome = null;
+  withPolicyLock('--seed', () => {
+    const writer = settingsWriter();
+    const settings = writer.readSettingsState().settings ?? {};
+    const existing = Array.isArray(settings?.permissions?.allow) ? settings.permissions.allow : [];
 
-  // Merge: existing entries first (preserve ordering), then new pack entries
-  const merged = [...new Set([...existing, ...pack])];
-  const after  = processAllowList(merged);
+    // Merge: existing entries first (preserve ordering), then new pack entries
+    const merged = [...new Set([...existing, ...pack])];
+    const after  = processAllowList(merged);
 
-  if (JSON.stringify(existing) === JSON.stringify(after)) {
-    process.stdout.write('wildcard-perms --seed: allow list already covers starter pack — nothing to do\n');
-    process.exit(0);
-  }
-
-  try {
-    writeSettings({
-      ...settings,
-      permissions: { ...(settings.permissions ?? {}), allow: after },
-    });
-
-    const added   = after.filter(p => !existing.includes(p));
-    const removed = existing.filter(p => !after.includes(p));
-    process.stdout.write(
-      `wildcard-perms --seed: merged ${pack.length} starter entries — ` +
-      `+${added.length} added, ${removed.length} pruned → ${after.length} total\n`
-    );
-    if (added.length) {
-      process.stdout.write(added.map(p => `  + ${p}`).join('\n') + '\n');
+    if (JSON.stringify(existing) === JSON.stringify(after)) {
+      outcome = { noop: true };
+      return;
     }
-  } catch (err) {
-    process.stderr.write(`wildcard-perms --seed: write error: ${err.message}\n`);
-    process.exit(1);
+    writer.writeAllow(settings, after);
+    outcome = {
+      after,
+      added: after.filter(p => !existing.includes(p)),
+      removed: existing.filter(p => !after.includes(p)),
+    };
+  });
+
+  if (!outcome) return; // withPolicyLock already reported and exited
+  if (outcome.noop) {
+    process.stdout.write('wildcard-perms --seed: allow list already covers starter pack — nothing to do\n');
+    return;
+  }
+  process.stdout.write(
+    `wildcard-perms --seed: merged ${pack.length} starter entries — ` +
+    `+${outcome.added.length} added, ${outcome.removed.length} pruned → ${outcome.after.length} total\n`
+  );
+  if (outcome.added.length) {
+    process.stdout.write(outcome.added.map(p => `  + ${p}`).join('\n') + '\n');
   }
 }
 
@@ -652,6 +731,18 @@ function codexMax(args) {
   }
 
   const res = applyCodexMax(text ?? '', cmd === 'on');
+  // Same reasoning as --max: the snapshot is the only record of the user's prior
+  // approval_policy, so without it, turning Codex MAX off would delete the key
+  // rather than restore the value. Refuse and say so.
+  if (res.error === 'codex-max-snapshot-failed') {
+    process.stderr.write(
+      'wildcard-perms --codex-max: refused — could not write the approval snapshot to\n'
+      + '  ~/.claude/backups, so turning Codex MAX off later would remove approval_policy\n'
+      + '  instead of restoring yours. config.toml is unchanged.\n'
+    );
+    process.exitCode = 1;
+    return;
+  }
   if (res.blockedBy === 'enterprise-policy') {
     process.stderr.write(
       'wildcard-perms --codex-max: enterprise policy permits no approval policy this can set ' +
@@ -710,6 +801,19 @@ function max(args) {
   withPolicyLock('--max', () => {
     const settings = readSettings() ?? {};
     const res = applyMax(settings, cmd === 'on');
+    // A refusal is not "already in that state". Reporting "already ON" after the
+    // allow snapshot failed to land would be the worst possible answer: MAX is
+    // off, the user believes it is on, and the snapshot that alone could restore
+    // their allow list does not exist.
+    if (res.error === 'max-snapshot-failed') {
+      process.stderr.write(
+        'wildcard-perms --max: refused — could not write the allow-list snapshot to\n'
+        + '  ~/.claude/backups, so turning MAX off later could not restore your entries.\n'
+        + '  MAX is unchanged. Check that directory is writable and retry.\n'
+      );
+      process.exitCode = 1;
+      return;
+    }
     if (!res.changed) {
       process.stdout.write(`wildcard-perms MAX: already ${cmd.toUpperCase()}\n`);
       return;

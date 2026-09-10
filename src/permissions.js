@@ -358,11 +358,20 @@ function readMaxState() {
   catch { return {}; }
 }
 
+// Returns whether the snapshot actually landed. It used to swallow the failure
+// and return nothing, and its "best-effort" comment was borrowed from
+// writeBypassState below — where a lost stash genuinely only degrades the OFF
+// restore to FALLBACK_MODE. Here the consequence is total: enableMaxAllow goes on
+// to prune every specific entry under Bash(*), and with no snapshot to read back
+// disableMaxAllow computes `restored = kept`, leaving the user the 7 blanket
+// entries and nothing else. `readMaxState` returns {} for both "never written"
+// and "corrupt", so that call site cannot tell the difference either.
 function writeMaxState(state) {
   try {
     fs.mkdirSync(path.dirname(MAX_STATE_FILE), { recursive: true });
     writeFileAtomicSync(MAX_STATE_FILE, JSON.stringify(state, null, 2) + '\n');
-  } catch { /* best-effort */ }
+    return true;
+  } catch { return false; }
 }
 
 // Servers to blanket-wildcard, derived from mcp__<server>__… entries already in
@@ -421,7 +430,14 @@ function enableMaxAllow(settings) {
   if (isMaxAllowOn(settings)) return { changed: false, settings };
   const current = Array.isArray(settings?.permissions?.allow) ? settings.permissions.allow : [];
   const previousMode = settings?.permissions?.defaultMode ?? null;
-  writeMaxState({ allowSnapshot: current, defaultMode: previousMode, savedAt: new Date().toISOString() });
+  // Refuse rather than proceed. The next line prunes every specific entry the
+  // blanket set covers, and only this snapshot can bring them back — so a
+  // silently failed write turns MAX-on into permanent loss of the whole allow
+  // list. Reported as a reason the caller can surface, not thrown, because every
+  // caller of applyMax already renders a `{ changed, ... }` result.
+  if (!writeMaxState({ allowSnapshot: current, defaultMode: previousMode, savedAt: new Date().toISOString() })) {
+    return { changed: false, settings, error: 'max-snapshot-failed' };
+  }
   const merged = processAllowList([...new Set([...current, ...buildMaxAllowSet(current)])]);
   const switchedMode = classifierModeOn(settings);
   const next = switchedMode
@@ -529,21 +545,26 @@ function maxLayers(settings, options = {}) {
 
 // Turn both layers on/off in a single settings transform.
 function applyMax(settings, on) {
-  let s = settings, changed = false, switchedMode = null, restoredMode = null;
+  let s = settings, changed = false, switchedMode = null, restoredMode = null, error = null;
+  // Returns whether the sequence may continue. A refusal has to STOP it, not
+  // merely contribute nothing: MAX-on that went on to register the approve hook
+  // after the allow snapshot failed would report a layer it never established,
+  // which is precisely the failure maxLayers' own comment warns about — "claiming
+  // a control that is not running".
   const step = (res) => {
-    if (!res.changed) return;
+    if (res.error) { error = res.error; return false; }
+    if (!res.changed) return true;
     s = res.settings; changed = true;
     if (res.switchedMode) switchedMode = res.switchedMode;
     if (res.restoredMode !== undefined && res.restoredMode !== null) restoredMode = res.restoredMode;
+    return true;
   };
   if (on) {
-    step(enableMaxAllow(s));
-    step(registerApproveHook(s));
+    if (step(enableMaxAllow(s))) step(registerApproveHook(s));
   } else {
-    step(disableMaxAllow(s));
-    step(unregisterApproveHook(s));
+    if (step(disableMaxAllow(s))) step(unregisterApproveHook(s));
   }
-  return { changed, settings: s, switchedMode, restoredMode };
+  return { changed, settings: s, switchedMode, restoredMode, ...(error ? { error } : {}) };
 }
 
 module.exports = {

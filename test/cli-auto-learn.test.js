@@ -119,3 +119,30 @@ test('CLI --learn honors explicit workspace partition and Codex off scope', (t) 
     path.join(workspace, '.codex', 'rules', 'permission-wildcarding.rules'),
   ), false);
 });
+
+// MAX-on snapshots the allow list, then prunes every specific entry the blanket
+// set covers. That snapshot is the ONLY way MAX-off restores them, and the write
+// used to be best-effort: it swallowed its failure and returned nothing, so the
+// prune went ahead anyway. With no snapshot, disableMaxAllow computes
+// `restored = kept` and leaves the user the blanket entries and nothing else —
+// 423 permissions traded for 7. The comment justifying "best-effort" was borrowed
+// from writeBypassState, where a lost stash really is benign.
+test('CLI --max refuses to turn on when the snapshot cannot be written', (t) => {
+  const home = tempHome(t, ['Bash(git status *)', 'Bash(rg *)']);
+  // Make the snapshot's directory un-creatable by putting a FILE where it goes,
+  // so mkdirSync throws. Portable, and no permission fiddling.
+  fs.writeFileSync(path.join(home, '.claude', 'backups'), 'not a directory\n');
+
+  const result = runCli(home, ['--max', 'on']);
+  assert.equal(result.status, 1, `must refuse, not proceed; stdout: ${result.stdout}`);
+  assert.match(result.stderr, /refused/, 'and say so');
+  assert.doesNotMatch(result.stdout, /already ON/,
+    '"already ON" would be the worst answer: MAX is off, the user thinks it is on, '
+      + 'and the snapshot that alone could restore their list does not exist');
+  assert.deepEqual(allowList(home), ['Bash(git status *)', 'Bash(rg *)'],
+    'the allow list is untouched — nothing was pruned under a blanket that was never added');
+  const settings = JSON.parse(fs.readFileSync(path.join(home, '.claude', 'settings.json'), 'utf8'));
+  assert.ok(!settings.hooks?.PreToolUse,
+    'and the approve hook must not be registered either: a half-applied MAX reports a '
+      + 'layer it never established');
+});

@@ -106,3 +106,30 @@ test('classifierModeOn reads the mode that discards blanket wildcards', (t) => {
   assert.equal(api.CLASSIFIER_MODE, 'auto');
   assert.equal(api.MAX_MODE, 'default');
 });
+
+// The snapshot write is the only record that can restore the allow list, so a
+// failed one must ABORT the sequence rather than merely contribute nothing.
+// Tested at this level on purpose: the CLI's own error check short-circuits
+// before its write, so a CLI test cannot see this — but the extension does
+// `if (!res.changed) return` and never inspects `error`, so if enableMaxAllow
+// refused and registerApproveHook still ran, `changed` would be true and the
+// extension would persist a MAX that has an approve hook, no blanket entries and
+// no snapshot: a mode reporting a layer it never established.
+test('a failed allow snapshot aborts MAX-on instead of half-applying it', (t) => {
+  const { tempHome, api } = setup(t);
+  fs.mkdirSync(path.join(tempHome, '.claude'), { recursive: true });
+  // A FILE where the snapshot's directory belongs, so mkdirSync throws.
+  fs.writeFileSync(path.join(tempHome, '.claude', 'backups'), 'not a directory\n');
+
+  const settings = { permissions: { allow: [...ALLOW] } };
+  const res = api.applyMax(settings, true);
+
+  assert.equal(res.error, 'max-snapshot-failed', 'the refusal is reported, not swallowed');
+  assert.equal(res.changed, false,
+    'changed must stay false, or every caller that only checks `changed` writes a '
+      + 'half-applied MAX');
+  assert.deepEqual(res.settings.permissions.allow, ALLOW,
+    'the allow list is untouched — nothing pruned under a blanket never added');
+  assert.equal(res.settings.hooks?.PreToolUse, undefined,
+    'and the approve hook is NOT registered: the sequence stopped at the refusal');
+});
