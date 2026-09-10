@@ -829,10 +829,16 @@ async function setRecallPath() {
 }
 
 // The Memory card's data payload (pure Node). null when there's no MEMORY.md at all.
-function memoryCardData() {
+//
+// `report` is optional and defaults to a fresh call, so the ~35 non-dashboard
+// callers are unaffected. _push() passes one in because gatesCardData needs a
+// single integer out of the same object, and computing it twice cost 2.93 ms and
+// 25 fs syscalls per refresh (measured: one memoryReport() 6.99 ms, two 9.92 ms,
+// 12 readFileSync + 11 existsSync + 2 readdirSync each).
+function memoryCardData(precomputed = null) {
   let out = null;
   try {
-    const { conf, dir, report } = memoryReport();
+    const { conf, dir, report } = precomputed || memoryReport();
     // `conf.enabled` is honoured here, not just discovered. memoryLint.activate()
     // returns early when memory.enabled is false and so never registers
     // `permission-wildcarding.lintMemory`, while this card gated on `dir &&
@@ -2738,7 +2744,11 @@ async function toggleGates() {
   dashboard?.refresh();
 }
 
-function gatesCardData() {
+// `precomputed` is the same optional memoryReport() result memoryCardData takes —
+// this card needs exactly one integer out of it, `report.gateSources`, which the
+// memory card's call already computed. Defaults to a fresh call so the other
+// callers are unaffected.
+function gatesCardData(precomputed = null) {
   try {
     const states = gatesStatusAll();
     if (!states.length) return null;
@@ -2753,8 +2763,15 @@ function gatesCardData() {
       // to offer an action that cannot succeed. Undefined when the memory report
       // is unavailable, which renderGates treats as "unknown, so still offer it"
       // rather than as zero.
+      //
+      // The try/catch is load-bearing and stays even with a value passed in: the
+      // distinction between `undefined` ("unknown, still offer") and `0`
+      // ("decline") is the card's whole contract, and a precomputed
+      // `{ report: null }` yields undefined through `?.` naturally. What must NOT
+      // happen is a throw escaping to the outer catch below, which returns null
+      // and loses the entire card rather than one field.
       gateSources: (() => {
-        try { return memoryReport().report?.gateSources; } catch { return undefined; }
+        try { return (precomputed || memoryReport()).report?.gateSources; } catch { return undefined; }
       })(),
       agents: states.filter((state) => state.on).map((state) => state.agent),
       targets: states.map((state) => state.agent),
@@ -2966,6 +2983,20 @@ class WildcardingViewProvider {
     // isn't Claude-only for a cross-agent tool.
     const autoLearn = autoLearnCardData();
     const codexWatching = !!autoLearn.enabled && fs.existsSync(CODEX_SESSIONS_DIR);
+    // One memory report for the whole push, hoisted for the same reason autoLearn
+    // above it is: two cards need it and it is not cheap. memoryCardData consumes
+    // conf plus six report fields; gatesCardData needs the single integer
+    // report.gateSources, which this call has already computed. Measured 2.93 ms
+    // and 25 fs syscalls saved per refresh.
+    //
+    // On a throw, fall back to the SHAPE both builders already read as "no card"
+    // rather than to null. Passing null would make each builder take its
+    // fresh-call default and throw again — three calls on the error path instead
+    // of the two we started with. This shape is also exactly what every test stub
+    // for memoryReport returns, so the failure path is the path already covered.
+    let memory;
+    try { memory = memoryReport(); }
+    catch { memory = { conf: {}, dir: null, report: null }; }
     this.view.webview.postMessage({
       type: 'data',
       active: fs.existsSync(SETTINGS),
@@ -2992,10 +3023,10 @@ class WildcardingViewProvider {
         };
       })(),
       autoLearn,
-      memory: memoryCardData(),
+      memory: memoryCardData(memory),
       local: localCardData(),
       guidance: guidanceCardData(),
-      gates: gatesCardData(),
+      gates: gatesCardData(memory),
     });
   }
 

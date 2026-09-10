@@ -85,6 +85,7 @@ function harness(tempHome) {
   const extensionPath = require.resolve('../vscode-extension/extension');
   const settingsWritePath = require.resolve('../src/settings-write');
   const scriptedReaders = new Set([extensionPath, settingsWritePath]);
+  const memoryReports = { count: 0 };
   const rootSrc = path.resolve(__dirname, '..', 'src');
   const originalLoad = Module._load;
   Module._load = function load(request, parent, isMain) {
@@ -131,7 +132,14 @@ function harness(tempHome) {
     if (request === './memoryLint' && parent?.filename === extensionPath) {
       return {
         MemoryLint: class MemoryLint { activate() {} },
-        memoryReport: () => ({ conf: {}, dir: null, report: null }),
+        // COUNTED, not just stubbed. The real memoryReport is 6.99 ms and 25 fs
+        // syscalls against a live corpus, and _push used to call it twice for two
+        // cards that need disjoint parts of one result. How many times it is
+        // called is the whole property, and nothing else in the suite can see it.
+        memoryReport: () => {
+          memoryReports.count += 1;
+          return { conf: {}, dir: null, report: null, gateSources: undefined };
+        },
         discoverDirs: () => [],
       };
     }
@@ -155,6 +163,7 @@ function harness(tempHome) {
     commands,
     executed,
     extension,
+    memoryReports,
     passes,
     arm(plan) { reads.length = 0; reads.push(...plan); },
     get provider() { return provider; },
@@ -554,6 +563,48 @@ test('the sidebar renders twelve wildcards and defers the rest to the picker', a
       { type: 'showWildcards' },
       { type: 'remove', value: [...FIFTEEN].sort()[0] },
     ]);
+  } finally {
+    await app.dispose();
+  }
+});
+
+// The memory report is the most expensive thing one push does: measured 6.99 ms
+// and 25 fs syscalls (12 readFileSync + 11 existsSync + 2 readdirSync) against a
+// live corpus. _push called it TWICE — once for the Memory card, once for a
+// one-integer `gateSources` lookup in the Gates card that the first call had
+// already computed. Two calls measured 9.92 ms, so the duplicate cost 2.93 ms of
+// every refresh, and a refresh fires on every settings.json change.
+//
+// This is the only assertion in the suite that can see it. Every other test stubs
+// memoryReport and ignores how often it is called, and no test exercises the real
+// one from this path at all — so without a count, reverting the hoist is silent.
+test('one push computes the memory report once, not once per card that needs it', async (t) => {
+  const { tempHome, write } = setup(t);
+  write({ permissions: { allow: ['Bash(git status *)'] } });
+  const app = harness(tempHome);
+  try {
+    const ui = fakeView();
+    app.provider.resolveWebviewView(ui.view);
+    await settle();
+
+    assert.equal(ui.posted.length, 1, 'one debounced push, so the count below is per-push');
+    assert.equal(app.memoryReports.count, 1,
+      'the Memory card and the Gates card must share one report, not take one each');
+
+    // And the value actually reaches both consumers. A hoist that threaded the
+    // report into only one card would still count 1 while the other silently
+    // called nothing and rendered wrong.
+    const data = ui.posted[0];
+    assert.ok('memory' in data, 'the memory card key is present');
+    assert.ok('gates' in data, 'the gates card key is present');
+
+    // A second push recomputes: the corpus can change between renders, so the
+    // report is per-push and must NOT be memoised across pushes.
+    app.provider.refresh();
+    await settle();
+    assert.equal(ui.posted.length, 2);
+    assert.equal(app.memoryReports.count, 2,
+      'per-push, not cached forever — a corpus edit between renders must be seen');
   } finally {
     await app.dispose();
   }
