@@ -15,7 +15,7 @@ const { scanHistoryFiles } = require('./history-adapters');
 const { createPolicyLock } = require('./policy-lock');
 const { commandLaunch } = require('./exec-resolve');
 const {
-  readPolicy, assessPermission, overridingRule, coversPermission,
+  readPolicy, assessPermission, overridingRule, coversPermission, defaultPolicyPath,
 } = require('./managed-policy');
 const {
   deriveMitigations, derivedStatus, setDerivedGuidance,
@@ -602,15 +602,37 @@ function createAutoLearnManager(options = {}) {
   const lockStaleMs = Number.isFinite(options.lockStaleMs) ? Math.max(0, options.lockStaleMs) : 10 * 60 * 1000;
   const observationHashLimit = Number.isFinite(options.observationHashLimit)
     ? Math.max(0, Math.floor(options.observationHashLimit)) : 20000;
-  // Read once per manager and cached: the policy is a client-refreshed cache,
-  // so re-reading it per candidate would only add I/O to a listing.
+  // Cached, because the policy is a client-refreshed cache and re-reading it per
+  // candidate would only add I/O to a listing — but keyed on a cheap stat rather
+  // than held for the manager's lifetime. Nothing watches the policy file, and
+  // the extension keeps one manager across policy changes, so a lifetime cache
+  // made `status()` keep reporting the pre-change verdict until some unrelated
+  // event happened to rebuild the manager. A stat per call is the smallest thing
+  // that fixes that without reparsing.
+  //
+  // `absent` is a real key rather than a miss: a machine with no
+  // managed-settings.json is the normal console-managed case, and a policy that
+  // appears later has to invalidate too.
   let policyCache;
+  let policyStamp;
+  const policyFingerprint = () => {
+    try {
+      const stat = fs.statSync(options.managedPolicyPath || defaultPolicyPath(home));
+      return `${stat.mtimeMs}:${stat.size}`;
+    } catch { return 'absent'; }
+  };
   const managedPolicy = () => {
-    if (policyCache === undefined) {
-      policyCache = options.managedPolicy !== undefined
-        ? options.managedPolicy
-        : readPolicy({ home, policyPath: options.managedPolicyPath });
-    }
+    // An injected policy is the caller's own object, not a file. Never stat it
+    // and never re-read it, or a test that passes a literal would find its
+    // policy replaced by whatever this machine happens to have.
+    if (options.managedPolicy !== undefined) return options.managedPolicy;
+    // Stamp BEFORE reading. If the file changes mid-read the stored stamp is the
+    // pre-change one, so the next call re-reads — one wasted read, rather than
+    // caching content under a stamp that says it is current.
+    const stamp = policyFingerprint();
+    if (policyCache !== undefined && stamp === policyStamp) return policyCache;
+    policyStamp = stamp;
+    policyCache = readPolicy({ home, policyPath: options.managedPolicyPath });
     return policyCache;
   };
   // Turns a file path into the managed rule that governs it, for the scanner to
