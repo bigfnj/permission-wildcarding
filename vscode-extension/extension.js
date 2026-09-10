@@ -2326,17 +2326,89 @@ function runWildcarding(manual = false) {
   // the CLI (`wildcard-perms --max` / `--bypass`) fires the watcher and lands here.
   updateStatusBar();
 
-  let settings;
-  let before;
-  let after;
+  // Already optimal: the ~95% case. Factored out because it is now reachable from
+  // two places — the unlocked probe below, and the post-lock path when somebody
+  // else generalized the list while we were waiting.
+  //
+  // backupPolicy runs HERE, on the unchanged path, and that is load-bearing. It is
+  // the only thing that rebuilds a DELETED backup, which is not hypothetical: on
+  // 2026-09-09 every directory under ~/.claude was recreated and this path is what
+  // restored the mirror. It self-short-circuits when the union is unchanged, so it
+  // costs a backup read, not a write. deny rides along because this is the path
+  // that runs on every settings change, so it is where a deny rule added by hand
+  // first reaches the backup.
+  const reportAlreadyOptimal = (list, deny) => {
+    backupPolicy(list, deny);
+    if (manual) vscode.window.setStatusBarMessage('$(shield) permission-wildcarding: already optimal', 4000);
+    dashboard?.refresh(wildcardingHint(list));
+  };
+
+  // ── the unlocked probe ──────────────────────────────────────────────────────
+  //
+  // The read and the pass used to happen INSIDE the lock, so every settings.json
+  // change paid a full lock cycle just to discover there was nothing to do. Same
+  // mistake, and the same fix, as bin/wildcard-perms:287-296 — this read is a
+  // NEGATIVE TEST ONLY, which is what makes it safe unlocked. If the list is
+  // already a fixed point we write nothing, so a stale read costs nothing. The
+  // moment it differs, everything authoritative is redone inside the lock.
+  //
+  // The lock cycle is 3.4-3.7 ms of file operations (46% of it a single
+  // fsyncSync), but milliseconds are the smaller half of the argument. The real
+  // win is CONTENTION. Auto Learn is on by default, scans every 5 minutes plus a
+  // 20-second debounce on the highest-frequency watcher in this extension, and its
+  // scan() holds this same lock across the ENTIRE transcript corpus read. The
+  // 20-deep `lockedRetries` budget with a 1500 ms backoff below — up to ~30
+  // seconds of deferral — is evidence that this race was observed, not predicted.
+  // On the unchanged path the pass can now no longer lose it at all.
+  //
+  // And the lock never protected this read from the file's highest-frequency
+  // writer anyway: Claude Code does not take it (see toggleMax's note above).
+  const settings = readSettings();
+  if (!settings) { dashboard?.refresh(); return; }
+  const before = settings?.permissions?.allow ?? [];
+  const after = processAllowList(before);
+
+  if (JSON.stringify(before) === JSON.stringify(after)) {
+    // Reset here too. The budget used to be cleared only after a completed lock
+    // cycle, and an early return that never reaches the lock would otherwise
+    // strand it — leaving a window of contention permanently spent.
+    lockedRetries = 0;
+    reportAlreadyOptimal(after, settings?.permissions?.deny);
+    return;
+  }
+
+  // ── a write is due, so now take the lock ────────────────────────────────────
+  //
+  // The probe's snapshot is DISCARDED and everything recomputed from a read taken
+  // inside the lock. This is not defensive tidiness, it is required:
+  // `writeAllow` replays a delta computed against the CALLER's snapshot, and its
+  // own note (src/settings-write.js:145-152) names this caller — "WRONG for one
+  // whose whole output is a function of the list it read … Such a caller must
+  // re-read and recompute first, so `settings` IS `latest` and this degenerates
+  // to identity."
+  //
+  // Until now this function satisfied that precondition only BY ACCIDENT, because
+  // its read happened to sit inside the lock. Handing writeAllow the probe's
+  // snapshot instead would reintroduce the failure spelled out at
+  // bin/wildcard-perms:354-368: with MAX on, Claude Code persists
+  // `Bash(npm test)`; the unlocked pass marks it removed because `Bash(*)` covers
+  // it; `--max off` then deliberately preserves it; replaying `removed` deletes it
+  // for good.
+  //
+  // So the changed path now runs the pass twice. That is the correct trade: it is
+  // the ~5% case, it already pays for an atomic write, and 3.2 ms of recompute
+  // buys back the only guarantee that makes the delta replay sound.
+  let locked;
+  let lockedBefore;
+  let lockedAfter;
   try {
     getPolicyLock().locked(() => {
-      settings = readSettings();
-      if (!settings) return;
-      before = settings?.permissions?.allow ?? [];
-      after = processAllowList(before);
-      if (JSON.stringify(before) === JSON.stringify(after)) return;
-      writeAllow(settings, after);
+      locked = readSettings();
+      if (!locked) return;
+      lockedBefore = locked?.permissions?.allow ?? [];
+      lockedAfter = processAllowList(lockedBefore);
+      if (JSON.stringify(lockedBefore) === JSON.stringify(lockedAfter)) return;
+      writeAllow(locked, lockedAfter);
       lastRun = Date.now();
     });
   } catch (err) {
@@ -2352,37 +2424,34 @@ function runWildcarding(manual = false) {
     return;
   }
   lockedRetries = 0;
-  if (!settings) { dashboard?.refresh(); return; }
+  if (!locked) { dashboard?.refresh(); return; }
 
-  // Nothing changed — also guards the watcher loop (our own write re-fires the
-  // watcher; the idempotent check short-circuits on the second pass).
-  if (JSON.stringify(before) === JSON.stringify(after)) {
-    // Keep the backup fresh even when the list is already optimal, so approvals
-    // that arrive already-wildcarded still get captured. deny rides along: this
-    // is the path that runs on every settings change, so it is where a deny rule
-    // added by hand first reaches the backup.
-    backupPolicy(after, settings?.permissions?.deny);
-    if (manual) vscode.window.setStatusBarMessage('$(shield) permission-wildcarding: already optimal', 4000);
-    dashboard?.refresh(wildcardingHint(after));
+  // Reported from the LOCKED read, not the probe, because that is what the write
+  // actually rebased onto. Reachable when another writer generalized the list
+  // between the probe and the lock — and it also still guards the watcher loop
+  // (our own write re-fires the watcher; the second pass short-circuits at the
+  // probe above).
+  if (JSON.stringify(lockedBefore) === JSON.stringify(lockedAfter)) {
+    reportAlreadyOptimal(lockedAfter, locked?.permissions?.deny);
     return;
   }
 
   {
-    const addedList   = after.filter(p => !before.includes(p));
-    const removedList = before.filter(p => !after.includes(p));
+    const addedList   = lockedAfter.filter(p => !lockedBefore.includes(p));
+    const removedList = lockedBefore.filter(p => !lockedAfter.includes(p));
     if (addedList.length || removedList.length) {
       vscode.window.showInformationMessage(
-        `permission-wildcarding: wildcarded ${addedList.length} permission${addedList.length !== 1 ? 's' : ''}, pruned ${removedList.length} — ${after.length} total`,
+        `permission-wildcarding: wildcarded ${addedList.length} permission${addedList.length !== 1 ? 's' : ''}, pruned ${removedList.length} — ${lockedAfter.length} total`,
         { detail: addedList.map(p => `→ ${p}`).join('\n') }
       );
       vscode.window.setStatusBarMessage(
-        `$(shield) permission-wildcarding: +${addedList.length} -${removedList.length} → ${after.length} entries`,
+        `$(shield) permission-wildcarding: +${addedList.length} -${removedList.length} → ${lockedAfter.length} entries`,
         5000
       );
     }
   }
 
-  dashboard?.refresh(wildcardingHint(after));
+  dashboard?.refresh(wildcardingHint(lockedAfter));
 }
 
 // ── project-local approvals ─────────────────────────────────────────────────────

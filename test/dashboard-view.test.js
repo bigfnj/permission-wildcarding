@@ -37,6 +37,11 @@ function harness(tempHome) {
   const commands = new Map();
   const executed = [];
   const passes = { count: 0 };
+  // Every policy-lock acquisition, plus a hook that runs after the lock is held
+  // but BEFORE the guarded work — i.e. inside the read-to-write window. Nothing
+  // in the suite could observe either before this: no test asserted the
+  // extension took the lock, and none counted acquisitions.
+  const locks = { count: 0, insideLock: null };
   const settingsPath = path.join(tempHome, '.claude', 'settings.json');
   // One directive per read of settings.json, consumed in order, then
   // pass-through. Armed by a test via app.arm(); empty for every other test, so
@@ -126,6 +131,26 @@ function harness(tempHome) {
         processAllowList: (list) => { passes.count += 1; return real.processAllowList(list); },
       };
     }
+    if (parent?.filename === extensionPath && request === './src/policy-lock') {
+      const real = originalLoad.call(this, path.join(rootSrc, 'policy-lock.js'), parent, isMain);
+      return {
+        ...real,
+        createPolicyLock: (...args) => {
+          const lock = real.createPolicyLock(...args);
+          return {
+            ...lock,
+            locked: (fn) => lock.locked(() => {
+              locks.count += 1;
+              // The injection point. A settings.json write landing here is
+              // exactly the interleaving writeAllow's delta replay cannot
+              // survive unless the guarded work re-reads.
+              if (locks.insideLock) locks.insideLock();
+              return fn();
+            }),
+          };
+        },
+      };
+    }
     if (parent?.filename === extensionPath && request.startsWith('./src/')) {
       return originalLoad.call(this, path.join(rootSrc, request.slice('./src/'.length)), parent, isMain);
     }
@@ -165,12 +190,22 @@ function harness(tempHome) {
     extension,
     memoryReports,
     passes,
+    locks,
     arm(plan) { reads.length = 0; reads.push(...plan); },
     get provider() { return provider; },
     async dispose() {
       await extension.deactivate();
       Module._load = originalLoad;
-      delete require.cache[extensionPath];
+      // Purge the whole tree, not just the entry. Every src/ module that
+      // defaults a home resolves it against its OWN `os` binding, frozen at
+      // first require — so leaving them cached hands the next harness this
+      // one's stub. Same fix as test/extension-activation.test.js.
+      const extensionDir = path.dirname(extensionPath) + path.sep;
+      for (const key of Object.keys(require.cache)) {
+        if (key.startsWith(rootSrc + path.sep) || key.startsWith(extensionDir)) {
+          delete require.cache[key];
+        }
+      }
     },
   };
 }
@@ -677,6 +712,118 @@ test('the hero card reports the running version and a gate count that does not d
     const expected = require('../vscode-extension/package.json').version;
     assert.equal(data.version, expected, 'the payload carries the running version');
     assert.match(data.version, /^\d+\.\d+\.\d+$/, 'and it is a real semver, not a placeholder');
+  } finally {
+    await app.dispose();
+  }
+});
+
+
+test('an already-optimal list takes no policy lock at all', async (t) => {
+  // The lock used to be taken BEFORE anything was known: the read, the pass and
+  // the no-op comparison were all inside it. So every settings.json change paid
+  // a full lock cycle to discover there was nothing to do.
+  //
+  // The cycle is 3.4-3.7 ms (46% of it one fsyncSync), but the milliseconds are
+  // the smaller half. The real cost was CONTENTION: Auto Learn takes this same
+  // lock, is on by default, scans every 5 minutes plus a 20-second debounce on
+  // the highest-frequency watcher in the extension, and its scan() holds the lock
+  // across the entire transcript corpus read. runWildcarding's own 20-deep
+  // retry budget with a 1500 ms backoff is the evidence that race was observed.
+  const env = setup(t);
+  env.write({ permissions: { allow: FIFTEEN, deny: [] } });   // already a fixed point
+  const app = harness(env.tempHome);
+  try {
+    const before = app.locks.count;
+    await app.commands.get('permission-wildcarding.runNow')();
+    await settle();
+
+    assert.equal(app.locks.count - before, 0,
+      'the unchanged path still takes the lock, so it can still lose the race with Auto Learn');
+    // And the work still happened: the backup is refreshed on this path, which is
+    // the only thing that rebuilds a DELETED backup.
+    assert.deepEqual(env.read().permissions.allow, FIFTEEN, 'nothing was rewritten');
+  } finally {
+    await app.dispose();
+  }
+});
+
+test('a write that is due DOES take the lock', async (t) => {
+  // The other half, so the test above cannot pass by the lock never being taken
+  // at all. Without this, deleting the entire getPolicyLock().locked(...) call
+  // would leave the suite green.
+  const env = setup(t);
+  // Seed an already-optimal list so ACTIVATION is quiet, then make work due
+  // afterwards. Seeding the ungeneralized list instead lets activate()'s own
+  // runWildcarding do the generalizing, and runNow then correctly finds nothing
+  // to do -- which is how the first version of this test failed.
+  env.write({ permissions: { allow: FIFTEEN, deny: [] } });
+  const app = harness(env.tempHome);
+  try {
+    await settle();
+    env.write({ permissions: { allow: ['Bash(git status)', 'Bash(git status --short)'], deny: [] } });
+    const before = app.locks.count;
+    await app.commands.get('permission-wildcarding.runNow')();
+    await settle();
+
+    assert.ok(app.locks.count - before >= 1, 'a write must be performed under the lock');
+    assert.ok(env.read().permissions.allow.includes('Bash(git status *)'), 'and it generalized');
+  } finally {
+    await app.dispose();
+  }
+});
+
+test('a concurrent write inside the lock is not flattened by a stale delta', async (t) => {
+  // THE test for this change, and the reason the probe's snapshot must be thrown
+  // away rather than handed to writeAllow.
+  //
+  // writeAllow replays a delta computed against the CALLER's snapshot onto a
+  // fresh read. Its own note (src/settings-write.js:145-152) says that is "WRONG
+  // for one whose whole output is a function of the list it read", and names the
+  // wildcarding pass as exactly that caller. Until the probe moved out of the
+  // lock, runWildcarding satisfied that precondition only BY ACCIDENT, because
+  // its read happened to sit inside the lock.
+  //
+  // The shape that actually loses data — my first attempt at this test injected an
+  // UNRELATED entry, which survives a stale replay fine, and the mutant lived. The
+  // entry has to be one the probe's pass PRUNED, so it lands in `removed`, which a
+  // concurrent writer then legitimately keeps. That is the MAX case at
+  // bin/wildcard-perms:354-368: with MAX on, `Bash(*)` covers everything, so the
+  // pass prunes the specific entries; `--max off` then deliberately restores them;
+  // replaying `removed` deletes them for good.
+  //
+  // Measured against the real functions:
+  //   probe    ['Bash(npm *)', 'Bash(npm run build)'] -> ['Bash(npm *)']
+  //            removed = ['Bash(npm run build)'], added = []
+  //   latest   ['Bash(npm run build)']      (the broad entry dropped, as --max off does)
+  //   correct  fresh recompute -> ['Bash(npm run *)']
+  //   stale    replay          -> []        <-- the allow list is EMPTIED
+  const env = setup(t);
+  env.write({ permissions: { allow: FIFTEEN, deny: [] } });   // quiet activation
+  const app = harness(env.tempHome);
+  try {
+    await settle();
+    env.write({ permissions: { allow: ['Bash(npm *)', 'Bash(npm run build)'], deny: [] } });
+
+    let injected = false;
+    app.locks.insideLock = () => {
+      if (injected) return;
+      injected = true;
+      // The broad entry goes away while we hold the lock — exactly what a
+      // concurrent `--max off` does. The specific entry must survive.
+      fs.writeFileSync(env.settingsPath, JSON.stringify(
+        { permissions: { allow: ['Bash(npm run build)'], deny: [] } }, null, 2) + '\n');
+    };
+
+    await app.commands.get('permission-wildcarding.runNow')();
+    await settle();
+
+    assert.ok(injected, 'precondition: the lock was taken, so the injection ran');
+    const allow = env.read().permissions.allow;
+    assert.notDeepEqual(allow, [],
+      'the write replayed the probe\u2019s stale `removed` onto the fresh read and '
+      + 'emptied the allow list');
+    assert.deepEqual(allow, ['Bash(npm run *)'],
+      'the guarded work must recompute from the read taken INSIDE the lock');
   } finally {
     await app.dispose();
   }
