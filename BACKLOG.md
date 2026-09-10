@@ -57,13 +57,32 @@ such family observed: 15 runs. Costs nothing while `PowerShell(& *)` covers the
 call-operator form those invocations use. Fix would unify the family for evidence
 while still emitting both permission spellings.
 
-### State file growth is unbounded in one dimension
+**Trigger: revisit when a split family would cross the threshold on its combined
+count while both halves sit below it.** Largest split seen is 15 runs, and
+nothing is currently blocked by it.
 
-2.9 MB at last check: ~13.5k observation hashes against a 20,000 cap, ~790
-cursors with no cap, 234 candidates. Measured cost is 14 ms to parse and 9 ms to
-serialize, so this is not urgent. Cursors are the only uncapped structure; they
-accumulate one entry per transcript file ever seen and never shrink when a
-transcript is deleted. Revisit if the file passes roughly 20 MB.
+### State file growth: cap `state.candidates`
+
+Corrected 2026-09-09. The earlier version of this entry named cursors as the
+uncapped structure and that was wrong: `scan()` replaces `state.cursors`
+wholesale from a set built only from files found on disk, so a deleted
+transcript's cursor is dropped. Mutation-tested (3 transcripts, 3 cursors;
+delete 2, rescan, 1 cursor) and confirmed live at 710 cursors against exactly
+710 files, zero orphans. Cursors are also not the size driver:
+`observationHashes` is 2.51 MB of a 3.56 MB file and sits exactly at its 20,000
+cap, while cursors are 250 KB and candidates 111 KB.
+
+`state.candidates` is the one persisted structure with no cap and no eviction:
+no `delete` anywhere and no limit constant. The open-ended axes are
+`webfetch:<host>`, one per domain ever fetched, and `mcp:<server>__<action>`.
+
+**Trigger: revisit when the count passes 1000.** It is 285 today. Deferred
+because eviction needs a decision about losing evidence, and a candidate is the
+only record that a family was ever observed.
+
+Also unbounded on disk, separately: `~/.claude/wildcarding/backups`, one `.bak`
+per changed target per apply, referenced only for the newest set. 14 files,
+99 KB, roughly 1.6 MB/year at the observed rate.
 
 ### An older copy of the tool silently drops new state fields
 
@@ -89,160 +108,38 @@ stricter and would have surfaced the multi-install problem immediately.
 Worth noting separately that multiple installed extension versions is itself
 worth guarding against, since each one scans on its own timer.
 
-## From the 2026-09-09 audit
+## Left from the 2026-09-09 audit
 
-Five parallel read-only audits over the whole repo. Everything here was verified
-by reading the code, and the numbers were measured on a real machine (712
-transcripts, ~920 MB; 316-entry allow list; 3.7 MB state file). Defects in that
-session's own new code were fixed in the same session and are not listed.
+Five parallel read-only audits over the whole repo, measured on a real machine
+(712 transcripts, ~920 MB; 317-entry allow list; 3.7 MB state file). Eight items
+were closed by the v1.4.0 burn-down and removed from this file; what follows is
+what was deliberately left.
 
-### The hook recompiles ~192k regexes per tool call
+### Prune `applied`/`reviewed` keys against the candidates
 
-Highest-impact item found, and the cheapest to fix. `ruleMatches`
-(`src/permission-match.js:60`) ends in `new RegExp(...)` with no cache, and
-`normalizeRule` runs three times per call. `processAllowList` then does two
-quadratic passes over the allow list (`src/permissions.js:204-216`).
+The v1.4.0 crash fix guards the read rather than removing the orphan, so a key
+whose candidate `sanitizeState` dropped still sits in `applied.claude` and
+`reviewed.claude` forever. `pruneObservationHashes` already does exactly this
+reconciliation for observation hashes and is tested, so the shape is known.
 
-Measured on a real 316-entry list: **495-508 ms and 192,150 RegExp compilations
-per `PostToolUse` hook run**, which then usually writes nothing because the list
-is already optimal. A prototype cache (rule string to compiled RegExp, plus a
-`normalizeRule` memo, both inside `permission-match.js`) gave **25 ms and 316
-compilations with byte-identical output**. Roughly 15 lines, one file, no call
-sites change; `test/permission-match.test.js` and
-`test/permissions-regressions.test.js` already guard the behaviour. Needs a cap
-on the cache, since the key space is rule strings.
+Not done because dropping an applied key discards claims-registry provenance,
+which is what stops one workspace revoking another's grant. **Trigger: do it if
+an orphaned key is ever observed causing anything beyond the crash that is now
+guarded.**
 
-Same fix also covers: the dashboard, which runs that 500 ms pass on every
-`refresh()` (~30 call sites, synchronous on the extension host,
-`vscode-extension/extension.js:2587`); `runWildcarding()` at `:2058`, which
-`activate()` calls synchronously; and the scan's probe matcher, measured at
-484,351 compilations across a full corpus pass.
+### Two things the burn-down proved about this file's own claims
 
-Whole-hook budget today is ~575 ms per tool call: 50 node startup, 20 requires,
-500 `processAllowList`, 4 the policy lock. Two more items on that path, both
-small: `bin/wildcard-perms` top-level-requires `codex-max`, `agent-guidance` and
-`agent-gates` plus `spawnSync`, none of which the hook path uses (~12 ms;
-`learn()` already lazy-requires and says why), and `finish()` takes the policy
-lock before checking whether the project has a `settings.local.json` at all
-(3.7 ms per call, and zero such files exist across the measured project tree).
+Worth keeping because both were wrong here for a while:
 
-### `coversPrefix` treats a `*` token as a literal, so a blanket managed rule is invisible
-
-`rulePrefix` (`src/managed-policy.js:35`) strips only a *trailing* ` *` or `:*`,
-so a bare `*` specifier survives as the literal token `"*"` and `coversPrefix`
-compares it as text. Measured: with managed `deny: ["Bash(*)"]`, the permission
-`Bash(git status *)` assesses `effective` and `overridingRule` returns null,
-while `shadowedByManaged` in `policy-guard.js` correctly names the deny. On a
-"deny all Bash, allow specific" org policy the learner would propose and write
-grants that can never fire. Worse, `rulePrefix("Bash( *)")` and
-`rulePrefix("Bash(:*)")` both return null, so `readPolicy`'s `.filter(Boolean)`
-drops those rules from the policy entirely.
-
-### The drift test cannot fail for the drift it names
-
-`src/policy-guard.js:78` hand-inlines a matcher that does not do the `:*` to
-` *` normalization and does not give the trailing-`*` bare-command allowance,
-both of which `permission-match.js` exists to centralize, and which
-`managed-policy.js:17` notes the managed file uses *exclusively*. Measured
-disagreements: `permissionMatches("Bash(docker ps)", "Bash(docker:*)")` is
-false where the canonical matcher says true; same for `Bash(head -n 5 x)` against
-`Bash(head:*)` and `Bash(git)` against `Bash(git *)`. So `shadowedByManaged`
-reports a shadowed allow entry as healthy.
-
-`test/policy-guard.test.js:187` claims to guard exactly this ("the guard matcher
-does not drift from the review matcher") but compares `policy-guard`'s copy
-against a *third* hand-copy in `vscode-extension/autoLearnUi.js`, never against
-`permission-match.ruleMatches`, and none of its eight cases uses the `:*`
-spelling. The two copies agree with each other while both diverge from the
-canonical one. This is the "a control that cannot fail is not a control" case in
-its purest form and should be fixed before the matcher itself.
-
-### Two-fifths of resolvable Codex evidence is discarded
-
-`structuredResultStatus` (`src/history-adapters.js:153-158`) uses a
-single-quote-only character class (`/[']exit_code[']/`) where `['"]` was meant,
-and the bare `/\bexit_code\s*[:=]/` cannot match `"exit_code":0` because the
-closing quote sits between key and colon. `explicitNestedShellStatuses:565` only
-looks for `Exit code: N`.
-
-Measured on a real `~/.codex/sessions` (last 40 rollouts, 3,365 outputs): 949
-carry `Exit code:` and parse, **690 say `Script completed` / `Script failed` and
-parse as `unknown`**, 476 are genuinely still running. `auto-learn-manager.js`
-then drops every `unknown` as not-evidence, so roughly 40% of the resolvable
-Codex signal never reaches a candidate.
-
-### One transient file error aborts an entire scan
-
-In `scanHistoryFiles`, the primary `readRange` calls sit at
-`src/history-adapters.js:936,944,951` while the per-file `try` does not open
-until `:954`. The scanner enumerates all files up front and then reads them over
-a measured 9.7 s, so a transcript deleted, locked by AV, or hitting EMFILE inside
-that window throws out of `scan()` and out of `locked()`, and `save(state)` never
-runs. Confirmed by injecting EBUSY on the middle of three files: the scan threw
-and zero cursors were returned. Every already-parsed file's progress is
-discarded, and the extension's exponential backoff then stretches to 60 minutes,
-so Auto Learn quietly stops learning.
-
-Related: a file whose *parse* fails gets no cursor at all when it has no prior
-one (`:985-988` writes only `if (prior)`), so it is re-read in full on every
-scan forever, and a per-file error does not trip the backoff, so nothing
-surfaces but a count in `lastScanStats.errors`.
-
-### `inert` withholding is display-only; apply writes the grant anyway
-
-`clone` (`src/auto-learn-manager.js:662`) excludes `'claude'` from
-`eligibleTargets` when the verdict is `inert`, but `applyUnlocked` never consults
-policy: the only gate is `claudeEligible`, which just asks whether a permission
-string rendered. `scan()` in `auto-safe` mode calls `applyUnlocked` directly,
-bypassing `clone` entirely, as does `--learn apply`. So with managed
-`ask: ["Bash(docker:*)"]` and an auto-safe `Bash(docker exec *)` candidate, the
-listing says `eligibleTargets: []` and `settings.json` gets the entry.
-`docs/claude-code-permissions.md` claims inert families are withheld;
-`test/managed-policy.test.js:72-111` asserts only `eligibleTargets`, never the
-write.
-
-### `--learn apply` can die with a raw TypeError
-
-`renderClaudePermissions` (`src/auto-learn-manager.js:983`) guards
-`state.candidates[key]?.autoSafe` with an optional chain and then uses the same
-possibly-absent value unguarded on the right of the `||`. Reachable because
-`sanitizeState` drops a candidate its validator rejects while keeping every key
-in `applied.claude`/`reviewed.claude` verbatim. Measured: throws
-`Cannot read properties of undefined (reading 'claudePermission')`. The Codex
-sibling at `:997` tolerates it and returns false.
-
-### Extension lifecycle leaks
-
-- `registerLocalWatchers` (`vscode-extension/extension.js:1542`) pushes each
-  watcher into both a local array and `context.subscriptions`, and only the local
-  array is drained on re-attach. `attach()` re-runs on every workspace-folder
-  change, so `context.subscriptions` accumulates disposed watchers until
-  deactivate. `memoryLint.js:174-198` has the correct pattern.
-- Three sites create an `OutputChannel` per invocation and never dispose it
-  (`:345`, `:1109`, `:1332`), one of them a palette command with no call limit.
-  `memoryLint.js:141` shows the intended one-channel-in-activate pattern.
-- `deactivate()` clears six timers and misses two: `gatesBounce` (`:1769`, whose
-  callback spawns Python) and the anonymous `setTimeout(autoSyncRecallIfStale,
-  10000)` at `:1712`, whose handle is never captured.
-
-### Corrections to this file's own growth baseline
-
-Measured, so the earlier entry above should be read against these:
-
-- **Cursors do shrink.** `scan()` replaces `state.cursors` wholesale from a set
-  built only from files found on disk. Mutation-tested: 3 transcripts gave 3
-  cursors, deleting 2 and rescanning gave 1. Live: 710 cursors against exactly
-  710 files, zero orphans. Each entry is 352 bytes, not ~60 (two SHA-256 hex
-  digests).
-- **Cursors are not the size driver.** `observationHashes` is 2.51 MB of the
-  3.56 MB file (67%) and is sitting exactly at its 20,000 cap. Cursors are 250 KB
-  (7%), candidates 111 KB (3%).
-- **`state.candidates` is the one uncapped structure that never shrinks.** No
-  `delete` anywhere and no limit. The open-ended axes are `webfetch:<host>` (one
-  per domain ever fetched) and `mcp:<server>__<action>`. 285 entries today.
-- Also unbounded on disk: `~/.claude/wildcarding/backups`, one `.bak` per changed
-  target per apply, referenced only for the newest set. 14 files, 99 KB, so about
-  1.6 MB/year at the observed rate.
+- The drift-test entry said `test/policy-guard.test.js` compared against a third
+  hand-copy in `autoLearnUi.js`. That was true once; commit `5566628` replaced
+  it with a delegation, so the test did reach the canonical matcher and STILL
+  could not fail, because all eight of its cases happened to agree. A test can
+  be vacuous without being wired wrong.
+- The Codex entry said ~40% of resolvable evidence was discarded, from a probe
+  that counted output payloads. Re-measured with the real parser: 30 of 6,870
+  observations, 28 of them failures, and no candidate changed disposition. Count
+  the thing the code counts, not the thing that looks like it.
 
 ### A single transcript will eventually exceed the 512 MB string limit
 
@@ -253,6 +150,10 @@ transcript measured is 70.4 MB and a session file only grows. Peak RSS is roughl
 pass), because the code holds the Buffer, then the whole string, then a split
 array of every line. An `onObservation` callback instead of one returned array
 would cap the retained half; streaming by line would cap the transient half.
+
+**Trigger: revisit when any single transcript passes 200 MB.** Largest is
+70.4 MB today, so there is roughly 7x headroom, and the fix is a rewrite of the
+code path every other feature depends on.
 
 ### Small, confirmed, no urgency
 

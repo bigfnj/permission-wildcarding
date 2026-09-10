@@ -520,6 +520,35 @@ deduplication avoid double counting and catch writes missed while VS Code was su
 capped and trimmed oldest first, so a long-lived install does not grow without limit, and the
 dashboard answers from one state read cached against the state file rather than reparsing it.
 
+### The hook is fast now
+
+The `PostToolUse` hook fires after every tool call, and it was spending most of
+that time proving nothing had changed. `ruleMatches` rebuilt a RegExp on every
+call, and `isCoveredBy` sits inside both quadratic passes of `processAllowList`,
+so one pass over a real 317-entry allow list was **192,150 regex compilations**.
+
+The matcher now memoizes the normalized rule and the compiled pattern, keyed on
+the rule string. Both are pure functions of that string, so nothing can go
+stale, which is the property that earns a cache here; contrast the deliberate
+refusal to cache a managed-policy verdict, where the file underneath is a
+client-refreshed copy. The maps are capped, because the hook process exits after
+one pass while the extension host holds the module for a whole session.
+
+Measured end to end, real process launches with a Claude Code style payload on
+stdin, before and after interleaved on the same machine:
+
+```
+hook BEFORE (v1.3.0)   min 511.6  p50 548.1  p90 562.5   ms
+hook AFTER             min 103.5  p50 109.8  p90 119.1   ms
+```
+
+Five times faster per tool call, with output proven byte-identical rather than
+assumed. What remains is mostly Node itself: 50 ms of that 110 is bare process
+startup. Two smaller wins came with it, `codex-max`/`agent-guidance`/
+`agent-gates` moved to lazy requires since the hook path never uses them, and
+`drainFromHook` now checks whether the project has a `settings.local.json`
+before taking the policy lock rather than after.
+
 Auto Learn and the wildcarding pass are two writers of one `settings.json`, so both take the
 same lock at `~/.claude/wildcarding/auto-learn-policy.lock`; the wildcarding pass defers and
 retries rather than failing while a scan holds it. **Undo** releases this claimant's grants
