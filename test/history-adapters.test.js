@@ -2,6 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -25,6 +26,37 @@ function byCallId(observations, callId) {
 function responseItem(payload) {
   return { type: 'response_item', payload };
 }
+
+function codexCall(id, command) {
+  return jsonl(
+    responseItem({
+      type: 'function_call', name: 'shell_command', call_id: id,
+      arguments: JSON.stringify({ command }),
+    }),
+    responseItem({ type: 'function_call_output', call_id: id, output: { exit_code: 0 } }),
+  );
+}
+
+// `fs.symlinkSync(target, link, 'junction')` is unprivileged on Windows, where
+// 'dir' and 'file' need SeCreateSymbolicLink or Developer Mode. Probe rather
+// than assume, so a box without the privilege skips instead of failing.
+const DIR_LINK = process.platform === 'win32' ? 'junction' : 'dir';
+function canLink(type) {
+  const probe = fs.mkdtempSync(path.join(os.tmpdir(), 'wildcard-link-probe-'));
+  try {
+    const target = path.join(probe, 'target');
+    if (type === 'file') fs.writeFileSync(target, '');
+    else fs.mkdirSync(target);
+    fs.symlinkSync(target, path.join(probe, 'link'), type);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    try { fs.rmSync(probe, { recursive: true, force: true }); } catch {}
+  }
+}
+const CAN_LINK_DIR = canLink(DIR_LINK);
+const CAN_LINK_FILE = canLink('file');
 
 test('Claude parsing correlates tool results, failures, and out-of-order results', () => {
   const transcript = jsonl(
@@ -336,13 +368,64 @@ test('incremental scanning replays overlap to correlate appended results with st
   assert.equal(appended.observations[0].id, initialId);
   assert.equal(appended.observations[0].status, 'success');
 
+  // The append above appends a result whose CALL is outside the overlap, which
+  // forces the reconciliation re-read -- and that re-read starts at byte 0, so
+  // it puts the head-of-file `session_meta` back into the parse and masks what
+  // an append really sees. A call that arrives WITH its own output needs no
+  // reconciliation, so the slice is parsed alone; and Codex states `cwd` and
+  // the session id in that head record only. Without them the manager drops
+  // the observation outright when a workspace root is set, and when it is not,
+  // the same call gets a SECOND identity, which defeats the observation-hash
+  // dedupe and inflates the success counts that gate auto-safe apply.
+  fs.appendFileSync(file, jsonl(
+    responseItem({
+      type: 'function_call', name: 'shell_command', call_id: 'paired-call',
+      arguments: JSON.stringify({ command: 'rg TODO src' }),
+    }),
+    responseItem({ type: 'function_call_output', call_id: 'paired-call', output: { exit_code: 0 } }),
+  ));
+  const paired = scanHistoryFiles({
+    roots: { codex: root }, cursors: JSON.parse(JSON.stringify(appended.cursors)),
+    platform: 'win32', overlapBytes: 48,
+  });
+  assert.equal(paired.files[0].mode, 'append');
+  assert.deepEqual(paired.observations.map(({ command }) => command), ['rg TODO src']);
+  assert.equal(paired.observations[0].status, 'success');
+  assert.equal(paired.observations[0].session, 'incremental-session',
+    'an append slice starts past session_meta, so the session must be seeded from the head line');
+  assert.equal(paired.observations[0].cwd, root,
+    'without the seeded cwd the manager drops this observation as outside the workspace');
+  const fromFull = scanHistoryFiles({ roots: { codex: root }, platform: 'win32' })
+    .observations.find((item) => item.callId === 'paired-call');
+  assert.equal(paired.observations[0].id, fromFull.id,
+    'append and full must agree on the identity or the dedupe counts one call twice');
+
+  // And the seed above must not have been bought by writing a path down. The
+  // cursor gains no field, least of all a cwd.
+  const pairedPersisted = JSON.parse(JSON.stringify(paired.cursors));
+  assert.deepEqual(
+    Object.keys(Object.values(pairedPersisted)[0]).sort(),
+    Object.keys(Object.values(persistedCursors)[0]).sort(),
+  );
+  assert.ok(!JSON.stringify(pairedPersisted).includes(path.basename(root)),
+    'a cwd is a user path, so recovering one must not persist one');
+
   const unchanged = scanHistoryFiles({
-    roots: { codex: root }, cursors: JSON.parse(JSON.stringify(appended.cursors)), platform: 'win32',
+    roots: { codex: root }, cursors: JSON.parse(JSON.stringify(paired.cursors)), platform: 'win32',
   });
   assert.equal(unchanged.files[0].mode, 'unchanged');
   assert.deepEqual(unchanged.observations, []);
+  // An unchanged file reuses the fingerprint `safeContinuation` has just
+  // verified rather than reading and re-hashing the same 8 KB to the same two
+  // digests, so the cursor it writes must be byte-identical to the one it
+  // carried in -- and must still verify on the scan after that.
+  assert.deepEqual(JSON.parse(JSON.stringify(unchanged.cursors)), pairedPersisted);
+  const twiceUnchanged = scanHistoryFiles({
+    roots: { codex: root }, cursors: JSON.parse(JSON.stringify(unchanged.cursors)), platform: 'win32',
+  });
+  assert.equal(twiceUnchanged.files[0].mode, 'unchanged');
 
-  const legacyCursor = { [file]: Object.values(appended.cursors)[0] };
+  const legacyCursor = { [file]: Object.values(paired.cursors)[0] };
   const legacyUnchanged = scanHistoryFiles({ roots: { codex: root }, cursors: legacyCursor, platform: 'win32' });
   assert.equal(legacyUnchanged.files[0].mode, 'unchanged');
   assert.match(Object.keys(legacyUnchanged.cursors)[0], /^path-sha256:[a-f0-9]{24}$/);
@@ -581,4 +664,242 @@ test('a nested exec reports one status per execution, not one per mention of it'
   );
   const success = parseCodexJsonl(wordedSuccess, { file: 'codex.jsonl', platform: 'win32' });
   assert.equal(success.find((item) => item.command === 'git ls-files')?.status, 'success');
+});
+
+// `tools.exec_command({ cmd })` is what a Codex 0.153.4 rollout contains, and
+// the extractor knew only `tools.shell_command({ command })`. Since the
+// extractor is the only route from a `custom_tool_call` to an observation, a
+// current transcript produced NOTHING in every mode -- and silently, because
+// an empty command list is also what a script that ran no shell looks like.
+// `src/auto-learn.js:8-11` has known both names all along, so the two modules
+// simply disagreed.
+test('nested exec extraction accepts the exec_command spelling too', () => {
+  const source = [
+    'const decoy = "tools.exec_command({ cmd: \\\"never\\\" })";',
+    '// tools.exec_command({ cmd: "also never" });',
+    'const first = await tools.exec_command({ cmd: "git status --short" });',
+    "const second = await tools.exec_command({ 'cmd': 'rg TODO src', yield_time_ms: 1000 });",
+    'const third = await tools.exec_command({ shell: "bash", command: "npm test" });',
+    'const dynamic = await tools.exec_command({ cmd: suppliedCommand });',
+    'const computed = await tools["exec_command"]({ cmd: "not accepted" });',
+    'const misspelled = await tools.exec_commands({ cmd: "not accepted" });',
+  ].join('\n');
+
+  assert.deepEqual(extractNestedShellCommands(source), [
+    'git status --short',
+    'rg TODO src',
+    'npm test',
+  ], 'an extractor that knows only tools.shell_command({ command }) sees a 0.153 rollout as empty');
+});
+
+test('an exec_command call is creditable, so a Codex-only corpus can still reach auto-safe', () => {
+  const transcript = jsonl(
+    responseItem({
+      type: 'custom_tool_call', name: 'exec', call_id: 'exec-cmd-ok',
+      input: 'await tools.exec_command({ cmd: "git status --short" })',
+    }),
+    responseItem({ type: 'custom_tool_call_output', call_id: 'exec-cmd-ok', output: 'Exit code: 0' }),
+    responseItem({
+      type: 'custom_tool_call', name: 'exec', call_id: 'exec-cmd-fail',
+      input: 'await tools.exec_command({ cmd: "npm test" })',
+    }),
+    responseItem({ type: 'custom_tool_call_output', call_id: 'exec-cmd-fail', output: 'Exit code: 1' }),
+  );
+
+  const observations = parseCodexJsonl(transcript, { file: 'codex.jsonl', platform: 'win32' });
+  const status = (command) => observations.find((item) => item.command === command)?.status;
+  assert.deepEqual(observations.map(({ command }) => command), ['git status --short', 'npm test'],
+    'a rollout that calls tools.exec_command yielded no observations at all');
+  // Success is attributable only through `customExecCanAttributeSuccess`, which
+  // matched the older name alone. Teaching the extractor and not that would
+  // have surfaced every Codex call with its outcome permanently `unknown`, so
+  // `counts.success` would stay at zero and nothing would ever apply.
+  assert.equal(status('git status --short'), 'success',
+    'an exec_command call whose script ran cleanly is creditable, or nothing ever applies');
+  assert.equal(status('npm test'), 'failed');
+});
+
+test('an append past an oversized session_meta still recovers the session and cwd', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wildcard-history-seed-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, 'session.jsonl');
+  // A FIXED-SIZE head read cannot recover the seed. On the real rollout this
+  // record is 22,095 bytes, because `payload.base_instructions.text` carries
+  // the whole ~21 KB Codex system prompt, and a read that stops mid-record
+  // leaves `parseJsonlRecords` with no parseable line at all -- which it skips
+  // in silence, so the recovery would fail invisibly. FINGERPRINT_BYTES is
+  // 4096, so the head read `safeContinuation` already did is no use either.
+  // The padding is multi-byte on purpose, so a character count is not a byte
+  // count anywhere in this file.
+  fs.writeFileSync(file, jsonl({
+    type: 'session_meta',
+    payload: {
+      id: 'oversized-session', cwd: root,
+      base_instructions: { text: 'é'.repeat(40 * 1024) },
+    },
+  }) + codexCall('first-call', 'git status --short'));
+  assert.ok(fs.statSync(file).size > 64 * 1024, 'the head record is past one chunked read');
+
+  const initial = scanHistoryFiles({ roots: { codex: root }, platform: 'win32', overlapBytes: 48 });
+  assert.equal(initial.files[0].mode, 'full');
+  assert.equal(initial.observations[0].session, 'oversized-session');
+
+  fs.appendFileSync(file, codexCall('second-call', 'rg TODO src'));
+  const appended = scanHistoryFiles({
+    roots: { codex: root }, cursors: JSON.parse(JSON.stringify(initial.cursors)),
+    platform: 'win32', overlapBytes: 48,
+  });
+
+  assert.equal(appended.files[0].mode, 'append');
+  assert.deepEqual(appended.observations.map(({ command }) => command), ['rg TODO src']);
+  assert.equal(appended.observations[0].session, 'oversized-session',
+    'a fixed-size head read cannot reach a 22 KB session_meta, so the seed must read to the newline');
+  assert.equal(appended.observations[0].cwd, root,
+    'without the seeded cwd the manager drops this observation as outside the workspace');
+  const fromFull = scanHistoryFiles({ roots: { codex: root }, platform: 'win32' })
+    .observations.find((item) => item.callId === 'second-call');
+  assert.equal(appended.observations[0].id, fromFull.id,
+    'append and full must agree on the identity or the dedupe counts one call twice');
+  const appendedPersisted = JSON.parse(JSON.stringify(appended.cursors));
+  assert.ok(!JSON.stringify(appendedPersisted).includes(path.basename(root)),
+    'the recovered cwd is not written down anywhere');
+
+  // An unchanged file reuses the fingerprint `safeContinuation` has just
+  // verified instead of reading and re-hashing the same two 4 KB ranges to the
+  // same two digests. This file is large enough that the head and tail ranges
+  // do NOT overlap, so the two digests differ and a reuse that mixed them up
+  // would show here -- and the reused cursor still has to verify next scan.
+  const unchanged = scanHistoryFiles({
+    roots: { codex: root }, cursors: JSON.parse(JSON.stringify(appended.cursors)), platform: 'win32',
+  });
+  assert.equal(unchanged.files[0].mode, 'unchanged');
+  assert.notEqual(appendedPersisted[Object.keys(appendedPersisted)[0]].headHash,
+    appendedPersisted[Object.keys(appendedPersisted)[0]].tailHash);
+  assert.deepEqual(JSON.parse(JSON.stringify(unchanged.cursors)), appendedPersisted,
+    'the reused fingerprint must be the one safeContinuation just verified, digest for digest');
+  const twiceUnchanged = scanHistoryFiles({
+    roots: { codex: root }, cursors: JSON.parse(JSON.stringify(unchanged.cursors)), platform: 'win32',
+  });
+  assert.equal(twiceUnchanged.files[0].mode, 'unchanged');
+
+  // A cursor written by an older or hand-edited build can name weaker ranges
+  // than this version would choose. `safeContinuation` still accepts it --
+  // the bytes it names really do hash as claimed -- but REUSING it would carry
+  // the weaker fingerprint forward on every scan from here on, so the reuse is
+  // guarded and this one gets rebuilt at full strength instead.
+  const cursorKey = Object.keys(appendedPersisted)[0];
+  const weak = { ...appendedPersisted[cursorKey], headLength: 100 };
+  weak.headHash = crypto.createHash('sha256')
+    .update(fs.readFileSync(file).subarray(0, 100)).digest('hex');
+  const rebuilt = scanHistoryFiles({
+    roots: { codex: root }, cursors: { [cursorKey]: weak }, platform: 'win32',
+  });
+  assert.equal(rebuilt.files[0].mode, 'unchanged');
+  assert.equal(Object.values(rebuilt.cursors)[0].headLength, 4096,
+    'a weaker legacy fingerprint must be rebuilt, not reused and carried forward for ever');
+});
+
+test('record offsets are byte offsets, so a multi-byte transcript appends exactly once', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wildcard-history-bytes-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, 'session.jsonl');
+  // 3,000 two-byte characters, so a length measured in CHARACTERS is 3,000
+  // short of the truth by the time the parser reaches the appended call. An
+  // append keeps only the observations that end past the prior size, so
+  // under-measured offsets drop the new call rather than reporting it.
+  fs.writeFileSync(file, jsonl({
+    type: 'session_meta',
+    payload: { id: 'multibyte-session', cwd: root, notes: 'é'.repeat(3000) },
+  }) + codexCall('old-call', 'git status --short'));
+  const initial = scanHistoryFiles({ roots: { codex: root }, platform: 'win32' });
+  assert.deepEqual(initial.observations.map(({ command }) => command), ['git status --short']);
+
+  fs.appendFileSync(file, codexCall('new-call', 'rg TODO src'));
+  // The default overlap reaches byte 0, so the whole file is re-parsed and
+  // every offset in it has to be right for the filter to pick out just the
+  // appended call.
+  const appended = scanHistoryFiles({
+    roots: { codex: root }, cursors: JSON.parse(JSON.stringify(initial.cursors)), platform: 'win32',
+  });
+  assert.equal(appended.files[0].mode, 'append');
+  assert.deepEqual(appended.observations.map(({ command }) => command), ['rg TODO src'],
+    'offsets measured in characters put the appended call before the prior size, so it is dropped');
+});
+
+// A Windows junction Dirent reports isDirectory() === false, isFile() === false
+// and only isSymbolicLink() === true, so a walk that queues children on
+// isDirectory() alone skipped the entire subtree -- with no error, so those
+// transcripts did not exist as far as Auto Learn was concerned.
+test('a junction or symlinked directory is walked, and a link cycle still terminates',
+  { skip: !CAN_LINK_DIR }, (t) => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'wildcard-history-link-'));
+    t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+    const root = path.join(base, 'root');
+    const outside = path.join(base, 'outside');
+    fs.mkdirSync(path.join(root, 'inside'), { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(root, 'inside', 'a.jsonl'), codexCall('a', 'rg alpha'));
+    fs.writeFileSync(path.join(outside, 'b.jsonl'), codexCall('b', 'rg beta'));
+    fs.symlinkSync(outside, path.join(root, 'linked'), DIR_LINK);
+    // Points back at the directory it lives in. Queuing links is what makes
+    // this reachable at all, and the realpath set is what stops it -- which is
+    // what that set was written for.
+    fs.symlinkSync(root, path.join(root, 'loop'), DIR_LINK);
+
+    const result = scanHistoryFiles({ roots: { codex: root }, platform: 'win32' });
+    assert.deepEqual(result.observations.map(({ command }) => command).sort(),
+      ['rg alpha', 'rg beta'],
+      'a junction Dirent is neither a file nor a directory, so the subtree behind it was skipped');
+    assert.deepEqual(result.files.filter((entry) => entry.mode === 'error'), []);
+  });
+
+test('a symlinked transcript is read rather than skipped for not being a regular file',
+  { skip: !CAN_LINK_FILE }, (t) => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'wildcard-history-filelink-'));
+    t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+    const root = path.join(base, 'root');
+    fs.mkdirSync(root, { recursive: true });
+    const target = path.join(base, 'real.jsonl');
+    fs.writeFileSync(target, codexCall('linked-call', 'rg gamma'));
+    fs.symlinkSync(target, path.join(root, 'aliased.jsonl'), 'file');
+
+    const result = scanHistoryFiles({ roots: { codex: root }, platform: 'win32' });
+    assert.deepEqual(result.observations.map(({ command }) => command), ['rg gamma']);
+  });
+
+// `findJsonlFiles` swallows a readdir failure per directory, so an unreadable
+// root came back as an empty corpus: no files, no observations, no errors --
+// indistinguishable from "nothing to do", while the manager took that as
+// licence to replace every cursor it held with nothing.
+test('an unreadable root is reported as an error rather than as an empty corpus', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wildcard-history-root-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'session.jsonl'), codexCall('one', 'rg alpha'));
+
+  const realReaddir = fs.readdirSync;
+  t.after(() => { fs.readdirSync = realReaddir; });
+  fs.readdirSync = (target, ...rest) => {
+    if (String(target) === root) {
+      const error = new Error(`EACCES: permission denied, scandir '${target}'`);
+      error.code = 'EACCES';
+      throw error;
+    }
+    return realReaddir(target, ...rest);
+  };
+  const blocked = scanHistoryFiles({ cursors: {}, codexRoots: [root], claudeRoots: [] });
+  fs.readdirSync = realReaddir;
+
+  assert.deepEqual(blocked.observations, []);
+  assert.deepEqual(blocked.files.map((entry) => entry.mode), ['error'],
+    'a root the walk could not read must not report as an empty corpus with no errors');
+  assert.match(blocked.files[0].error, /EACCES/);
+  assert.equal(blocked.files[0].path, path.resolve(root));
+
+  // A root that is simply not there is NOT a failure. Every machine without
+  // both agents has one, and reporting it would leave the error count nonzero
+  // forever, which is the same lie in the other direction.
+  const absent = scanHistoryFiles({
+    cursors: {}, codexRoots: [path.join(root, 'no-such-directory')], claudeRoots: [],
+  });
+  assert.deepEqual(absent.files, []);
 });
