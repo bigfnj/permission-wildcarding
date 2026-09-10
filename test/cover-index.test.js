@@ -18,7 +18,9 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const { isCoveredBy, createCoverIndex, processAllowList } = require('../src/permissions');
+const {
+  isCoveredBy, createCoverIndex, processAllowList, coverKeyCacheStats,
+} = require('../src/permissions');
 
 // The full scan the index replaces. Deliberately written out here rather than
 // imported, so a change to the production path cannot silently change the oracle.
@@ -225,4 +227,104 @@ test('a rule with no star is not in the pool at all, and could not cover anythin
   assert.equal(createCoverIndex(pack).stats().indexed + createCoverIndex(pack).stats().fallback,
     pack.length - packStarFree,
     'every star-free rule in the pack is dropped, and nothing else is');
+});
+
+// ── the coverLookupKeys memo ─────────────────────────────────────────────────
+//
+// coverLookupKeys probes every CHARACTER of a candidate's argument, and
+// processAllowList sweeps largely the same strings twice (scope probe, then
+// prune) while the dashboard repeats the whole pass on refresh. It is memoized
+// on the candidate string, which is its only input.
+//
+// The observable is a count of the per-character probe, taken from OUTSIDE the
+// module by wrapping RegExp.prototype.test. That matters: a memo asked to
+// report its own hit rate would be checking bookkeeping, and bookkeeping is
+// exactly what a broken memo gets wrong. This counts the work itself, so
+// "0 probes on a repeat" cannot be true unless the walk really was skipped.
+const BOUNDARY_PROBE = /[\s:]/.source; // the probe at src/permissions.js:286
+
+function countBoundaryProbes(run) {
+  const original = RegExp.prototype.test;
+  let calls = 0;
+  RegExp.prototype.test = function counted(value) {
+    if (this.source === BOUNDARY_PROBE) calls += 1;
+    return original.call(this, value);
+  };
+  try { run(); } finally { RegExp.prototype.test = original; }
+  return calls;
+}
+
+const argOf = (rule) => /^[^(]+\((.*)\)$/s.exec(rule)[1];
+const asSet = (list) => [...new Set(list)].sort();
+
+const MEMO_POOL = ['Bash(git *)', 'Bash(g* *)', 'Skill(dataviz:*)', 'Read(*)'];
+
+test('the key memo answers a repeat without re-walking the candidate', (t) => {
+  const index = createCoverIndex(MEMO_POOL);
+  const candidate = 'Bash(git status --short --branch --untracked-files=all)';
+
+  // Instrumentation sanity first. If the counter cannot see the walk, every
+  // assertion below is vacuously true — this is the axis that makes them real.
+  const cold = countBoundaryProbes(() => index.covers(candidate));
+  assert.equal(cold, argOf(candidate).length,
+    'a cold candidate probes every character of its argument exactly once');
+
+  // The property being bought.
+  assert.equal(countBoundaryProbes(() => index.covers(candidate)), 0,
+    'a repeated candidate must be answered from the memo, not re-walked');
+
+  // Keyed on the candidate ALONE, so a different index over a different pool
+  // reuses the keys. This is the claim that makes a module-global memo sound.
+  const elsewhere = createCoverIndex(['Bash(gh *)']);
+  assert.equal(countBoundaryProbes(() => elsewhere.coveredBy(candidate)), 0,
+    'the keys are a function of the candidate, so any index reuses them');
+
+  // A near-miss must NOT be served from the memo. Without this, a memo that
+  // returned one cached answer for everything would satisfy the assertions
+  // above — and would be a false-negative factory.
+  const near = `${candidate.slice(0, -1)}x)`;
+  assert.equal(countBoundaryProbes(() => index.covers(near)), argOf(near).length,
+    'one character different is a different key, and is walked');
+
+  // Correctness across the memo boundary: the warm answer must equal the cold
+  // one AND the full scan, for candidates that hit different key shapes.
+  for (const probe of [candidate, near, 'Skill(dataviz:report)', 'Skill(other:report)',
+    'Bash(git)', 'Bash(gh pr list)', 'Read(/etc/passwd)', 'Bash()', 'Bash( )']) {
+    const expected = asSet(oracleCoveredBy(probe, MEMO_POOL));
+    assert.deepEqual(asSet(index.coveredBy(probe)), expected, `cold: ${probe}`);
+    assert.deepEqual(asSet(index.coveredBy(probe)), expected, `warm: ${probe}`);
+    assert.equal(index.covers(probe), expected.length > 0, `covers(): ${probe}`);
+  }
+});
+
+test('the key memo is bounded, and stays correct across an eviction', (t) => {
+  const index = createCoverIndex(MEMO_POOL);
+  const { limit } = coverKeyCacheStats();
+  // Fail loudly rather than hang if the cap is ever raised past what a test can
+  // flood. The cap exists because the extension host holds this module for a
+  // whole session; a cap of a million would be a leak with extra steps.
+  assert.ok(limit > 0 && limit <= 20000, `implausible cap: ${limit}`);
+
+  const candidate = 'Bash(git status --porcelain --untracked-files=no)';
+  const expected = asSet(oracleCoveredBy(candidate, MEMO_POOL));
+  assert.deepEqual(asSet(index.coveredBy(candidate)), expected, 'answer before the flood');
+  assert.equal(countBoundaryProbes(() => index.covers(candidate)), 0, 'and it is memoized');
+
+  // Distinct candidates past the cap — what a caller synthesizing rules in a
+  // loop does, which is the only way to reach this limit in practice.
+  for (let i = 0; i < limit + 100; i += 1) index.covers(`Bash(synthetic-${i} run)`);
+
+  const stats = coverKeyCacheStats();
+  assert.ok(stats.size <= stats.limit,
+    `memo holds ${stats.size} entries, cap is ${stats.limit}`);
+
+  // Asserted behaviourally too, because `size <= limit` on its own would pass
+  // with the cap raised to a number nothing could reach: the wholesale clear
+  // must really have dropped the pre-flood entry, so its walk happens again.
+  assert.equal(countBoundaryProbes(() => index.covers(candidate)), argOf(candidate).length,
+    'the clear must drop the pre-flood entry, forcing a fresh walk');
+  // And a clear must cost a re-walk and NOTHING else.
+  assert.deepEqual(asSet(index.coveredBy(candidate)), expected, 'answer after the flood');
+  assert.deepEqual(processAllowList(['Bash(git status --short)', 'Bash(git status *)']),
+    ['Bash(git status *)'], 'and the pipeline still collapses after an eviction');
 });

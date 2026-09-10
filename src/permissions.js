@@ -277,7 +277,7 @@ function coverIndexKey(rule) {
 // wildcards in patterns/starter-pack.json and the documented
 // `WebFetch(domain:*)`. Extra keys cost only a bucket probe, because
 // isCoveredBy still decides every answer; a MISSING key changes the answer.
-function coverLookupKeys(specific) {
+function coverLookupKeysUncached(specific) {
   const parts = RULE_SHAPE.exec(specific);
   if (!parts) return [];
   const [, tool, arg] = parts;
@@ -288,6 +288,84 @@ function coverLookupKeys(specific) {
     }
   }
   return keys;
+}
+
+// Memoized on the candidate string, because that string is the ONLY input:
+// coverLookupKeys reads nothing from the pool, the buckets or the module, so a
+// global memo returns a provably identical answer no matter which
+// createCoverIndex asked. Determinism is the entire safety argument here — this
+// needs no differential of its own, unlike the index it feeds, whose keys are
+// still checked against the full-scan oracle in test/cover-index.test.js.
+//
+// Worth it because the walk is per-CHARACTER: a regex probe on every character
+// of every argument, plus a slice and a trailing-separator replace per boundary
+// (8,018 argument characters and 1,479 keys per sweep on the live 431-entry
+// list), and processAllowList runs TWO sweeps — the scope probe, then the prune
+// — over largely the same strings. The dashboard then repeats the whole pass on
+// every refresh, which is where a warm memo pays for itself.
+//
+// Measured 2026-09-10. Method, because a warm loop against an inferred baseline
+// has been wrong here before: the "before" arm is this file with the memo
+// actually reverted, both arms interleaved inside ONE loop with a rotating order.
+// Figures are min/p50 ms, before -> after.
+//   warm, one long-lived process — the dashboard's regime, per refresh
+//     431 entries   n=300   2.19/2.50 -> 1.01/1.14
+//     1200 entries  n=300   7.53/9.35 -> 3.36/4.26
+//   cold, a fresh process per sample — the hook's regime, one pass then exit
+//     431 entries   n=40    8.27/9.89 -> 7.64/9.04
+//     1200 entries  n=40   28.46/30.75 -> 25.47/29.46
+// The honest exception: on a list that has NOT yet converged, generalization
+// rewrites most candidates, so the two sweeps ask about different strings (15.7%
+// candidate overlap, not 100%) and the cold pass is ~0.3 ms SLOWER — the memo
+// pays for inserts it never reads. That is a first-ever pass on a fresh machine;
+// it writes the converged list back, and every pass after it is the case above.
+//
+// Bounded, and evicted by wholesale clear rather than LRU, for the reasons
+// written out at permission-match.js:38-57 and not re-argued here: the hook
+// process exits after one pass but the VS Code extension host holds this module
+// for a whole session, so an unbounded map keyed on rule strings is a slow leak,
+// and an LRU's bookkeeping would cost more than the walk it saves. The six-line
+// idiom is replicated rather than imported from permission-match.js because
+// exporting a shared cache helper would make a module boundary out of six lines
+// that both sides want to tune separately.
+//
+// The number is the same 5000, and here it is load-bearing rather than copied:
+// one sweep visits every entry once, so a cap below the list length would clear
+// mid-sweep and hand the next sweep a cold memo. 5000 keeps even the 3,200-entry
+// growth case named above inside a single sweep. Measured at the cap with
+// realistic candidates, a full memo costs 3.5 MB of heap — the price of the
+// bound, and the reason it is not larger.
+//
+// Two deliberate details:
+//   * Only STRINGS are memoized, matching normalizeRule (permission-match.js:79).
+//     A non-string is coerced by RULE_SHAPE.exec, and an object key would be
+//     memoized by reference — so a caller mutating one could be answered from a
+//     stale entry. Passing them straight through removes that hazard entirely.
+//   * The memoized value is an array handed out BY REFERENCE, which is safe only
+//     while every caller treats it as read-only. The one caller is `narrow`
+//     below, which iterates it with for...of and never sorts, pushes or splices;
+//     it copies what it needs into its own `out` array. A caller that mutated
+//     the keys would corrupt the memo for every later caller, so if one ever
+//     needs to, return `keys.slice()` here.
+const COVER_KEY_CACHE_LIMIT = 5000;
+const coverKeyCache = new Map();
+
+function coverLookupKeys(specific) {
+  if (typeof specific !== 'string') return coverLookupKeysUncached(specific);
+  const hit = coverKeyCache.get(specific);
+  if (hit !== undefined) return hit;
+  const keys = coverLookupKeysUncached(specific);
+  if (coverKeyCache.size >= COVER_KEY_CACHE_LIMIT) coverKeyCache.clear();
+  coverKeyCache.set(specific, keys);
+  return keys;
+}
+
+// Introspection, so the cap can be asserted rather than assumed — the same
+// reason permission-match.js:131-136 exposes matchCacheStats. A bound nothing
+// observes is not a bound: a test without this can only show that results
+// survive an eviction, which stays true when the cap is deleted.
+function coverKeyCacheStats() {
+  return { size: coverKeyCache.size, limit: COVER_KEY_CACHE_LIMIT };
 }
 
 // `covers(specific)` answers "does anything in this pool cover it", and
@@ -739,6 +817,7 @@ function applyMax(settings, on) {
 module.exports = {
   generalizePermission, mineWildcard, BASH_SCRIPT_KEYWORDS,
   isCoveredBy, createCoverIndex, prunePermissions, processAllowList, writeFileAtomicSync,
+  coverKeyCacheStats,
   BYPASS_MODE, BYPASS_STATE_FILE, currentMode, isBypassOn, applyBypass, readBypassState,
   CLASSIFIER_MODE, MAX_MODE, classifierModeOn,
   MAX_ALLOW_CORE, MAX_MARKERS, MAX_STATE_FILE, APPROVE_SCRIPT, APPROVE_COMMAND,
